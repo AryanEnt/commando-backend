@@ -1,0 +1,969 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────
+
+enum RoleCode {
+  SUPER_ADMIN
+  TEAM_LEAD
+  COMMANDO_EXECUTIVE
+  SALES_EXECUTIVE
+  SALES_SUPPORT_EXECUTIVE
+}
+
+enum AssignmentStatus {
+  ACTIVE
+  COMPLETED
+  EXITED
+}
+
+enum InterventionOutcome {
+  IMPROVED
+  PARTIALLY_IMPROVED
+  NOT_IMPROVED
+  CONTINUED_MONITORING
+  OTHER
+}
+
+enum InterventionGoalStatus {
+  OPEN
+  IN_PROGRESS
+  MET
+  NOT_MET
+}
+
+enum ReferralStatus {
+  SUBMITTED
+  ACKNOWLEDGED
+  IN_PROGRESS
+  COMPLETED
+  REJECTED
+}
+
+enum ReferralInitiatedBy {
+  TEAM_LEAD
+  COMMANDO
+}
+
+enum SwotSource {
+  TEAM_LEAD
+  COMMANDO
+  SALES_EXECUTIVE
+}
+
+enum WeeklyReviewStatus {
+  DRAFT
+  SUBMITTED
+}
+
+enum EisenhowerCategory {
+  DO_FIRST
+  SCHEDULE
+  DELEGATE
+  ELIMINATE
+}
+
+enum EisenhowerTaskStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum ActionItemStatus {
+  ACTIVE
+  COMPLETED
+  EXPIRED
+  REPLACED
+  CANCELLED
+}
+
+enum SupportRoleAssignmentStatus {
+  ACTIVE
+  SUPERSEDED
+  ARCHIVED
+}
+
+enum FeedbackSource {
+  TEAM_LEAD
+  COMMANDO
+}
+
+enum PerformanceSource {
+  TEAM_LEAD
+  COMMANDO
+}
+
+enum SupportTaskPriority {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum SupportTaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum MembershipRole {
+  TEAM_LEAD
+  SALES_EXECUTIVE
+  SALES_SUPPORT_EXECUTIVE
+  MEMBER
+}
+
+// ─────────────────────────────────────────────
+// Identity & access
+// ─────────────────────────────────────────────
+
+model Role {
+  id          String   @id @default(cuid())
+  code        RoleCode @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users           User[]
+  rolePermissions RolePermission[]
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  rolePermissions RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  createdAt    DateTime @default(now())
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Restrict)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  isActive     Boolean   @default(true)
+  roleId       String
+  deletedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  role Role @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  teamMemberships TeamMembership[]
+
+  salesExecutiveProfile SalesExecutiveProfile?
+
+  assignmentsAsCommando  CommandoAssignment[] @relation("AssignmentCommando")
+  assignmentsAsTeamLead  CommandoAssignment[] @relation("AssignmentTeamLead")
+  referralsAsTeamLead    Referral[]           @relation("ReferralTeamLead")
+  referralsAsCommando    Referral[]           @relation("ReferralCommando")
+  referralsAcknowledged  Referral[]           @relation("ReferralAcknowledgedBy")
+  recordAcknowledgements RecordAcknowledgement[]
+  interventionGoals      InterventionGoal[]  @relation("InterventionGoalOwner")
+
+  swotCreated            SwotAnalysis[]          @relation("SwotCreator")
+  dailyLogsCreated       DailyLog[]              @relation("DailyLogCreator")
+  weeklyReviewsCreated   WeeklyReview[]          @relation("WeeklyReviewCreator")
+  weeklyReviewAttendance WeeklyReviewAttendee[]
+  syncEvalsCreated       SyncEvaluation[]        @relation("SyncEvalCreator")
+  syncEvalsAsSupport     SyncEvaluation[]        @relation("SyncEvalSupport")
+  eisenhowerCreated      EisenhowerTask[]        @relation("EisenhowerCreator")
+  monitoringCreated      LiveMonitoringRecord[]  @relation("MonitoringCreator")
+  actionItemsCreated     ActionItem[]            @relation("ActionItemCreator")
+  feedbackCreated        Feedback[]              @relation("FeedbackCreator")
+  performanceCreated     PerformanceEvaluation[] @relation("PerformanceCreator")
+  supportTasksCreated    SupportTask[]           @relation("SupportTaskCreator")
+  supportTasksAssignedBy SupportTask[]           @relation("SupportTaskAssignedBy")
+  supportTasksAssigned   SupportTask[]           @relation("SupportTaskAssignee")
+  auditLogs              AuditLog[]              @relation("AuditActor")
+  notifications          Notification[]          @relation("NotificationRecipient")
+  salesSupportLinks      SalesSupportLink[]      @relation("SupportUser")
+  supportRoleAssignments SupportRoleAssignment[] @relation("SupportRoleAssignee")
+  supportRolesCreated    SupportRoleAssignment[] @relation("SupportRoleCreator")
+  refreshTokens          RefreshToken[]
+
+  @@index([roleId])
+  @@index([deletedAt])
+  @@index([isActive])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────
+// Org structure
+// ─────────────────────────────────────────────
+
+model Team {
+  id          String    @id @default(cuid())
+  name        String
+  description String?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  memberships TeamMembership[]
+  profiles    SalesExecutiveProfile[]
+  assignments CommandoAssignment[]
+  referrals   Referral[]
+  swots       SwotAnalysis[]
+
+  @@index([archivedAt])
+  @@index([name])
+}
+
+model TeamMembership {
+  id        String         @id @default(cuid())
+  teamId    String
+  userId    String
+  roleInTeam MembershipRole @default(MEMBER)
+  startedAt DateTime       @default(now())
+  endedAt   DateTime?
+  isActive  Boolean        @default(true)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([teamId, isActive])
+  @@index([userId, isActive])
+  @@index([startedAt])
+}
+
+model SalesExecutiveProfile {
+  id        String    @id @default(cuid())
+  userId    String    @unique
+  teamId    String
+  displayName String
+  employeeCode String?
+  archivedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  team Team @relation(fields: [teamId], references: [id], onDelete: Restrict)
+
+  assignments       CommandoAssignment[]
+  referrals         Referral[]
+  swots             SwotAnalysis[]
+  dailyLogs         DailyLog[]
+  weeklyReviews     WeeklyReview[]
+  syncEvaluations   SyncEvaluation[]
+  eisenhowerTasks   EisenhowerTask[]
+  monitoringRecords LiveMonitoringRecord[]
+  actionItems       ActionItem[]
+  feedback          Feedback[]
+  performanceEvals  PerformanceEvaluation[]
+  salesSupportLinks SalesSupportLink[]
+  supportRoleAssignments SupportRoleAssignment[]
+  supportTasks      SupportTask[]
+  interventionGoals InterventionGoal[]
+  recordAcknowledgements RecordAcknowledgement[]
+
+  @@index([teamId])
+  @@index([archivedAt])
+  @@index([displayName])
+}
+
+/// Historical SE ↔ Sales Support pairing (not dependent on current team membership alone)
+model SalesSupportLink {
+  id                       String    @id @default(cuid())
+  salesExecutiveProfileId  String
+  salesSupportUserId       String
+  startedAt                DateTime  @default(now())
+  endedAt                  DateTime?
+  isActive                 Boolean   @default(true)
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  profile      SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  supportUser  User                  @relation("SupportUser", fields: [salesSupportUserId], references: [id], onDelete: Restrict)
+  syncEvaluations SyncEvaluation[]
+  roleAssignments SupportRoleAssignment[]
+  supportTasks SupportTask[]
+
+  @@index([salesExecutiveProfileId, isActive])
+  @@index([salesSupportUserId, isActive])
+}
+
+// ─────────────────────────────────────────────
+// Commando lifecycle
+// ─────────────────────────────────────────────
+
+model CommandoAssignment {
+  id                       String           @id @default(cuid())
+  salesExecutiveProfileId  String
+  commandoUserId           String
+  teamLeadUserId           String
+  teamId                   String
+  startedAt                DateTime
+  endedAt                  DateTime?
+  status                   AssignmentStatus @default(ACTIVE)
+  completionReason         String?
+  outcome                  InterventionOutcome?
+  initialProblem           String?
+  interventionProvided     String?
+  improvementObserved      String?
+  remainingGaps            String?
+  finalCommandoAssessment    String?
+  finalTeamLeadView        String?
+  transferredFromId       String?
+  transferReason           String?
+  createdAt                DateTime         @default(now())
+  updatedAt                DateTime         @updatedAt
+
+  profile  SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  commando User                  @relation("AssignmentCommando", fields: [commandoUserId], references: [id], onDelete: Restrict)
+  teamLead User                  @relation("AssignmentTeamLead", fields: [teamLeadUserId], references: [id], onDelete: Restrict)
+  team     Team                  @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  transferredFrom CommandoAssignment?  @relation("AssignmentTransfer", fields: [transferredFromId], references: [id], onDelete: SetNull)
+  transferredTo    CommandoAssignment[] @relation("AssignmentTransfer")
+
+  referrals         Referral[]
+  dailyLogs         DailyLog[]
+  weeklyReviews     WeeklyReview[]
+  syncEvaluations   SyncEvaluation[]
+  eisenhowerTasks   EisenhowerTask[]
+  monitoringRecords LiveMonitoringRecord[]
+  actionItems       ActionItem[]
+  feedback          Feedback[]
+  performanceEvals  PerformanceEvaluation[]
+  supportRoleAssignments SupportRoleAssignment[]
+  supportTasks      SupportTask[]
+  interventionGoals InterventionGoal[]
+
+  @@index([salesExecutiveProfileId, status])
+  @@index([commandoUserId, status])
+  @@index([teamLeadUserId, status])
+  @@index([teamId])
+  @@index([startedAt])
+  @@index([endedAt])
+}
+
+model Referral {
+  id                         String         @id @default(cuid())
+  salesExecutiveProfileId    String
+  teamLeadUserId             String
+  teamId                     String
+  commandoUserId             String
+  assignmentId               String?
+  profileName                String
+  whySalesIsDown             String
+  whatIsTheGap               String
+  detailedSummaryOfGap       String
+  supportAlreadyProvided     String
+  supportRequiredFromCommando String
+  recommendationFocus        String
+  priority1                  String?
+  priority2                  String?
+  priority3                  String?
+  initiatedBy                ReferralInitiatedBy @default(TEAM_LEAD)
+  requestReason              String?
+  informationProvidedAt      DateTime?
+  rejectionReason            String?
+  rejectedAt                 DateTime?
+  status                     ReferralStatus @default(SUBMITTED)
+  acknowledgedAt             DateTime?
+  acknowledgedById           String?
+  acknowledgementNote        String?
+  completedAt                DateTime?
+  archivedAt                 DateTime?
+  createdAt                  DateTime       @default(now())
+  updatedAt                  DateTime       @updatedAt
+
+  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  teamLead   User                  @relation("ReferralTeamLead", fields: [teamLeadUserId], references: [id], onDelete: Restrict)
+  team       Team                  @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  commando   User                  @relation("ReferralCommando", fields: [commandoUserId], references: [id], onDelete: Restrict)
+  acknowledgedBy User?            @relation("ReferralAcknowledgedBy", fields: [acknowledgedById], references: [id], onDelete: SetNull)
+  assignment CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+
+  @@index([salesExecutiveProfileId])
+  @@index([teamLeadUserId])
+  @@index([commandoUserId])
+  @@index([teamId])
+  @@index([assignmentId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// SWOT
+// ─────────────────────────────────────────────
+
+model SwotAnalysis {
+  id                      String     @id @default(cuid())
+  salesExecutiveProfileId String
+  teamId                  String
+  assignmentId            String?
+  source                  SwotSource
+  strength                String
+  weakness                String
+  opportunity             String
+  threat                  String
+  createdById             String
+  archivedAt              DateTime?
+  createdAt               DateTime   @default(now())
+  updatedAt               DateTime   @updatedAt
+
+  profile   SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  team      Team                  @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  createdBy User                  @relation("SwotCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([salesExecutiveProfileId, source])
+  @@index([teamId])
+  @@index([assignmentId])
+  @@index([createdById])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// Daily coaching logs
+// ─────────────────────────────────────────────
+
+model ActivityType {
+  id          String    @id @default(cuid())
+  code        String    @unique
+  name        String
+  description String?
+  isActive    Boolean   @default(true)
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  dailyLogs DailyLog[]
+
+  @@index([isActive])
+}
+
+model DailyLog {
+  id                      String   @id @default(cuid())
+  salesExecutiveProfileId String
+  assignmentId            String?
+  activityTypeId          String
+  sessionTitle            String
+  observation             String
+  evidence                String?
+  seResponse               String?
+  coachingGiven           String?
+  expectedChange          String?
+  followUp                String?
+  createdById             String
+  loggedAt                DateTime @default(now())
+  archivedAt              DateTime?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  profile      SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment   CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  activityType ActivityType          @relation(fields: [activityTypeId], references: [id], onDelete: Restrict)
+  createdBy    User                  @relation("DailyLogCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([salesExecutiveProfileId])
+  @@index([assignmentId])
+  @@index([activityTypeId])
+  @@index([createdById])
+  @@index([loggedAt])
+}
+
+// ─────────────────────────────────────────────
+// Weekly reviews
+// ─────────────────────────────────────────────
+
+model WeeklyReview {
+  id                      String             @id @default(cuid())
+  salesExecutiveProfileId String
+  assignmentId            String?
+  commandoUserId          String?
+  teamLeadUserId          String
+  weekLabel               String
+  weekStartDate           DateTime           @db.Date
+  meetingDate             DateTime
+  performanceSummary      String
+  whatWentWell            String
+  improvement             String
+  nextWeekAction          String
+  status                  WeeklyReviewStatus @default(DRAFT)
+  submittedAt             DateTime?
+  createdById             String
+  archivedAt              DateTime?
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
+
+  profile    SalesExecutiveProfile  @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?    @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy  User                   @relation("WeeklyReviewCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  attendees  WeeklyReviewAttendee[]
+
+  @@index([salesExecutiveProfileId])
+  @@index([assignmentId])
+  @@index([commandoUserId])
+  @@index([teamLeadUserId])
+  @@index([status])
+  @@index([weekStartDate])
+  @@index([meetingDate])
+  @@index([createdById])
+}
+
+model WeeklyReviewAttendee {
+  id             String   @id @default(cuid())
+  weeklyReviewId String
+  userId         String
+  signedAt       DateTime?
+  createdAt      DateTime @default(now())
+
+  weeklyReview WeeklyReview @relation(fields: [weeklyReviewId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([weeklyReviewId, userId])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────
+// Sales support sync evaluation
+// ─────────────────────────────────────────────
+
+model SyncEvaluation {
+  id                      String   @id @default(cuid())
+  salesExecutiveProfileId String
+  salesSupportUserId      String
+  salesSupportLinkId      String?
+  assignmentId            String?
+  issue                   String
+  recommendedAction       String
+  createdById             String
+  archivedAt              DateTime?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  profile          SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  salesSupportUser User                  @relation("SyncEvalSupport", fields: [salesSupportUserId], references: [id], onDelete: Restrict)
+  salesSupportLink SalesSupportLink?     @relation(fields: [salesSupportLinkId], references: [id], onDelete: SetNull)
+  assignment       CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy        User                  @relation("SyncEvalCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([salesExecutiveProfileId])
+  @@index([salesSupportUserId])
+  @@index([assignmentId])
+  @@index([createdById])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// Eisenhower matrix
+// ─────────────────────────────────────────────
+
+model EisenhowerTask {
+  id                      String                @id @default(cuid())
+  salesExecutiveProfileId String
+  assignmentId            String?
+  month                   DateTime              @db.Date
+  category                EisenhowerCategory
+  title                   String
+  notes                   String?
+  dueDate                 DateTime?
+  status                  EisenhowerTaskStatus  @default(OPEN)
+  createdById             String
+  archivedAt              DateTime?
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @updatedAt
+
+  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy  User                  @relation("EisenhowerCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([salesExecutiveProfileId, month])
+  @@index([assignmentId])
+  @@index([category])
+  @@index([status])
+  @@index([createdById])
+}
+
+// ─────────────────────────────────────────────
+// Live monitoring
+// ─────────────────────────────────────────────
+
+model MonitoringCategory {
+  id          String    @id @default(cuid())
+  code        String    @unique
+  name        String
+  description String?
+  sortOrder   Int       @default(0)
+  isActive    Boolean   @default(true)
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  checklistItems MonitoringChecklistItem[]
+  records        LiveMonitoringRecord[]
+
+  @@index([isActive])
+  @@index([sortOrder])
+}
+
+model MonitoringChecklistItem {
+  id          String    @id @default(cuid())
+  categoryId  String
+  code        String
+  label       String
+  sortOrder   Int       @default(0)
+  isActive    Boolean   @default(true)
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  category  MonitoringCategory             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  responses MonitoringChecklistResponse[]
+
+  @@unique([categoryId, code])
+  @@index([categoryId, isActive])
+}
+
+model LiveMonitoringRecord {
+  id                      String   @id @default(cuid())
+  salesExecutiveProfileId String
+  assignmentId            String?
+  categoryId              String
+  observation             String?
+  createdById             String
+  observedAt              DateTime @default(now())
+  archivedAt              DateTime?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  profile    SalesExecutiveProfile        @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?          @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  category   MonitoringCategory           @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  createdBy  User                         @relation("MonitoringCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  responses  MonitoringChecklistResponse[]
+
+  @@index([salesExecutiveProfileId])
+  @@index([assignmentId])
+  @@index([categoryId])
+  @@index([createdById])
+  @@index([observedAt])
+}
+
+model MonitoringChecklistResponse {
+  id              String   @id @default(cuid())
+  recordId        String
+  checklistItemId String
+  value           String
+  createdAt       DateTime @default(now())
+
+  record        LiveMonitoringRecord    @relation(fields: [recordId], references: [id], onDelete: Cascade)
+  checklistItem MonitoringChecklistItem @relation(fields: [checklistItemId], references: [id], onDelete: Restrict)
+
+  @@unique([recordId, checklistItemId])
+  @@index([checklistItemId])
+}
+
+// ─────────────────────────────────────────────
+// Sales Support role assignment (on-demand support)
+// ─────────────────────────────────────────────
+
+model SupportRoleAssignment {
+  id                      String                      @id @default(cuid())
+  salesExecutiveProfileId String
+  salesSupportUserId      String
+  salesSupportLinkId      String?
+  assignmentId            String?
+  primaryResponsibility   String
+  status                  SupportRoleAssignmentStatus @default(ACTIVE)
+  replacesId              String?
+  createdById             String
+  archivedAt              DateTime?
+  createdAt               DateTime                    @default(now())
+  updatedAt               DateTime                    @updatedAt
+
+  profile          SalesExecutiveProfile           @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  salesSupportUser User                            @relation("SupportRoleAssignee", fields: [salesSupportUserId], references: [id], onDelete: Restrict)
+  salesSupportLink SalesSupportLink?               @relation(fields: [salesSupportLinkId], references: [id], onDelete: SetNull)
+  assignment       CommandoAssignment?             @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy        User                            @relation("SupportRoleCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  replaces         SupportRoleAssignment?          @relation("SupportRoleReplacement", fields: [replacesId], references: [id], onDelete: SetNull)
+  replacedBy       SupportRoleAssignment[]         @relation("SupportRoleReplacement")
+  shouldDoItems    SupportRoleShouldDoItem[]
+  shouldNotDoItems SupportRoleShouldNotDoItem[]
+
+  @@index([salesExecutiveProfileId, status])
+  @@index([salesSupportUserId, status])
+  @@index([salesSupportLinkId])
+  @@index([assignmentId])
+  @@index([createdById])
+  @@index([replacesId])
+  @@index([createdAt])
+}
+
+model SupportRoleShouldDoItem {
+  id               String   @id @default(cuid())
+  roleAssignmentId String
+  text             String
+  sortOrder        Int      @default(0)
+  createdAt        DateTime @default(now())
+
+  roleAssignment SupportRoleAssignment @relation(fields: [roleAssignmentId], references: [id], onDelete: Cascade)
+
+  @@index([roleAssignmentId, sortOrder])
+}
+
+model SupportRoleShouldNotDoItem {
+  id               String   @id @default(cuid())
+  roleAssignmentId String
+  text             String
+  sortOrder        Int      @default(0)
+  createdAt        DateTime @default(now())
+
+  roleAssignment SupportRoleAssignment @relation(fields: [roleAssignmentId], references: [id], onDelete: Cascade)
+
+  @@index([roleAssignmentId, sortOrder])
+}
+
+// ─────────────────────────────────────────────
+// Sales Support Executive tasks (Commando-assigned)
+// ─────────────────────────────────────────────
+
+model SupportTask {
+  id                      String              @id @default(cuid())
+  title                   String
+  description             String?
+  priority                SupportTaskPriority @default(MEDIUM)
+  status                  SupportTaskStatus   @default(PENDING)
+  dueDate                 DateTime?
+  completedAt             DateTime?
+  completionNotes         String?
+  salesExecutiveProfileId String
+  salesSupportUserId      String
+  assignedById            String
+  createdById             String
+  assignmentId            String?
+  salesSupportLinkId      String?
+  archivedAt              DateTime?
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+
+  profile          SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  salesSupportUser User                  @relation("SupportTaskAssignee", fields: [salesSupportUserId], references: [id], onDelete: Restrict)
+  assignedBy       User                  @relation("SupportTaskAssignedBy", fields: [assignedById], references: [id], onDelete: Restrict)
+  createdBy        User                  @relation("SupportTaskCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  assignment       CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  salesSupportLink SalesSupportLink?     @relation(fields: [salesSupportLinkId], references: [id], onDelete: SetNull)
+
+  @@index([salesSupportUserId, status])
+  @@index([salesExecutiveProfileId, status])
+  @@index([assignedById])
+  @@index([createdById])
+  @@index([assignmentId])
+  @@index([dueDate])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// Action items
+// ─────────────────────────────────────────────
+
+model ActionItem {
+  id                      String           @id @default(cuid())
+  salesExecutiveProfileId String
+  assignmentId            String?
+  title                   String
+  description             String?
+  status                  ActionItemStatus @default(ACTIVE)
+  dueDate                 DateTime?
+  completedAt             DateTime?
+  expiredAt               DateTime?
+  replacesId              String?
+  createdById             String
+  archivedAt              DateTime?
+  createdAt               DateTime         @default(now())
+  updatedAt               DateTime         @updatedAt
+
+  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy  User                  @relation("ActionItemCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  replaces   ActionItem?           @relation("ActionItemReplacement", fields: [replacesId], references: [id], onDelete: SetNull)
+  replacedBy ActionItem[]          @relation("ActionItemReplacement")
+
+  @@index([salesExecutiveProfileId, status])
+  @@index([assignmentId])
+  @@index([createdById])
+  @@index([dueDate])
+  @@index([replacesId])
+}
+
+// ─────────────────────────────────────────────
+// Feedback & performance
+// ─────────────────────────────────────────────
+
+model Feedback {
+  id                      String         @id @default(cuid())
+  salesExecutiveProfileId String
+  assignmentId            String?
+  source                  FeedbackSource
+  body                    String
+  createdById             String
+  archivedAt              DateTime?
+  createdAt               DateTime       @default(now())
+  updatedAt               DateTime       @updatedAt
+
+  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy  User                  @relation("FeedbackCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([salesExecutiveProfileId, source])
+  @@index([assignmentId])
+  @@index([createdById])
+  @@index([createdAt])
+}
+
+model PerformanceEvaluation {
+  id                      String            @id @default(cuid())
+  salesExecutiveProfileId String
+  assignmentId            String?
+  source                  PerformanceSource
+  summary                 String?
+  verdict                 String?
+  rating                  Decimal?          @db.Decimal(3, 2)
+  createdById             String
+  evaluatedAt             DateTime          @default(now())
+  archivedAt              DateTime?
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+
+  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy  User                  @relation("PerformanceCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  scores     PerformanceScore[]
+
+  @@index([salesExecutiveProfileId, source])
+  @@index([assignmentId])
+  @@index([createdById])
+  @@index([evaluatedAt])
+}
+
+model PerformanceScore {
+  id            String   @id @default(cuid())
+  evaluationId  String
+  metricCode    String
+  metricLabel   String
+  scoreValue    Decimal  @db.Decimal(10, 2)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  evaluation PerformanceEvaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+
+  @@index([evaluationId])
+  @@index([metricCode])
+}
+
+// ─────────────────────────────────────────────
+// Audit & notifications
+// ─────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+model InterventionGoal {
+  id                      String                 @id @default(cuid())
+  salesExecutiveProfileId String
+  assignmentId            String?
+  title                   String
+  ownerUserId             String
+  targetDate              DateTime?               @db.Date
+  status                  InterventionGoalStatus @default(OPEN)
+  progressNotes           String?
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @updatedAt
+
+  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?  @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  owner      User                  @relation("InterventionGoalOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+
+  @@index([salesExecutiveProfileId, status])
+  @@index([assignmentId])
+  @@index([ownerUserId])
+}
+
+model RecordAcknowledgement {
+  id                      String   @id @default(cuid())
+  userId                  String
+  salesExecutiveProfileId String
+  entityType              String
+  entityId                String
+  acknowledgedAt          DateTime @default(now())
+  createdAt               DateTime @default(now())
+
+  user    User                   @relation(fields: [userId], references: [id], onDelete: Restrict)
+  profile SalesExecutiveProfile  @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, entityType, entityId])
+  @@index([salesExecutiveProfileId])
+  @@index([entityType, entityId])
+}
+
+model Notification {
+  id          String    @id @default(cuid())
+  recipientId String
+  type        String
+  title       String
+  body        String?
+  payload     Json?
+  readAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  recipient User @relation("NotificationRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+
+  @@index([recipientId, readAt])
+  @@index([createdAt])
+}

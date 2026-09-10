@@ -1,0 +1,681 @@
+import type { Prisma } from "@prisma/client";
+import { prisma } from "../../lib/prisma.js";
+import { writeAuditLog } from "../../lib/audit.js";
+import type { Actor } from "../../lib/authorization.js";
+import { isSuperAdmin } from "../../lib/authorization.js";
+import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { getActiveTeamIds } from "../../lib/scope.js";
+import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
+import {
+  getCommandoLifecycleState,
+  salesExecutiveCanViewActionItemStatus,
+} from "../../lib/lifecycleVisibility.js";
+import type {
+  CreateActionItemInput,
+  ListActionItemsQuery,
+  ReplaceActionItemInput,
+  UpdateActionItemInput,
+} from "./schemas.js";
+
+const userBrief = {
+  select: {
+    id: true,
+    firstName: true,
+    lastName: true,
+    email: true,
+    role: { select: { code: true } },
+  },
+} as const;
+
+const itemInclude = {
+  profile: {
+    select: { id: true, displayName: true, userId: true, teamId: true },
+  },
+  createdBy: userBrief,
+  assignment: {
+    select: {
+      id: true,
+      status: true,
+      startedAt: true,
+      endedAt: true,
+      commandoUserId: true,
+    },
+  },
+  replaces: {
+    select: {
+      id: true,
+      title: true,
+      status: true,
+      createdAt: true,
+      completedAt: true,
+      expiredAt: true,
+    },
+  },
+  replacedBy: {
+    select: {
+      id: true,
+      title: true,
+      status: true,
+      createdAt: true,
+    },
+    orderBy: { createdAt: "desc" as const },
+    take: 5,
+  },
+} satisfies Prisma.ActionItemInclude;
+
+type ItemRow = Prisma.ActionItemGetPayload<{ include: typeof itemInclude }>;
+
+type UserBrief = {
+  id: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+};
+
+async function loadUsers(ids: string[]): Promise<Map<string, UserBrief>> {
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (unique.length === 0) return new Map();
+  const users = await prisma.user.findMany({
+    where: { id: { in: unique } },
+    select: { id: true, firstName: true, lastName: true, email: true },
+  });
+  return new Map(users.map((u) => [u.id, u]));
+}
+
+function isHistoryStatus(status: string): boolean {
+  return (
+    status === "COMPLETED" ||
+    status === "EXPIRED" ||
+    status === "REPLACED" ||
+    status === "CANCELLED"
+  );
+}
+
+function serialize(row: ItemRow, extras: Map<string, UserBrief>) {
+  const commando = row.assignment
+    ? (extras.get(row.assignment.commandoUserId) ?? null)
+    : extras.get(row.createdById) ??
+      (row.createdBy
+        ? {
+            id: row.createdBy.id,
+            firstName: row.createdBy.firstName,
+            lastName: row.createdBy.lastName,
+            email: row.createdBy.email,
+          }
+        : null);
+
+  return {
+    id: row.id,
+    salesExecutiveProfileId: row.salesExecutiveProfileId,
+    profile: row.profile,
+    assignmentId: row.assignmentId,
+    assignment: row.assignment
+      ? {
+          id: row.assignment.id,
+          status: row.assignment.status,
+          startedAt: row.assignment.startedAt,
+          endedAt: row.assignment.endedAt,
+        }
+      : null,
+    title: row.title,
+    description: row.description,
+    status: row.status,
+    dueDate: row.dueDate,
+    completedAt: row.completedAt,
+    expiredAt: row.expiredAt,
+    replacesId: row.replacesId,
+    replaces: row.replaces,
+    replacedBy: row.replacedBy,
+    createdById: row.createdById,
+    createdBy: row.createdBy,
+    commando,
+    isActive: row.status === "ACTIVE",
+    isHistory: isHistoryStatus(row.status),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+async function serializeMany(rows: ItemRow[]) {
+  const ids = rows.flatMap((r) =>
+    r.assignment ? [r.assignment.commandoUserId] : [],
+  );
+  const extras = await loadUsers(ids);
+  return rows.map((r) => serialize(r, extras));
+}
+
+async function scopeWhere(actor: Actor): Promise<Prisma.ActionItemWhereInput> {
+  if (isSuperAdmin(actor)) {
+    return { archivedAt: null };
+  }
+
+  switch (actor.roleCode) {
+    case "COMMANDO_EXECUTIVE": {
+      const assignments = await prisma.commandoAssignment.findMany({
+        where: { commandoUserId: actor.id },
+        select: { salesExecutiveProfileId: true },
+      });
+      const profileIds = [
+        ...new Set(assignments.map((a) => a.salesExecutiveProfileId)),
+      ];
+      return {
+        archivedAt: null,
+        OR: [
+          { createdById: actor.id },
+          { salesExecutiveProfileId: { in: profileIds } },
+          { assignment: { commandoUserId: actor.id } },
+        ],
+      };
+    }
+    case "TEAM_LEAD": {
+      const teamIds = await getActiveTeamIds(prisma, actor.id);
+      return {
+        archivedAt: null,
+        profile: { teamId: { in: teamIds } },
+      };
+    }
+    case "SALES_EXECUTIVE": {
+      const profile = await prisma.salesExecutiveProfile.findFirst({
+        where: { userId: actor.id, archivedAt: null },
+        select: { id: true },
+      });
+      if (!profile) return { id: "__none__" };
+      const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
+      const statuses = lifecycle.isAfterCommando
+        ? (["ACTIVE", "COMPLETED", "EXPIRED", "REPLACED", "CANCELLED"] as const)
+        : (["ACTIVE"] as const);
+      return {
+        archivedAt: null,
+        salesExecutiveProfileId: profile.id,
+        status: { in: [...statuses] },
+      };
+    }
+    default:
+      return { id: "__none__" };
+  }
+}
+
+async function assertCanAccess(actor: Actor, row: ItemRow): Promise<void> {
+  if (isSuperAdmin(actor)) return;
+
+  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    if (row.createdById === actor.id) return;
+    if (row.assignment?.commandoUserId === actor.id) return;
+    const assigned = await prisma.commandoAssignment.findFirst({
+      where: {
+        salesExecutiveProfileId: row.salesExecutiveProfileId,
+        commandoUserId: actor.id,
+      },
+      select: { id: true },
+    });
+    if (!assigned) {
+      throw forbidden("Action item is outside your assignment scope");
+    }
+    return;
+  }
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (!teamIds.includes(row.profile.teamId)) {
+      throw forbidden("Action item is outside your team scope");
+    }
+    return;
+  }
+
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    if (row.profile.userId !== actor.id) {
+      throw forbidden("You may only view your own action items");
+    }
+    const lifecycle = await getCommandoLifecycleState(
+      prisma,
+      row.salesExecutiveProfileId,
+    );
+    if (!salesExecutiveCanViewActionItemStatus(row.status, lifecycle)) {
+      throw forbidden(
+        "Action item history is not visible during an active Commando assignment",
+      );
+    }
+    return;
+  }
+
+  throw forbidden("Not allowed to access action items");
+}
+
+async function assertCanManage(actor: Actor, row: ItemRow): Promise<void> {
+  await assertCanAccess(actor, row);
+  if (isSuperAdmin(actor)) {
+    throw forbidden("Super Admin is read-only for action items");
+  }
+  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    const active = await prisma.commandoAssignment.findFirst({
+      where: {
+        salesExecutiveProfileId: row.salesExecutiveProfileId,
+        commandoUserId: actor.id,
+        status: "ACTIVE",
+      },
+      select: { id: true },
+    });
+    if (!active && row.createdById !== actor.id) {
+      throw forbidden("No active assignment to manage this action item");
+    }
+    return;
+  }
+  if (actor.roleCode === "TEAM_LEAD") {
+    await assertTeamLeadOperationalWriteAllowed(
+      prisma,
+      actor,
+      row.salesExecutiveProfileId,
+      { action: "ACTION_ITEM_UPDATE" },
+    );
+    return;
+  }
+  throw forbidden("Only Commandos and Team Leads can manage action items");
+}
+
+export async function listActionItems(
+  actor: Actor,
+  query: ListActionItemsQuery,
+) {
+  const scope = await scopeWhere(actor);
+
+  // SE during Commando: force ACTIVE only — ignore view/status query bypasses
+  let effectiveView = query.view;
+  let effectiveStatus = query.status;
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    const profile = await prisma.salesExecutiveProfile.findFirst({
+      where: { userId: actor.id, archivedAt: null },
+      select: { id: true },
+    });
+    if (profile) {
+      const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
+      if (lifecycle.isDuringCommando) {
+        if (
+          query.view === "history" ||
+          query.view === "all" ||
+          (query.status && query.status !== "ACTIVE")
+        ) {
+          throw forbidden(
+            "Action item history is not visible during an active Commando assignment",
+          );
+        }
+        effectiveView = "active";
+        effectiveStatus = undefined;
+      }
+    }
+  }
+
+  const viewFilter: Prisma.ActionItemWhereInput =
+    effectiveStatus
+      ? { status: effectiveStatus }
+      : effectiveView === "active"
+        ? { status: "ACTIVE" }
+        : effectiveView === "history"
+          ? {
+              status: {
+                in: ["COMPLETED", "EXPIRED", "REPLACED", "CANCELLED"],
+              },
+            }
+          : {};
+
+  const where: Prisma.ActionItemWhereInput = {
+    AND: [
+      scope,
+      viewFilter,
+      ...(query.profileId
+        ? [{ salesExecutiveProfileId: query.profileId }]
+        : []),
+      ...(query.search
+        ? [
+            {
+              OR: [
+                {
+                  title: {
+                    contains: query.search,
+                    mode: "insensitive" as const,
+                  },
+                },
+                {
+                  description: {
+                    contains: query.search,
+                    mode: "insensitive" as const,
+                  },
+                },
+                {
+                  profile: {
+                    displayName: {
+                      contains: query.search,
+                      mode: "insensitive" as const,
+                    },
+                  },
+                },
+              ],
+            },
+          ]
+        : []),
+    ],
+  };
+
+  const [total, rows] = await Promise.all([
+    prisma.actionItem.count({ where }),
+    prisma.actionItem.findMany({
+      where,
+      skip: (query.page - 1) * query.pageSize,
+      take: query.pageSize,
+      orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
+      include: itemInclude,
+    }),
+  ]);
+
+  return {
+    page: query.page,
+    pageSize: query.pageSize,
+    total,
+    view: query.view,
+    actionItems: await serializeMany(rows),
+  };
+}
+
+export async function getActionItem(actor: Actor, id: string) {
+  const row = await prisma.actionItem.findFirst({
+    where: { id, archivedAt: null },
+    include: itemInclude,
+  });
+  if (!row) throw notFound("Action item not found");
+  await assertCanAccess(actor, row);
+
+  // Walk previous chain for history context
+  const previous: Array<{
+    id: string;
+    title: string;
+    status: string;
+    createdAt: Date;
+    completedAt: Date | null;
+    expiredAt: Date | null;
+  }> = [];
+  let cursor = row.replacesId;
+  let guard = 0;
+  while (cursor && guard < 20) {
+    const prev = await prisma.actionItem.findUnique({
+      where: { id: cursor },
+      select: {
+        id: true,
+        title: true,
+        status: true,
+        createdAt: true,
+        completedAt: true,
+        expiredAt: true,
+        replacesId: true,
+      },
+    });
+    if (!prev) break;
+    previous.push({
+      id: prev.id,
+      title: prev.title,
+      status: prev.status,
+      createdAt: prev.createdAt,
+      completedAt: prev.completedAt,
+      expiredAt: prev.expiredAt,
+    });
+    cursor = prev.replacesId;
+    guard += 1;
+  }
+
+  const extras = await loadUsers(
+    row.assignment ? [row.assignment.commandoUserId] : [],
+  );
+  return {
+    ...serialize(row, extras),
+    previousActions: previous,
+  };
+}
+
+export async function createActionItem(
+  actor: Actor,
+  input: CreateActionItemInput,
+) {
+  if (isSuperAdmin(actor)) {
+    throw forbidden("Super Admin is read-only for action items");
+  }
+  if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD"
+  ) {
+    throw forbidden("Only Commandos and Team Leads can create action items");
+  }
+
+  const profile = await prisma.salesExecutiveProfile.findFirst({
+    where: { id: input.salesExecutiveProfileId, archivedAt: null },
+  });
+  if (!profile) throw notFound("Sales executive profile not found");
+
+  let assignmentId: string | null = null;
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (!teamIds.includes(profile.teamId)) {
+      throw forbidden("Profile is outside your team scope");
+    }
+    await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
+      action: "ACTION_ITEM_CREATE",
+    });
+  } else {
+    const assignment = await prisma.commandoAssignment.findFirst({
+      where: {
+        salesExecutiveProfileId: profile.id,
+        commandoUserId: actor.id,
+        status: "ACTIVE",
+      },
+    });
+    if (!assignment) {
+      throw forbidden(
+        "You may only create action items for profiles with an active assignment to you",
+      );
+    }
+    assignmentId = assignment.id;
+  }
+
+  const created = await prisma.actionItem.create({
+    data: {
+      salesExecutiveProfileId: profile.id,
+      assignmentId,
+      title: input.title,
+      description: input.description?.trim()
+        ? input.description.trim()
+        : null,
+      dueDate: input.dueDate ?? null,
+      status: "ACTIVE",
+      createdById: actor.id,
+    },
+    include: itemInclude,
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: "ACTION_ITEM_CREATED",
+    entityType: "ActionItem",
+    entityId: created.id,
+    metadata: { profileId: profile.id, assignmentId, verb: "CREATE" },
+  });
+
+  const extras = await loadUsers(
+    created.assignment ? [created.assignment.commandoUserId] : [],
+  );
+  return serialize(created, extras);
+}
+
+export async function updateActionItem(
+  actor: Actor,
+  id: string,
+  input: UpdateActionItemInput,
+) {
+  const existing = await prisma.actionItem.findFirst({
+    where: { id, archivedAt: null },
+    include: itemInclude,
+  });
+  if (!existing) throw notFound("Action item not found");
+  await assertCanManage(actor, existing);
+
+  if (existing.status !== "ACTIVE") {
+    throw badRequest("Only ACTIVE action items can be edited");
+  }
+
+  const updated = await prisma.actionItem.update({
+    where: { id },
+    data: {
+      title: input.title,
+      description:
+        input.description === undefined
+          ? undefined
+          : input.description?.trim()
+            ? input.description.trim()
+            : null,
+      dueDate: input.dueDate === undefined ? undefined : input.dueDate,
+    },
+    include: itemInclude,
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: "ACTION_ITEM_UPDATED",
+    entityType: "ActionItem",
+    entityId: updated.id,
+    metadata: { title: updated.title, verb: "UPDATE" },
+  });
+
+  const extras = await loadUsers(
+    updated.assignment ? [updated.assignment.commandoUserId] : [],
+  );
+  return serialize(updated, extras);
+}
+
+export async function completeActionItem(actor: Actor, id: string) {
+  const existing = await prisma.actionItem.findFirst({
+    where: { id, archivedAt: null },
+    include: itemInclude,
+  });
+  if (!existing) throw notFound("Action item not found");
+  await assertCanManage(actor, existing);
+
+  if (existing.status !== "ACTIVE") {
+    throw badRequest("Only ACTIVE action items can be completed");
+  }
+
+  const updated = await prisma.actionItem.update({
+    where: { id },
+    data: {
+      status: "COMPLETED",
+      completedAt: new Date(),
+    },
+    include: itemInclude,
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: "ACTION_ITEM_COMPLETED",
+    entityType: "ActionItem",
+    entityId: updated.id,
+    metadata: { from: "ACTIVE", to: "COMPLETED", verb: "COMPLETE" },
+  });
+
+  const extras = await loadUsers(
+    updated.assignment ? [updated.assignment.commandoUserId] : [],
+  );
+  return serialize(updated, extras);
+}
+
+export async function expireActionItem(actor: Actor, id: string) {
+  const existing = await prisma.actionItem.findFirst({
+    where: { id, archivedAt: null },
+    include: itemInclude,
+  });
+  if (!existing) throw notFound("Action item not found");
+  await assertCanManage(actor, existing);
+
+  if (existing.status !== "ACTIVE") {
+    throw badRequest("Only ACTIVE action items can be expired");
+  }
+
+  const updated = await prisma.actionItem.update({
+    where: { id },
+    data: {
+      status: "EXPIRED",
+      expiredAt: new Date(),
+    },
+    include: itemInclude,
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: "ACTION_ITEM_EXPIRED",
+    entityType: "ActionItem",
+    entityId: updated.id,
+    metadata: { from: "ACTIVE", to: "EXPIRED", verb: "ARCHIVE" },
+  });
+
+  const extras = await loadUsers(
+    updated.assignment ? [updated.assignment.commandoUserId] : [],
+  );
+  return serialize(updated, extras);
+}
+
+/**
+ * Replace creates a new ACTIVE item and marks the old one REPLACED.
+ * Old record is never deleted.
+ */
+export async function replaceActionItem(
+  actor: Actor,
+  id: string,
+  input: ReplaceActionItemInput,
+) {
+  const existing = await prisma.actionItem.findFirst({
+    where: { id, archivedAt: null },
+    include: itemInclude,
+  });
+  if (!existing) throw notFound("Action item not found");
+  await assertCanManage(actor, existing);
+
+  if (existing.status !== "ACTIVE") {
+    throw badRequest("Only ACTIVE action items can be replaced");
+  }
+
+  const created = await prisma.$transaction(async (tx) => {
+    await tx.actionItem.update({
+      where: { id: existing.id },
+      data: { status: "REPLACED" },
+    });
+
+    return tx.actionItem.create({
+      data: {
+        salesExecutiveProfileId: existing.salesExecutiveProfileId,
+        assignmentId: existing.assignmentId,
+        title: input.title,
+        description: input.description?.trim()
+          ? input.description.trim()
+          : null,
+        dueDate: input.dueDate ?? null,
+        status: "ACTIVE",
+        replacesId: existing.id,
+        createdById: actor.id,
+      },
+      include: itemInclude,
+    });
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: "ACTION_ITEM_REPLACED",
+    entityType: "ActionItem",
+    entityId: created.id,
+    metadata: {
+      replacesId: existing.id,
+      from: "ACTIVE",
+      to: "REPLACED",
+      verb: "REPLACE",
+    },
+  });
+
+  const extras = await loadUsers(
+    created.assignment ? [created.assignment.commandoUserId] : [],
+  );
+  return serialize(created, extras);
+}
