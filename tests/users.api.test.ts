@@ -178,20 +178,60 @@ describe("user management & sales executive onboarding API", () => {
     ).toBe(true);
   });
 
-  it("blocks non-admin from SE onboarding and prevents duplicate SE email", async () => {
+  it("allows Team Lead to onboard SE on their team and blocks out-of-scope teams", async () => {
     const tl = await token("teamlead@commando.local");
-    const denied = await request(app)
+    const email = uniqueEmail("tl-se-ok");
+    const allowed = await request(app)
       .post("/api/users/sales-executives")
       .set("Authorization", `Bearer ${tl}`)
       .send({
+        firstName: "Tess",
+        lastName: "LeadSe",
+        email,
+        password: PASSWORD,
+        teamId,
+        displayName: "Tess LeadSe",
+      });
+    expect(allowed.status).toBe(201);
+    expect(allowed.body.data.user.role.code).toBe("SALES_EXECUTIVE");
+    expect(allowed.body.data.profile.team.id).toBe(teamId);
+
+    const otherTeam = await prisma.team.create({
+      data: {
+        name: `Other Team ${Date.now()}`,
+        description: "Out of scope for Alpha Team Lead",
+      },
+    });
+    try {
+      const denied = await request(app)
+        .post("/api/users/sales-executives")
+        .set("Authorization", `Bearer ${tl}`)
+        .send({
+          firstName: "Out",
+          lastName: "Scope",
+          email: uniqueEmail("tl-se-bad"),
+          password: PASSWORD,
+          teamId: otherTeam.id,
+          displayName: "Out Scope",
+        });
+      expect(denied.status).toBe(403);
+    } finally {
+      await prisma.team.delete({ where: { id: otherTeam.id } }).catch(() => undefined);
+    }
+
+    const c = await token("commando@commando.local");
+    const commandoDenied = await request(app)
+      .post("/api/users/sales-executives")
+      .set("Authorization", `Bearer ${c}`)
+      .send({
         firstName: "X",
         lastName: "Y",
-        email: uniqueEmail("tl-se"),
+        email: uniqueEmail("commando-se"),
         password: PASSWORD,
         teamId,
         displayName: "X Y",
       });
-    expect(denied.status).toBe(403);
+    expect(commandoDenied.status).toBe(403);
 
     const existingSe = await request(app)
       .post("/api/users/sales-executives")

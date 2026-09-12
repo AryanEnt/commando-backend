@@ -32,17 +32,16 @@ describe("permission matrix (least privilege)", () => {
       PERMISSIONS.USER_MANAGE,
     );
     expect(ROLE_PERMISSION_MAP.TEAM_LEAD).not.toContain(PERMISSIONS.USER_CREATE);
-    expect(ROLE_PERMISSION_MAP.TEAM_LEAD).not.toContain(
-      PERMISSIONS.SALES_EXECUTIVE_CREATE,
-    );
   });
 
-  it("limits sales support to sync eval, role assignment, support tasks, and dashboard", () => {
+  it("limits sales support to profile, sync eval, role assignment, support tasks, links, and dashboard", () => {
     expect(ROLE_PERMISSION_MAP.SALES_SUPPORT_EXECUTIVE).toEqual([
+      PERMISSIONS.PROFILE_VIEW,
       PERMISSIONS.SYNC_EVAL_VIEW,
       PERMISSIONS.ROLE_ASSIGNMENT_VIEW,
       PERMISSIONS.SALES_SUPPORT_TASK_VIEW,
       PERMISSIONS.SALES_SUPPORT_TASK_STATUS_UPDATE,
+      PERMISSIONS.SALES_SUPPORT_LINK_VIEW,
       PERMISSIONS.DASHBOARD_VIEW,
     ]);
     expect(ROLE_PERMISSION_MAP.SALES_SUPPORT_EXECUTIVE).not.toContain(
@@ -50,6 +49,27 @@ describe("permission matrix (least privilege)", () => {
     );
     expect(ROLE_PERMISSION_MAP.SALES_SUPPORT_EXECUTIVE).not.toContain(
       PERMISSIONS.SALES_SUPPORT_TASK_UPDATE,
+    );
+    expect(ROLE_PERMISSION_MAP.SALES_SUPPORT_EXECUTIVE).not.toContain(
+      PERMISSIONS.SALES_SUPPORT_LINK_ASSIGN,
+    );
+  });
+
+  it("grants team lead support link assign and view", () => {
+    expect(ROLE_PERMISSION_MAP.TEAM_LEAD).toContain(
+      PERMISSIONS.SALES_SUPPORT_LINK_VIEW,
+    );
+    expect(ROLE_PERMISSION_MAP.TEAM_LEAD).toContain(
+      PERMISSIONS.SALES_SUPPORT_LINK_ASSIGN,
+    );
+  });
+
+  it("grants commando support link view and assign for active interventions", () => {
+    expect(ROLE_PERMISSION_MAP.COMMANDO_EXECUTIVE).toContain(
+      PERMISSIONS.SALES_SUPPORT_LINK_VIEW,
+    );
+    expect(ROLE_PERMISSION_MAP.COMMANDO_EXECUTIVE).toContain(
+      PERMISSIONS.SALES_SUPPORT_LINK_ASSIGN,
     );
   });
 
@@ -59,6 +79,15 @@ describe("permission matrix (least privilege)", () => {
     );
     expect(ROLE_PERMISSION_MAP.SALES_EXECUTIVE).not.toContain(
       PERMISSIONS.MONITORING_CREATE,
+    );
+  });
+
+  it("grants sales executive support link view for own team (not assign)", () => {
+    expect(ROLE_PERMISSION_MAP.SALES_EXECUTIVE).toContain(
+      PERMISSIONS.SALES_SUPPORT_LINK_VIEW,
+    );
+    expect(ROLE_PERMISSION_MAP.SALES_EXECUTIVE).not.toContain(
+      PERMISSIONS.SALES_SUPPORT_LINK_ASSIGN,
     );
   });
 

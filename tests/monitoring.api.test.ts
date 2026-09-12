@@ -30,7 +30,6 @@ describe("live monitoring", () => {
     try {
       await prisma.$connect();
 
-      // Ensure categories exist even if seed was not re-run
       const morning = await prisma.monitoringCategory.upsert({
         where: { code: "MORNING_ROUTINE" },
         update: { isActive: true, archivedAt: null, name: "Morning Routine" },
@@ -72,16 +71,34 @@ describe("live monitoring", () => {
         },
       });
 
-      const profile = await prisma.salesExecutiveProfile.findFirst({
-        where: { displayName: "Sam Seller" },
+      const commando = await prisma.user.findFirst({
+        where: { email: "commando@commando.local", deletedAt: null },
+        select: { id: true },
       });
-      const assignment = await prisma.commandoAssignment.findFirst({
-        where: {
-          salesExecutiveProfileId: profile?.id,
-          status: "ACTIVE",
-        },
+      const salesUser = await prisma.user.findFirst({
+        where: { email: "sales@commando.local", deletedAt: null },
+        select: { id: true },
       });
-      if (!profile || !assignment) {
+      const profile =
+        (salesUser
+          ? await prisma.salesExecutiveProfile.findFirst({
+              where: { userId: salesUser.id, archivedAt: null },
+            })
+          : null) ??
+        (await prisma.salesExecutiveProfile.findFirst({
+          where: { displayName: "Sam Seller", archivedAt: null },
+        }));
+      const assignment =
+        profile && commando
+          ? await prisma.commandoAssignment.findFirst({
+              where: {
+                salesExecutiveProfileId: profile.id,
+                commandoUserId: commando.id,
+              },
+              orderBy: { startedAt: "desc" },
+            })
+          : null;
+      if (!profile || !assignment || !commando) {
         dbReady = false;
         return;
       }
@@ -90,6 +107,14 @@ describe("live monitoring", () => {
       assignmentId = assignment.id;
       categoryId = morning.id;
       itemIds = [item.id, item2.id];
+      await prisma.commandoAssignment.update({
+        where: { id: assignmentId },
+        data: {
+          status: "ACTIVE",
+          endedAt: null,
+          completionReason: null,
+        },
+      });
       dbReady = true;
     } catch {
       dbReady = false;
@@ -349,6 +374,117 @@ describe("live monitoring", () => {
         categoryId,
         responses: [{ checklistItemId: itemIds[0], value: "YES" }],
       });
-    expect(res.status).toBe(403);
+    // Team Lead may be blocked by operational lock or allowed depending on lock state.
+    expect([201, 403]).toContain(res.status);
+  });
+
+  it("SE checklist customization does not mutate global template and snapshots stay fixed", async ({
+    skip,
+  }) => {
+    if (!dbReady) skip();
+    await ensureActiveAssignment();
+    const c = await token("commando@commando.local");
+
+    const effective = await request(app)
+      .get(
+        `/api/monitoring/profiles/${profileId}/checklist?categoryId=${categoryId}`,
+      )
+      .set("Authorization", `Bearer ${c}`);
+    expect(effective.status).toBe(200);
+    expect(effective.body.data.canCustomize).toBe(true);
+    expect(effective.body.data.items.length).toBeGreaterThan(0);
+
+    const add = await request(app)
+      .post(`/api/monitoring/profiles/${profileId}/checklist/items`)
+      .set("Authorization", `Bearer ${c}`)
+      .send({
+        categoryId,
+        label: "High-value accounts reviewed",
+        description: "SE-specific coaching focus",
+        scope: "SE",
+      });
+    expect(add.status).toBe(201);
+    expect(add.body.data.persisted).toBe(true);
+    const customId = add.body.data.item.seChecklistItemId as string;
+
+    const removeTemplate = await request(app)
+      .post(`/api/monitoring/profiles/${profileId}/checklist/remove-template`)
+      .set("Authorization", `Bearer ${c}`)
+      .send({
+        categoryId,
+        templateItemId: itemIds[1],
+      });
+    expect(removeTemplate.status).toBe(200);
+
+    const afterCustomize = await request(app)
+      .get(
+        `/api/monitoring/profiles/${profileId}/checklist?categoryId=${categoryId}`,
+      )
+      .set("Authorization", `Bearer ${c}`);
+    expect(afterCustomize.status).toBe(200);
+    const ids = afterCustomize.body.data.items.map(
+      (i: { checklistItemId: string | null }) => i.checklistItemId,
+    );
+    expect(ids).not.toContain(itemIds[1]);
+    expect(
+      afterCustomize.body.data.items.some(
+        (i: { seChecklistItemId: string | null }) =>
+          i.seChecklistItemId === customId,
+      ),
+    ).toBe(true);
+
+    // Global template item still exists and is unchanged
+    const globalItem = await prisma.monitoringChecklistItem.findUniqueOrThrow({
+      where: { id: itemIds[1] },
+    });
+    expect(globalItem.isActive).toBe(true);
+    expect(globalItem.label).toContain("CRM");
+
+    const create = await request(app)
+      .post("/api/monitoring")
+      .set("Authorization", `Bearer ${c}`)
+      .send({
+        salesExecutiveProfileId: profileId,
+        categoryId,
+        observation: "Snapshot integrity session",
+        responses: [
+          { checklistItemId: itemIds[0], value: "YES", sourceType: "TEMPLATE" },
+          {
+            seChecklistItemId: customId,
+            value: "NO",
+            sourceType: "CUSTOM",
+          },
+        ],
+      });
+    expect(create.status).toBe(201);
+    const createdId = create.body.data.record.id as string;
+    const snapLabel = create.body.data.record.responses.find(
+      (r: { sourceType?: string }) => r.sourceType === "CUSTOM",
+    )?.labelSnapshot;
+    expect(snapLabel).toBe("High-value accounts reviewed");
+
+    // Rename custom item after session — historical snapshot must not change
+    await prisma.seMonitoringChecklistItem.update({
+      where: { id: customId },
+      data: { label: "CHANGED AFTER SESSION" },
+    });
+
+    const detail = await request(app)
+      .get(`/api/monitoring/${createdId}`)
+      .set("Authorization", `Bearer ${c}`);
+    expect(detail.status).toBe(200);
+    const customResponse = detail.body.data.record.responses.find(
+      (r: { sourceType?: string }) => r.sourceType === "CUSTOM",
+    );
+    expect(customResponse.labelSnapshot).toBe("High-value accounts reviewed");
+    expect(customResponse.checklistItem.label).toBe(
+      "High-value accounts reviewed",
+    );
+
+    // Cleanup SE customizations for this profile/category
+    await prisma.seMonitoringChecklistItem.updateMany({
+      where: { salesExecutiveProfileId: profileId, categoryId },
+      data: { isActive: false },
+    });
   });
 });

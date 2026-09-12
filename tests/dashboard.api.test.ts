@@ -95,6 +95,9 @@ describe("Super Admin Control Tower", () => {
       pendingReferrals: expect.any(Array),
       overdueActions: expect.any(Array),
     });
+    expect(typeof res.body.data.generatedAt).toBe("string");
+    expect(Array.isArray(res.body.data.recentActivity)).toBe(true);
+    expect(res.body.data.recentActivity.length).toBeLessThanOrEqual(8);
   });
 
   it("Super Admin receives organization structure", async ({ skip }) => {

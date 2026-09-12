@@ -5,7 +5,9 @@ import { hasPermission, isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
+import { getActiveTeamIds } from "../../lib/scope.js";
 import type {
+  AddSupportTaskProgressNoteInput,
   CreateSupportTaskInput,
   ListSupportTasksQuery,
   UpdateSupportTaskInput,
@@ -41,11 +43,36 @@ const taskInclude = {
     },
   },
   salesSupportLink: {
-    select: { id: true, isActive: true, startedAt: true, endedAt: true },
+    select: {
+      id: true,
+      isActive: true,
+      startedAt: true,
+      endedAt: true,
+      responsibilityType: true,
+    },
+  },
+  shouldDoItems: { orderBy: { sortOrder: "asc" as const } },
+  shouldNotDoItems: { orderBy: { sortOrder: "asc" as const } },
+  progressNotes: {
+    orderBy: { createdAt: "desc" as const },
+    take: 50,
+    include: { createdBy: userBrief },
+  },
+  assignmentEvents: {
+    orderBy: { createdAt: "desc" as const },
+    take: 20,
+    include: { changedBy: userBrief },
   },
 } satisfies Prisma.SupportTaskInclude;
 
 type TaskRow = Prisma.SupportTaskGetPayload<{ include: typeof taskInclude }>;
+
+const ACTIVE_STATUSES: SupportTaskStatus[] = [
+  "PENDING",
+  "ACCEPTED",
+  "IN_PROGRESS",
+  "BLOCKED",
+];
 
 function isOverdue(
   dueDate: Date | null,
@@ -61,12 +88,15 @@ function serialize(row: TaskRow) {
     id: row.id,
     title: row.title,
     description: row.description,
+    purpose: row.purpose,
     priority: row.priority,
     status: row.status,
     dueDate: row.dueDate,
     isOverdue: isOverdue(row.dueDate, row.status),
     completedAt: row.completedAt,
     completionNotes: row.completionNotes,
+    blockedReason: row.blockedReason,
+    blockedAt: row.blockedAt,
     salesExecutiveProfileId: row.salesExecutiveProfileId,
     profile: row.profile,
     salesSupportUserId: row.salesSupportUserId,
@@ -79,15 +109,36 @@ function serialize(row: TaskRow) {
     assignment: row.assignment,
     salesSupportLinkId: row.salesSupportLinkId,
     salesSupportLink: row.salesSupportLink,
+    shouldDo: row.shouldDoItems.map((i) => ({
+      id: i.id,
+      text: i.text,
+      sortOrder: i.sortOrder,
+    })),
+    shouldNotDo: row.shouldNotDoItems.map((i) => ({
+      id: i.id,
+      text: i.text,
+      sortOrder: i.sortOrder,
+    })),
+    progressNotes: row.progressNotes.map((n) => ({
+      id: n.id,
+      body: n.body,
+      createdAt: n.createdAt,
+      createdBy: n.createdBy,
+    })),
+    assignmentHistory: row.assignmentEvents.map((e) => ({
+      id: e.id,
+      fromSupportUserId: e.fromSupportUserId,
+      toSupportUserId: e.toSupportUserId,
+      salesSupportLinkId: e.salesSupportLinkId,
+      reason: e.reason,
+      changedBy: e.changedBy,
+      createdAt: e.createdAt,
+    })),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
 }
 
-/**
- * Hard scope: Sales Support Executive NEVER sees another assignee's tasks.
- * Query filters cannot widen this.
- */
 async function scopeWhere(actor: Actor): Promise<Prisma.SupportTaskWhereInput> {
   if (isSuperAdmin(actor)) {
     return { archivedAt: null };
@@ -112,11 +163,29 @@ async function scopeWhere(actor: Actor): Promise<Prisma.SupportTaskWhereInput> {
         ],
       };
     }
+    case "TEAM_LEAD": {
+      const teamIds = await getActiveTeamIds(prisma, actor.id);
+      return {
+        archivedAt: null,
+        profile: { teamId: { in: teamIds }, archivedAt: null },
+      };
+    }
     case "SALES_SUPPORT_EXECUTIVE":
       return {
         archivedAt: null,
         salesSupportUserId: actor.id,
       };
+    case "SALES_EXECUTIVE": {
+      const profile = await prisma.salesExecutiveProfile.findFirst({
+        where: { userId: actor.id, archivedAt: null },
+        select: { id: true },
+      });
+      if (!profile) return { id: "__none__" };
+      return {
+        archivedAt: null,
+        salesExecutiveProfileId: profile.id,
+      };
+    }
     default:
       return { id: "__none__" };
   }
@@ -128,6 +197,13 @@ async function assertCanAccess(actor: Actor, row: TaskRow): Promise<void> {
   if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
     if (row.salesSupportUserId !== actor.id) {
       throw forbidden("You may only view tasks assigned to you");
+    }
+    return;
+  }
+
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    if (row.profile.userId !== actor.id) {
+      throw forbidden("You may only view support tasks for your own profile");
     }
     return;
   }
@@ -148,12 +224,30 @@ async function assertCanAccess(actor: Actor, row: TaskRow): Promise<void> {
     return;
   }
 
+  if (actor.roleCode === "TEAM_LEAD") {
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (!teamIds.includes(row.profile.teamId)) {
+      throw forbidden("Support task is outside your team scope");
+    }
+    return;
+  }
+
   throw forbidden("Not allowed to access support tasks");
 }
 
-function viewWhere(
-  query: ListSupportTasksQuery,
-): Prisma.SupportTaskWhereInput {
+function assertCanManageAssignment(actor: Actor): void {
+  if (isSuperAdmin(actor)) {
+    throw forbidden("Super Admin is read-only for support tasks");
+  }
+  if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD"
+  ) {
+    throw forbidden("Only Commandos and Team Leads can manage support tasks");
+  }
+}
+
+function viewWhere(query: ListSupportTasksQuery): Prisma.SupportTaskWhereInput {
   const now = new Date();
   const filter = query.filter;
   const view = filter ?? query.view;
@@ -161,16 +255,30 @@ function viewWhere(
   if (view === "history" || view === "historical" || view === "completed") {
     return { status: "COMPLETED" };
   }
+  if (view === "blocked") {
+    return { status: "BLOCKED" };
+  }
   if (view === "overdue") {
     return {
-      status: { in: ["PENDING", "IN_PROGRESS"] },
+      status: { in: ACTIVE_STATUSES },
       dueDate: { lt: now },
     };
   }
   if (view === "active") {
-    return { status: { in: ["PENDING", "IN_PROGRESS"] } };
+    return { status: { in: ACTIVE_STATUSES } };
   }
   return {};
+}
+
+function replaceInstructionData(
+  items: string[] | undefined,
+):
+  | { create: Array<{ text: string; sortOrder: number }> }
+  | undefined {
+  if (!items) return undefined;
+  return {
+    create: items.map((text, index) => ({ text, sortOrder: index })),
+  };
 }
 
 export async function listSupportTasks(
@@ -179,7 +287,6 @@ export async function listSupportTasks(
 ) {
   const scope = await scopeWhere(actor);
 
-  // Sales Support cannot widen scope via salesSupportUserId filter.
   let assigneeFilter: Prisma.SupportTaskWhereInput | undefined;
   if (query.salesSupportUserId) {
     if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
@@ -205,6 +312,9 @@ export async function listSupportTasks(
       ...(query.priority ? [{ priority: query.priority }] : []),
       ...(query.profileId
         ? [{ salesExecutiveProfileId: query.profileId }]
+        : []),
+      ...(query.salesSupportLinkId
+        ? [{ salesSupportLinkId: query.salesSupportLinkId }]
         : []),
       ...(assigneeFilter ? [assigneeFilter] : []),
       ...(query.search
@@ -271,20 +381,22 @@ export async function createSupportTask(
   actor: Actor,
   input: CreateSupportTaskInput,
 ) {
-  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
-    throw forbidden("Sales Support Executives cannot create Commando tasks");
-  }
-  if (
-    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
-    !isSuperAdmin(actor)
-  ) {
-    throw forbidden("Only Commandos can create support tasks");
+  assertCanManageAssignment(actor);
+  if (!hasPermission(actor, PERMISSIONS.SALES_SUPPORT_TASK_CREATE)) {
+    throw forbidden("Missing permission to create support tasks");
   }
 
   const profile = await prisma.salesExecutiveProfile.findFirst({
     where: { id: input.salesExecutiveProfileId, archivedAt: null },
   });
   if (!profile) throw notFound("Sales executive profile not found");
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (!teamIds.includes(profile.teamId)) {
+      throw forbidden("Profile is outside your team scope");
+    }
+  }
 
   const supportUser = await prisma.user.findFirst({
     where: {
@@ -298,7 +410,7 @@ export async function createSupportTask(
     throw badRequest("Assignee must be an active Sales Support Executive");
   }
 
-  let assignmentId: string | null;
+  let assignmentId: string | null = null;
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
     const assignment = await prisma.commandoAssignment.findFirst({
       where: {
@@ -336,10 +448,14 @@ export async function createSupportTask(
     );
   }
 
+  const shouldDo = input.shouldDo.filter(Boolean);
+  const shouldNotDo = input.shouldNotDo.filter(Boolean);
+
   const created = await prisma.supportTask.create({
     data: {
       title: input.title,
       description: input.description ?? null,
+      purpose: input.purpose ?? null,
       priority: input.priority,
       dueDate: input.dueDate ?? null,
       salesExecutiveProfileId: input.salesExecutiveProfileId,
@@ -349,6 +465,21 @@ export async function createSupportTask(
       assignmentId,
       salesSupportLinkId: link.id,
       status: "PENDING",
+      shouldDoItems: {
+        create: shouldDo.map((text, index) => ({ text, sortOrder: index })),
+      },
+      shouldNotDoItems: {
+        create: shouldNotDo.map((text, index) => ({ text, sortOrder: index })),
+      },
+      assignmentEvents: {
+        create: {
+          fromSupportUserId: null,
+          toSupportUserId: input.salesSupportUserId,
+          salesSupportLinkId: link.id,
+          reason: "Initial assignment",
+          changedById: actor.id,
+        },
+      },
     },
     include: taskInclude,
   });
@@ -362,6 +493,8 @@ export async function createSupportTask(
       salesSupportUserId: created.salesSupportUserId,
       salesExecutiveProfileId: created.salesExecutiveProfileId,
       priority: created.priority,
+      shouldDoCount: shouldDo.length,
+      shouldNotDoCount: shouldNotDo.length,
     },
   });
 
@@ -379,29 +512,19 @@ export async function updateSupportTask(
   });
   if (!row) throw notFound("Support task not found");
   await assertCanAccess(actor, row);
+  assertCanManageAssignment(actor);
 
-  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
-    throw forbidden(
-      "Sales Support cannot edit task definitions; use status update instead",
-    );
-  }
-
-  if (
-    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
-    !isSuperAdmin(actor)
-  ) {
-    throw forbidden("Not allowed to update support tasks");
-  }
-
-  if (
-    actor.roleCode === "COMMANDO_EXECUTIVE" &&
-    !hasPermission(actor, PERMISSIONS.SALES_SUPPORT_TASK_UPDATE)
-  ) {
+  if (!hasPermission(actor, PERMISSIONS.SALES_SUPPORT_TASK_UPDATE)) {
     throw forbidden("Missing permission to update support tasks");
+  }
+
+  if (row.status === "COMPLETED") {
+    throw badRequest("Completed support tasks cannot be edited");
   }
 
   const nextAssignee = input.salesSupportUserId;
   let nextLinkId = row.salesSupportLinkId;
+  let reassigned = false;
 
   if (nextAssignee && nextAssignee !== row.salesSupportUserId) {
     const supportUser = await prisma.user.findFirst({
@@ -429,44 +552,138 @@ export async function updateSupportTask(
       );
     }
     nextLinkId = link.id;
+    reassigned = true;
   }
 
-  const nextStatus = input.status ?? row.status;
-  const completing =
-    nextStatus === "COMPLETED" && row.status !== "COMPLETED";
-  const reopening =
-    nextStatus !== "COMPLETED" && row.status === "COMPLETED";
+  const updated = await prisma.$transaction(async (tx) => {
+    if (input.shouldDo) {
+      await tx.supportTaskShouldDoItem.deleteMany({
+        where: { supportTaskId: row.id },
+      });
+    }
+    if (input.shouldNotDo) {
+      await tx.supportTaskShouldNotDoItem.deleteMany({
+        where: { supportTaskId: row.id },
+      });
+    }
 
-  const updated = await prisma.supportTask.update({
-    where: { id: row.id },
-    data: {
-      ...(input.title !== undefined ? { title: input.title } : {}),
-      ...(input.description !== undefined
-        ? { description: input.description }
-        : {}),
-      ...(input.priority !== undefined ? { priority: input.priority } : {}),
-      ...(input.dueDate !== undefined ? { dueDate: input.dueDate } : {}),
-      ...(nextAssignee ? { salesSupportUserId: nextAssignee } : {}),
-      ...(nextLinkId !== undefined ? { salesSupportLinkId: nextLinkId } : {}),
-      ...(input.status !== undefined ? { status: input.status } : {}),
-      ...(input.completionNotes !== undefined
-        ? { completionNotes: input.completionNotes }
-        : {}),
-      ...(completing ? { completedAt: new Date() } : {}),
-      ...(reopening ? { completedAt: null } : {}),
-    },
-    include: taskInclude,
+    return tx.supportTask.update({
+      where: { id: row.id },
+      data: {
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.description !== undefined
+          ? { description: input.description }
+          : {}),
+        ...(input.purpose !== undefined ? { purpose: input.purpose } : {}),
+        ...(input.priority !== undefined ? { priority: input.priority } : {}),
+        ...(input.dueDate !== undefined ? { dueDate: input.dueDate } : {}),
+        ...(nextAssignee ? { salesSupportUserId: nextAssignee } : {}),
+        ...(nextLinkId !== undefined
+          ? { salesSupportLinkId: nextLinkId }
+          : {}),
+        ...(reassigned
+          ? {
+              status: "PENDING" as const,
+              blockedReason: null,
+              blockedAt: null,
+              completedAt: null,
+            }
+          : {}),
+        ...(input.shouldDo
+          ? { shouldDoItems: replaceInstructionData(input.shouldDo) }
+          : {}),
+        ...(input.shouldNotDo
+          ? { shouldNotDoItems: replaceInstructionData(input.shouldNotDo) }
+          : {}),
+        ...(reassigned
+          ? {
+              assignmentEvents: {
+                create: {
+                  fromSupportUserId: row.salesSupportUserId,
+                  toSupportUserId: nextAssignee!,
+                  salesSupportLinkId: nextLinkId,
+                  reason: input.reassignReason?.trim() || "Reassigned",
+                  changedById: actor.id,
+                },
+              },
+            }
+          : {}),
+      },
+      include: taskInclude,
+    });
   });
 
   await writeAuditLog({
     actorId: actor.id,
-    action: AUDIT_ACTIONS.SUPPORT_TASK_UPDATED,
+    action: reassigned
+      ? AUDIT_ACTIONS.SUPPORT_TASK_REASSIGNED
+      : AUDIT_ACTIONS.SUPPORT_TASK_UPDATED,
     entityType: "SupportTask",
     entityId: updated.id,
-    metadata: { fields: Object.keys(input) },
+    metadata: {
+      fields: Object.keys(input),
+      ...(reassigned
+        ? {
+            from: row.salesSupportUserId,
+            to: nextAssignee,
+            reason: input.reassignReason ?? null,
+          }
+        : {}),
+    },
   });
 
   return serialize(updated);
+}
+
+function assertValidStatusTransition(
+  from: SupportTaskStatus,
+  to: SupportTaskStatus,
+  actor: Actor,
+): void {
+  if (from === to) return;
+
+  const isSupport = actor.roleCode === "SALES_SUPPORT_EXECUTIVE";
+  const isManager =
+    actor.roleCode === "COMMANDO_EXECUTIVE" ||
+    actor.roleCode === "TEAM_LEAD" ||
+    isSuperAdmin(actor);
+
+  const allowed: Record<SupportTaskStatus, SupportTaskStatus[]> = {
+    PENDING: ["ACCEPTED", "IN_PROGRESS", "BLOCKED", "COMPLETED"],
+    ACCEPTED: ["IN_PROGRESS", "BLOCKED", "COMPLETED", "PENDING"],
+    IN_PROGRESS: ["BLOCKED", "COMPLETED", "ACCEPTED"],
+    BLOCKED: ["IN_PROGRESS", "ACCEPTED", "COMPLETED"],
+    COMPLETED: isManager ? ["IN_PROGRESS", "PENDING"] : [],
+  };
+
+  if (!allowed[from].includes(to)) {
+    throw badRequest(`Cannot change status from ${from} to ${to}`);
+  }
+
+  // Support executes their own work; managers may override only for reopen/complete edge cases
+  if (isSupport) {
+    if (to === "COMPLETED" || to === "BLOCKED" || to === "IN_PROGRESS" || to === "ACCEPTED") {
+      return;
+    }
+  }
+
+  if (isManager && to === "COMPLETED") {
+    // Prefer Support to complete; managers may complete only as override
+    return;
+  }
+
+  if (isManager && (to === "PENDING" || from === "COMPLETED")) {
+    return;
+  }
+
+  if (isManager && to !== "COMPLETED" && from !== "COMPLETED") {
+    // Managers should not casually drive accept/start — Support owns execution
+    if (to === "ACCEPTED" || to === "IN_PROGRESS" || to === "BLOCKED") {
+      throw forbidden(
+        "Sales Support controls execution status (accept / start / block)",
+      );
+    }
+  }
 }
 
 export async function updateSupportTaskStatus(
@@ -482,6 +699,15 @@ export async function updateSupportTaskStatus(
   await assertCanAccess(actor, row);
 
   if (!hasPermission(actor, PERMISSIONS.SALES_SUPPORT_TASK_STATUS_UPDATE)) {
+    // Team Lead may not have STATUS_UPDATE — only Support and Commando do today
+    // Allow TL reopen via UPDATE path only; for Support status they need the permission
+    if (
+      actor.roleCode === "TEAM_LEAD" &&
+      input.status !== "COMPLETED" &&
+      row.status === "COMPLETED"
+    ) {
+      // no-op: TL lacks status update by design
+    }
     throw forbidden("Missing permission to update support task status");
   }
 
@@ -491,8 +717,23 @@ export async function updateSupportTaskStatus(
     }
   }
 
+  assertValidStatusTransition(row.status, input.status, actor);
+
+  if (input.status === "BLOCKED") {
+    const reason = input.blockedReason?.trim();
+    if (!reason) {
+      throw badRequest("A blocked reason is required");
+    }
+  }
+
+  if (input.status === "COMPLETED") {
+    // completion notes optional
+  }
+
   const completing =
     input.status === "COMPLETED" && row.status !== "COMPLETED";
+  const blocking = input.status === "BLOCKED" && row.status !== "BLOCKED";
+  const unblocking = input.status !== "BLOCKED" && row.status === "BLOCKED";
   const reopening =
     input.status !== "COMPLETED" && row.status === "COMPLETED";
 
@@ -505,6 +746,13 @@ export async function updateSupportTaskStatus(
         : {}),
       ...(completing ? { completedAt: new Date() } : {}),
       ...(reopening ? { completedAt: null } : {}),
+      ...(blocking
+        ? {
+            blockedReason: input.blockedReason!.trim(),
+            blockedAt: new Date(),
+          }
+        : {}),
+      ...(unblocking ? { blockedReason: null, blockedAt: null } : {}),
     },
     include: taskInclude,
   });
@@ -517,8 +765,61 @@ export async function updateSupportTaskStatus(
     metadata: {
       from: row.status,
       to: updated.status,
+      blockedReason: updated.blockedReason,
     },
   });
 
   return serialize(updated);
+}
+
+export async function addSupportTaskProgressNote(
+  actor: Actor,
+  id: string,
+  input: AddSupportTaskProgressNoteInput,
+) {
+  const row = await prisma.supportTask.findFirst({
+    where: { id, archivedAt: null },
+    include: taskInclude,
+  });
+  if (!row) throw notFound("Support task not found");
+  await assertCanAccess(actor, row);
+
+  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+    if (row.salesSupportUserId !== actor.id) {
+      throw forbidden("You may only add notes on tasks assigned to you");
+    }
+  } else if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD" &&
+    !isSuperAdmin(actor)
+  ) {
+    throw forbidden("Not allowed to add progress notes");
+  }
+
+  if (row.status === "COMPLETED") {
+    throw badRequest("Cannot add progress notes to a completed task");
+  }
+
+  await prisma.supportTaskProgressNote.create({
+    data: {
+      supportTaskId: row.id,
+      body: input.body.trim(),
+      createdById: actor.id,
+    },
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: AUDIT_ACTIONS.SUPPORT_TASK_PROGRESS_NOTE_ADDED,
+    entityType: "SupportTask",
+    entityId: row.id,
+    metadata: { preview: input.body.trim().slice(0, 120) },
+  });
+
+  const refreshed = await prisma.supportTask.findFirst({
+    where: { id: row.id },
+    include: taskInclude,
+  });
+  if (!refreshed) throw notFound("Support task not found");
+  return serialize(refreshed);
 }

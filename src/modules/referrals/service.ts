@@ -71,6 +71,7 @@ type TeamLeadSwotSummary = {
 function serialize(
   referral: ReferralRow,
   teamLeadSwot: TeamLeadSwotSummary | null = null,
+  actor: Actor | null = null,
 ) {
   return {
     id: referral.id,
@@ -107,7 +108,7 @@ function serialize(
     createdAt: referral.createdAt,
     updatedAt: referral.updatedAt,
     teamLeadSwot,
-    allowedActions: allowedActionsFor(referral),
+    allowedActions: allowedActionsFor(referral, actor),
   };
 }
 
@@ -137,38 +138,61 @@ async function findTeamLeadSwot(
   });
 }
 
-async function attachTeamLeadSwot(referral: ReferralRow) {
+async function attachTeamLeadSwot(referral: ReferralRow, actor: Actor | null = null) {
   const swot =
     (await findTeamLeadSwot(referral.salesExecutiveProfileId, referral.createdAt)) ??
     (await findTeamLeadSwot(referral.salesExecutiveProfileId));
-  return serialize(referral, swot);
+  return serialize(referral, swot, actor);
 }
 
-function allowedActionsFor(referral: {
-  status: ReferralStatus;
-  initiatedBy: "TEAM_LEAD" | "COMMANDO";
-  informationProvidedAt: Date | null;
-}): string[] {
+/**
+ * Actions the *viewing actor* may take. Status alone is not enough —
+ * Commandos must never receive Team Lead approve/reject actions.
+ */
+function allowedActionsFor(
+  referral: {
+    status: ReferralStatus;
+    initiatedBy: "TEAM_LEAD" | "COMMANDO";
+    informationProvidedAt: Date | null;
+    commandoUserId: string;
+  },
+  actor: Actor | null,
+): string[] {
   if (referral.status === "COMPLETED" || referral.status === "REJECTED") {
     return [];
   }
+
+  const role = actor?.roleCode;
+  const isTeamLeadActor =
+    role === "TEAM_LEAD" || (actor ? isSuperAdmin(actor) : false);
+  const isAssignedCommando =
+    !!actor &&
+    (isSuperAdmin(actor) ||
+      (role === "COMMANDO_EXECUTIVE" && referral.commandoUserId === actor.id));
 
   if (referral.status === "SUBMITTED") {
     if (
       referral.initiatedBy === "COMMANDO" &&
       !referral.informationProvidedAt
     ) {
-      return ["provideInformation", "reject"];
+      return isTeamLeadActor ? ["provideInformation", "reject"] : [];
     }
-    // Legacy Team Lead–initiated handoffs (deprecated)
+    // Legacy Team Lead–initiated handoffs
     if (referral.initiatedBy === "TEAM_LEAD") {
-      return ["acknowledge", "reject"];
+      const actions: string[] = [];
+      if (isAssignedCommando) actions.push("acknowledge");
+      if (isTeamLeadActor) actions.push("reject");
+      return actions;
     }
-    return ["acknowledge", "reject"];
+    return isAssignedCommando ? ["acknowledge"] : [];
   }
 
-  if (referral.status === "ACKNOWLEDGED") return ["begin"];
-  if (referral.status === "IN_PROGRESS") return ["complete"];
+  if (referral.status === "ACKNOWLEDGED") {
+    return isAssignedCommando ? ["begin"] : [];
+  }
+  if (referral.status === "IN_PROGRESS") {
+    return isAssignedCommando ? ["complete"] : [];
+  }
   return [];
 }
 
@@ -255,7 +279,7 @@ export async function listReferrals(actor: Actor, query: ListReferralsQuery) {
     page: query.page,
     pageSize: query.pageSize,
     total,
-    referrals: rows.map((row) => serialize(row)),
+    referrals: rows.map((row) => serialize(row, null, actor)),
   };
 }
 
@@ -266,7 +290,7 @@ export async function getReferral(actor: Actor, referralId: string) {
   });
   if (!referral) throw notFound("Referral not found");
   await assertReferralAccess(actor, referral);
-  return attachTeamLeadSwot(referral);
+  return attachTeamLeadSwot(referral, actor);
 }
 
 export async function createReferral(
@@ -324,12 +348,12 @@ async function transition(
       );
     }
     const updated = await acknowledgeAndEnsureAssignment(actor, referral, note);
-    return attachTeamLeadSwot(updated);
+    return attachTeamLeadSwot(updated, actor);
   }
 
   if (action === "begin") {
     const updated = await beginWithExistingAssignment(actor, referral);
-    return attachTeamLeadSwot(updated);
+    return attachTeamLeadSwot(updated, actor);
   }
 
   // complete — referral handoff only; assignment stays ACTIVE until ended separately
@@ -355,7 +379,7 @@ async function transition(
     },
   });
 
-  return attachTeamLeadSwot(updated);
+  return attachTeamLeadSwot(updated, actor);
 }
 
 type Tx = Prisma.TransactionClient;
@@ -759,7 +783,7 @@ export async function createCommandoRequest(
     },
   });
 
-  return serialize(created, null);
+  return serialize(created, null, actor);
 }
 
 /**
@@ -885,7 +909,7 @@ export async function provideReferralInformation(
       return { updated: row, swot: swotRow };
     });
 
-    return serialize(updated, swot);
+    return serialize(updated, swot, actor);
   } catch (err) {
     rethrowAssignmentConflict(err);
   }
@@ -963,5 +987,5 @@ export async function rejectReferral(
     },
   });
 
-  return serialize(updated, null);
+  return serialize(updated, null, actor);
 }

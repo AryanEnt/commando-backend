@@ -48,7 +48,7 @@ export const env = {
   cookieSecure: process.env.COOKIE_SECURE === "true" || isProd,
   corsOrigin: isProd
     ? required("CORS_ORIGIN")
-    : (process.env.CORS_ORIGIN ?? "http://localhost:3001"),
+    : (process.env.CORS_ORIGIN ?? "http://localhost:3000"),
   accessCookieMaxAgeMs: Number(
     process.env.ACCESS_COOKIE_MAX_AGE_MS ?? 15 * 60 * 1000,
   ),

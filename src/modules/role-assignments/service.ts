@@ -3,6 +3,8 @@ import { prisma } from "../../lib/prisma.js";
 import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { getActiveTeamIds } from "../../lib/scope.js";
+import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import type {
   CreateRoleAssignmentInput,
   ListRoleAssignmentsQuery,
@@ -199,6 +201,19 @@ async function scopeWhere(
     };
   }
 
+  if (actor.roleCode === "TEAM_LEAD") {
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    return {
+      archivedAt: null,
+      ...(query.includeHistory ? {} : { status: "ACTIVE" as const }),
+      OR: [
+        { createdById: actor.id },
+        { profile: { teamId: { in: teamIds } } },
+        { assignment: { teamLeadUserId: actor.id } },
+      ],
+    };
+  }
+
   if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
     // Only currently synced Sales Executives — never all SE profiles
     const syncedIds = await activeSyncedProfileIds(actor.id);
@@ -236,6 +251,14 @@ async function assertCanAccess(actor: Actor, row: Row): Promise<void> {
       throw forbidden("Role assignment is outside your assignment scope");
     }
     return;
+  }
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    if (row.createdById === actor.id) return;
+    if (row.assignment?.teamLeadUserId === actor.id) return;
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (row.profile.teamId && teamIds.includes(row.profile.teamId)) return;
+    throw forbidden("Role assignment is outside your team scope");
   }
 
   if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
@@ -368,20 +391,49 @@ async function resolveLinkAndAssignment(
     );
   }
 
-  const assignment = await prisma.commandoAssignment.findFirst({
-    where: {
-      salesExecutiveProfileId: profile.id,
-      commandoUserId: actor.id,
-      status: "ACTIVE",
-    },
-  });
-  if (!assignment) {
-    throw forbidden(
-      "You may only create role assignments for profiles with an active assignment to you",
-    );
+  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    const assignment = await prisma.commandoAssignment.findFirst({
+      where: {
+        salesExecutiveProfileId: profile.id,
+        commandoUserId: actor.id,
+        status: "ACTIVE",
+      },
+    });
+    if (!assignment) {
+      throw forbidden(
+        "You may only create role assignments for profiles with an active assignment to you",
+      );
+    }
+    return { profile, supportUser, link, assignmentId: assignment.id };
   }
 
-  return { profile, supportUser, link, assignmentId: assignment.id };
+  if (actor.roleCode === "TEAM_LEAD") {
+    await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
+      action: "ROLE_ASSIGNMENT_WRITE",
+    });
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (!teamIds.includes(profile.teamId)) {
+      throw forbidden(
+        "You may only create role assignments for Sales Executives on your teams",
+      );
+    }
+    // Optional link to any current intervention for history; not required.
+    const activeIntervention = await prisma.commandoAssignment.findFirst({
+      where: {
+        salesExecutiveProfileId: profile.id,
+        status: "ACTIVE",
+      },
+      select: { id: true },
+    });
+    return {
+      profile,
+      supportUser,
+      link,
+      assignmentId: activeIntervention?.id ?? null,
+    };
+  }
+
+  throw forbidden("Only Team Leads and Commandos can create role assignments");
 }
 
 export async function createRoleAssignment(
@@ -391,8 +443,13 @@ export async function createRoleAssignment(
   if (isSuperAdmin(actor)) {
     throw forbidden("Super Admin is read-only for role assignments");
   }
-  if (actor.roleCode !== "COMMANDO_EXECUTIVE") {
-    throw forbidden("Only Commandos can create role assignments");
+  if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD"
+  ) {
+    throw forbidden(
+      "Only Team Leads and Commandos can create role assignments",
+    );
   }
 
   const { profile, supportUser, link, assignmentId } =
@@ -483,8 +540,11 @@ export async function updateRoleAssignment(
   if (isSuperAdmin(actor)) {
     throw forbidden("Super Admin is read-only for role assignments");
   }
-  if (actor.roleCode !== "COMMANDO_EXECUTIVE") {
-    throw forbidden("Only Commandos can edit role assignments");
+  if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD"
+  ) {
+    throw forbidden("Only Team Leads and Commandos can edit role assignments");
   }
 
   const existing = await prisma.supportRoleAssignment.findFirst({
@@ -496,6 +556,15 @@ export async function updateRoleAssignment(
 
   if (existing.status !== "ACTIVE") {
     throw badRequest("Only ACTIVE role assignments can be edited");
+  }
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    await assertTeamLeadOperationalWriteAllowed(
+      prisma,
+      actor,
+      existing.salesExecutiveProfileId,
+      { action: "ROLE_ASSIGNMENT_WRITE" },
+    );
   }
 
   if (

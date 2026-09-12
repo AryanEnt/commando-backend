@@ -393,9 +393,10 @@ describe("commando request → TL provide information → lock", () => {
     expect(created.status).toBe(201);
     expect(created.body.data.referral.initiatedBy).toBe("COMMANDO");
     expect(created.body.data.referral.status).toBe("SUBMITTED");
-    expect(created.body.data.referral.allowedActions).toContain(
+    expect(created.body.data.referral.allowedActions).not.toContain(
       "provideInformation",
     );
+    expect(created.body.data.referral.allowedActions).not.toContain("reject");
     requestReferralId = created.body.data.referral.id;
 
     // Commando cannot acknowledge before information is provided

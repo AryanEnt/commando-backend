@@ -17,11 +17,8 @@ export async function listActivityTypes(
 ): Promise<void> {
   try {
     const query = listActivityTypesQuerySchema.parse(req.query);
-    const items = await service.listActivityTypes(
-      req.user as Actor,
-      query.includeInactive,
-    );
-    res.status(200).json({ data: { activityTypes: items } });
+    const result = await service.listActivityTypes(req.user as Actor, query);
+    res.status(200).json({ data: result });
   } catch (err) {
     next(err);
   }

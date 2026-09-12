@@ -1,7 +1,11 @@
 import type { NextFunction, Request, Response } from "express";
 import type { Actor } from "../../lib/authorization.js";
 import { badRequest } from "../../lib/errors.js";
-import { listSupportTasksQuerySchema } from "./schemas.js";
+import {
+  endSalesSupportLinkSchema,
+  listEligibleSupportUsersQuerySchema,
+  listSalesSupportLinksQuerySchema,
+} from "./schemas.js";
 import * as service from "./service.js";
 
 function paramId(value: string | string[] | undefined): string {
@@ -10,98 +14,101 @@ function paramId(value: string | string[] | undefined): string {
   return id;
 }
 
-export async function listSupportTasks(
+export async function listSalesSupportLinks(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
   try {
-    const query = listSupportTasksQuerySchema.parse(req.query);
-    const result = await service.listSupportTasks(req.user as Actor, query);
+    const query = listSalesSupportLinksQuerySchema.parse(req.query);
+    const result = await service.listSalesSupportLinks(
+      req.user as Actor,
+      query,
+    );
     res.status(200).json({ data: result });
   } catch (err) {
     next(err);
   }
 }
 
-export async function getSupportTask(
+export async function listEligibleSupportUsers(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
   try {
-    const task = await service.getSupportTask(
+    const query = listEligibleSupportUsersQuerySchema.parse(req.query);
+    const result = await service.listEligibleSupportUsers(
       req.user as Actor,
-      paramId(req.params.id),
+      query,
     );
-    res.status(200).json({ data: { task } });
+    res.status(200).json({ data: result });
   } catch (err) {
     next(err);
   }
 }
 
-export async function createSupportTask(
+export async function getTeamContext(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
   try {
-    const task = await service.createSupportTask(
+    const result = await service.getTeamContext(
       req.user as Actor,
-      req.body,
+      paramId(req.params.profileId),
     );
-    res.status(201).json({ data: { task } });
+    res.status(200).json({ data: result });
   } catch (err) {
     next(err);
   }
 }
 
-export async function updateSupportTask(
+export async function getSalesSupportLink(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
   try {
-    const task = await service.updateSupportTask(
+    const link = await service.getSalesSupportLink(
       req.user as Actor,
       paramId(req.params.id),
-      req.body,
     );
-    res.status(200).json({ data: { task } });
+    res.status(200).json({ data: { link } });
   } catch (err) {
     next(err);
   }
 }
 
-export async function updateSupportTaskStatus(
+export async function assignSalesSupportLink(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
   try {
-    const task = await service.updateSupportTaskStatus(
+    const link = await service.assignSalesSupportLink(
       req.user as Actor,
-      paramId(req.params.id),
       req.body,
     );
-    res.status(200).json({ data: { task } });
+    res.status(201).json({ data: { link } });
   } catch (err) {
     next(err);
   }
 }
 
-export async function addSupportTaskProgressNote(
+export async function endSalesSupportLink(
   req: Request,
   res: Response,
   next: NextFunction,
 ): Promise<void> {
   try {
-    const task = await service.addSupportTaskProgressNote(
+    const body = endSalesSupportLinkSchema.parse(req.body ?? {});
+    const link = await service.endSalesSupportLink(
       req.user as Actor,
       paramId(req.params.id),
-      req.body,
+      body,
     );
-    res.status(200).json({ data: { task } });
+    res.status(200).json({ data: { link } });
   } catch (err) {
     next(err);
   }

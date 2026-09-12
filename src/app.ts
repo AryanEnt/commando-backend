@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
-import { env } from "./config/env.js";
+import { env, isProd } from "./config/env.js";
 import { prisma } from "./lib/prisma.js";
 import { logger } from "./lib/logger.js";
 import { errorHandler } from "./middleware/errorHandler.js";
@@ -29,6 +29,7 @@ import { roleAssignmentsRouter } from "./modules/role-assignments/routes.js";
 import { eisenhowerRouter } from "./modules/eisenhower/routes.js";
 import { actionItemsRouter } from "./modules/action-items/routes.js";
 import { supportTasksRouter } from "./modules/support-tasks/routes.js";
+import { salesSupportLinksRouter } from "./modules/sales-support-links/routes.js";
 import { feedbackRouter } from "./modules/feedback/routes.js";
 import { performanceRouter } from "./modules/performance/routes.js";
 import { reportsRouter } from "./modules/reports/routes.js";
@@ -47,7 +48,33 @@ export function createApp() {
   app.use(requestLogger);
   app.use(
     cors({
-      origin: env.corsOrigin,
+      origin: (origin, callback) => {
+        const allowed = env.corsOrigin
+          .split(",")
+          .map((o) => o.trim())
+          .filter(Boolean);
+        // Same-origin / non-browser tools (no Origin header)
+        if (!origin) {
+          callback(null, true);
+          return;
+        }
+        if (allowed.includes(origin) || (!isProd && allowed.includes("*"))) {
+          callback(null, true);
+          return;
+        }
+        // Local / LAN Next.js (dev): localhost or private network hosts
+        if (
+          !isProd &&
+          (/^http:\/\/(localhost|127\.0\.0\.1):(3000|3001)$/.test(origin) ||
+            /^http:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}):(3000|3001)$/.test(
+              origin,
+            ))
+        ) {
+          callback(null, true);
+          return;
+        }
+        callback(new Error(`CORS blocked for origin ${origin}`));
+      },
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       allowedHeaders: ["Content-Type", "Authorization"],
@@ -97,6 +124,7 @@ export function createApp() {
   app.use("/api/eisenhower", eisenhowerRouter);
   app.use("/api/action-items", actionItemsRouter);
   app.use("/api/support-tasks", supportTasksRouter);
+  app.use("/api/sales-support-links", salesSupportLinksRouter);
   app.use("/api/feedback", feedbackRouter);
   app.use("/api/performance", performanceRouter);
   app.use("/api/reports", reportsRouter);

@@ -10,10 +10,66 @@ export const listMonitoringQuerySchema = z.object({
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 });
 
-export const checklistResponseSchema = z.object({
-  checklistItemId: z.string().cuid(),
-  value: z.string().trim().min(1).max(64),
+export const listMonitoringCategoriesQuerySchema = z.object({
+  includeInactive: z
+    .enum(["true", "false"])
+    .optional()
+    .transform((v) => v === "true"),
+  search: z.string().trim().optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(10),
+  /** Active catalog for forms (large page, no admin paging UX). */
+  catalog: z
+    .enum(["true", "false"])
+    .optional()
+    .transform((v) => v === "true"),
 });
+
+export const effectiveChecklistQuerySchema = z.object({
+  categoryId: z.string().cuid(),
+});
+
+const responseValueSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .refine((v) => ["YES", "NO", "NA"].includes(v.toUpperCase()), {
+    message: "Response must be YES, NO, or NA",
+  })
+  .transform((v) => v.toUpperCase());
+
+export const checklistResponseSchema = z
+  .object({
+    checklistItemId: z.string().cuid().optional(),
+    seChecklistItemId: z.string().cuid().optional(),
+    label: z.string().trim().min(1).max(240).optional(),
+    description: z.string().trim().max(1000).optional().nullable(),
+    sourceType: z.enum(["TEMPLATE", "CUSTOM", "SESSION"]).optional(),
+    sortOrder: z.number().int().optional(),
+    value: responseValueSchema,
+  })
+  .superRefine((val, ctx) => {
+    const hasTemplate = Boolean(val.checklistItemId);
+    const hasCustom = Boolean(val.seChecklistItemId);
+    const hasSession = Boolean(val.label) && val.sourceType === "SESSION";
+    const kinds = [hasTemplate, hasCustom, hasSession].filter(Boolean).length;
+    if (kinds !== 1 && !(hasTemplate && !hasCustom && !val.label)) {
+      if (!hasTemplate && !hasCustom && !val.label) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            "Each response must reference a template item, SE custom item, or session-only label",
+        });
+      }
+    }
+    if (val.sourceType === "SESSION" && !val.label) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Session-only items require a label",
+      });
+    }
+  });
 
 export const createMonitoringRecordSchema = z.object({
   salesExecutiveProfileId: z.string().cuid(),
@@ -21,6 +77,12 @@ export const createMonitoringRecordSchema = z.object({
   observation: z.string().trim().max(10000).optional().nullable(),
   observedAt: z.coerce.date().optional(),
   responses: z.array(checklistResponseSchema).min(1),
+  supportInvolvement: z
+    .object({
+      none: z.boolean().optional(),
+      salesSupportUserIds: z.array(z.string().cuid()).optional(),
+    })
+    .optional(),
 });
 
 export const createMonitoringCategorySchema = z.object({
@@ -63,7 +125,24 @@ export const updateChecklistItemSchema = z.object({
   archivedAt: z.coerce.date().nullable().optional(),
 });
 
+export const addSeChecklistItemSchema = z.object({
+  categoryId: z.string().cuid(),
+  label: z.string().trim().min(1).max(240),
+  description: z.string().trim().max(1000).optional().nullable(),
+  sortOrder: z.number().int().optional(),
+  /** Persist for this SE (default) or only for the current session UI (no DB row). */
+  scope: z.enum(["SE", "SESSION"]).default("SE"),
+});
+
+export const removeSeTemplateItemSchema = z.object({
+  categoryId: z.string().cuid(),
+  templateItemId: z.string().cuid(),
+});
+
 export type ListMonitoringQuery = z.infer<typeof listMonitoringQuerySchema>;
+export type ListMonitoringCategoriesQuery = z.infer<
+  typeof listMonitoringCategoriesQuerySchema
+>;
 export type CreateMonitoringRecordInput = z.infer<
   typeof createMonitoringRecordSchema
 >;
@@ -75,3 +154,7 @@ export type UpdateMonitoringCategoryInput = z.infer<
 >;
 export type CreateChecklistItemInput = z.infer<typeof createChecklistItemSchema>;
 export type UpdateChecklistItemInput = z.infer<typeof updateChecklistItemSchema>;
+export type AddSeChecklistItemInput = z.infer<typeof addSeChecklistItemSchema>;
+export type RemoveSeTemplateItemInput = z.infer<
+  typeof removeSeTemplateItemSchema
+>;

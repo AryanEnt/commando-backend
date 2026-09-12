@@ -9,6 +9,7 @@ import {
   createSupportTaskSchema,
   updateSupportTaskSchema,
   updateSupportTaskStatusSchema,
+  addSupportTaskProgressNoteSchema,
 } from "./schemas.js";
 import * as controller from "./controller.js";
 
@@ -47,4 +48,11 @@ supportTasksRouter.patch(
   requirePermission(PERMISSIONS.SALES_SUPPORT_TASK_STATUS_UPDATE),
   validate(updateSupportTaskStatusSchema),
   controller.updateSupportTaskStatus,
+);
+
+supportTasksRouter.post(
+  "/:id/progress-notes",
+  requirePermission(PERMISSIONS.SALES_SUPPORT_TASK_VIEW),
+  validate(addSupportTaskProgressNoteSchema),
+  controller.addSupportTaskProgressNote,
 );

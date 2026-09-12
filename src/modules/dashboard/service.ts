@@ -111,14 +111,14 @@ export async function getControlTower(actor: Actor) {
     count: number;
   }> = [];
 
-  if (pendingReferrals > 0) {
+  if (seWithoutActiveAssignmentWithOpenReferral > 0) {
     alerts.push({
-      code: "REFERRALS_AWAITING_ACK",
-      severity: "warning",
-      title: "Referrals awaiting acknowledgement",
-      reason: `${pendingReferrals} referral${pendingReferrals === 1 ? "" : "s"} submitted and waiting for Commando.`,
-      href: "/reports",
-      count: pendingReferrals,
+      code: "REFERRAL_NO_ASSIGNMENT",
+      severity: "critical",
+      title: "Open referrals without active assignment",
+      reason: `${seWithoutActiveAssignmentWithOpenReferral} open referral${seWithoutActiveAssignmentWithOpenReferral === 1 ? "" : "s"} have no active Commando assignment.`,
+      href: "/referrals",
+      count: seWithoutActiveAssignmentWithOpenReferral,
     });
   }
   if (overdueActionItems > 0) {
@@ -131,16 +131,6 @@ export async function getControlTower(actor: Actor) {
       count: overdueActionItems,
     });
   }
-  if (draftWeeklyReviews > 0) {
-    alerts.push({
-      code: "REVIEWS_DRAFT",
-      severity: "info",
-      title: "Weekly reviews in draft",
-      reason: `${draftWeeklyReviews} weekly review${draftWeeklyReviews === 1 ? "" : "s"} not yet submitted.`,
-      href: "/reports",
-      count: draftWeeklyReviews,
-    });
-  }
   if (overdueSupportTasks > 0) {
     alerts.push({
       code: "SUPPORT_TASKS_OVERDUE",
@@ -149,6 +139,16 @@ export async function getControlTower(actor: Actor) {
       reason: `${overdueSupportTasks} Sales Support task${overdueSupportTasks === 1 ? "" : "s"} overdue.`,
       href: "/reports",
       count: overdueSupportTasks,
+    });
+  }
+  if (pendingReferrals > 0) {
+    alerts.push({
+      code: "REFERRALS_AWAITING_ACK",
+      severity: "warning",
+      title: "Referrals awaiting acknowledgement",
+      reason: `${pendingReferrals} referral${pendingReferrals === 1 ? "" : "s"} submitted and waiting for Commando.`,
+      href: "/referrals?status=SUBMITTED",
+      count: pendingReferrals,
     });
   }
   if (seWithoutProfile > 0) {
@@ -161,14 +161,14 @@ export async function getControlTower(actor: Actor) {
       count: seWithoutProfile,
     });
   }
-  if (seWithoutActiveAssignmentWithOpenReferral > 0) {
+  if (draftWeeklyReviews > 0) {
     alerts.push({
-      code: "REFERRAL_NO_ASSIGNMENT",
-      severity: "critical",
-      title: "Open referrals without active assignment",
-      reason: `${seWithoutActiveAssignmentWithOpenReferral} open referral${seWithoutActiveAssignmentWithOpenReferral === 1 ? "" : "s"} have no active Commando assignment.`,
+      code: "REVIEWS_DRAFT",
+      severity: "info",
+      title: "Weekly reviews in draft",
+      reason: `${draftWeeklyReviews} weekly review${draftWeeklyReviews === 1 ? "" : "s"} not yet submitted.`,
       href: "/reports",
-      count: seWithoutActiveAssignmentWithOpenReferral,
+      count: draftWeeklyReviews,
     });
   }
   if (inactiveUsers > 0) {
@@ -182,37 +182,86 @@ export async function getControlTower(actor: Actor) {
     });
   }
 
-  const [pendingReferralRows, overdueActionRows] = await Promise.all([
-    prisma.referral.findMany({
-      where: { archivedAt: null, status: "SUBMITTED" },
-      orderBy: { createdAt: "asc" },
-      take: 8,
-      include: {
-        profile: { select: { id: true, displayName: true } },
-        team: { select: { id: true, name: true } },
-        commando: {
-          select: { id: true, firstName: true, lastName: true },
+  const severityRank: Record<"critical" | "warning" | "info", number> = {
+    critical: 0,
+    warning: 1,
+    info: 2,
+  };
+  alerts.sort(
+    (a, b) =>
+      severityRank[a.severity] - severityRank[b.severity] ||
+      b.count - a.count,
+  );
+
+  const operationalAuditActions = [
+    "COMMANDO_ASSIGNMENT_STARTED",
+    "COMMANDO_ASSIGNMENT_ENDED",
+    "COMMANDO_ASSIGNMENT_EXITED",
+    "COMMANDO_ASSIGNMENT_TRANSFERRED",
+    "INTERVENTION_OUTCOME_RECORDED",
+    "REFERRAL_SUBMITTED",
+    "REFERRAL_ACKNOWLEDGED",
+    "REFERRAL_IN_PROGRESS",
+    "REFERRAL_COMPLETED",
+    "COMMANDO_REQUEST_SUBMITTED",
+    "REFERRAL_INFORMATION_PROVIDED",
+    "REFERRAL_REJECTED",
+    "WEEKLY_REVIEW_SUBMITTED",
+    "SUPPORT_TASK_CREATED",
+    "SUPPORT_TASK_STATUS_UPDATED",
+    "ACTION_ITEM_COMPLETED",
+    "ACTION_ITEM_CREATED",
+    "ROLE_ASSIGNMENT_CREATED",
+  ];
+
+  const [pendingReferralRows, overdueActionRows, recentAuditRows] =
+    await Promise.all([
+      prisma.referral.findMany({
+        where: { archivedAt: null, status: "SUBMITTED" },
+        orderBy: { createdAt: "asc" },
+        take: 8,
+        include: {
+          profile: { select: { id: true, displayName: true } },
+          team: { select: { id: true, name: true } },
+          commando: {
+            select: { id: true, firstName: true, lastName: true },
+          },
+          teamLead: {
+            select: { id: true, firstName: true, lastName: true },
+          },
         },
-        teamLead: {
-          select: { id: true, firstName: true, lastName: true },
+      }),
+      prisma.actionItem.findMany({
+        where: {
+          status: "ACTIVE",
+          dueDate: { not: null, lt: now },
+          archivedAt: null,
         },
-      },
-    }),
-    prisma.actionItem.findMany({
-      where: {
-        status: "ACTIVE",
-        dueDate: { not: null, lt: now },
-        archivedAt: null,
-      },
-      orderBy: { dueDate: "asc" },
-      take: 8,
-      include: {
-        profile: { select: { id: true, displayName: true } },
-      },
-    }),
-  ]);
+        orderBy: { dueDate: "asc" },
+        take: 8,
+        include: {
+          profile: { select: { id: true, displayName: true } },
+        },
+      }),
+      prisma.auditLog.findMany({
+        where: { action: { in: operationalAuditActions } },
+        orderBy: { createdAt: "desc" },
+        take: 8,
+        include: {
+          actor: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              role: { select: { code: true } },
+            },
+          },
+        },
+      }),
+    ]);
 
   return {
+    generatedAt: now.toISOString(),
     metrics: {
       users: {
         total: totalUsers,
@@ -256,6 +305,21 @@ export async function getControlTower(actor: Actor) {
         profileName: a.profile.displayName,
       })),
     },
+    recentActivity: recentAuditRows.map((row) => ({
+      id: row.id,
+      action: row.action,
+      entityType: row.entityType,
+      entityId: row.entityId,
+      createdAt: row.createdAt,
+      actor: row.actor
+        ? {
+            id: row.actor.id,
+            name: `${row.actor.firstName} ${row.actor.lastName}`.trim(),
+            roleCode: row.actor.role.code,
+          }
+        : null,
+      metadata: row.metadata,
+    })),
   };
 }
 

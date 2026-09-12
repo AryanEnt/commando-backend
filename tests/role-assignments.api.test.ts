@@ -342,6 +342,42 @@ describe("sales support role assignments", () => {
     expect(edit.status).toBe(403);
   });
 
+  it("team lead can create role assignments without an active Commando intervention", async ({
+    skip,
+  }) => {
+    if (!dbReady) skip();
+    const tl = await token("teamlead@commando.local");
+    const me = await request(app)
+      .get("/api/auth/me")
+      .set("Authorization", `Bearer ${tl}`);
+    if (!me.body.data.user.permissions.includes("ROLE_ASSIGNMENT_CREATE")) {
+      skip();
+    }
+
+    // Use Other Seller so we do not disturb Sam Seller's Commando fixtures.
+    await prisma.commandoAssignment.updateMany({
+      where: { salesExecutiveProfileId: otherProfileId, status: "ACTIVE" },
+      data: { status: "COMPLETED", endedAt: new Date() },
+    });
+
+    const res = await request(app)
+      .post("/api/role-assignments")
+      .set("Authorization", `Bearer ${tl}`)
+      .send({
+        salesExecutiveProfileId: otherProfileId,
+        salesSupportUserId: otherSupportUserId,
+        primaryResponsibility:
+          "Provide proposal support under Team Lead management.",
+        shouldDo: ["Draft proposals as directed by Team Lead"],
+        shouldNotDo: ["Do not change performance scores"],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.data.roleAssignment.status).toBe("ACTIVE");
+    expect(res.body.data.roleAssignment.salesExecutiveProfileId).toBe(
+      otherProfileId,
+    );
+  });
+
   it("SSE cannot modify Commando evaluations / TL assessments / performance", async ({
     skip,
   }) => {

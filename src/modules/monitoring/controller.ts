@@ -1,7 +1,11 @@
 import type { NextFunction, Request, Response } from "express";
 import type { Actor } from "../../lib/authorization.js";
 import { badRequest } from "../../lib/errors.js";
-import { listMonitoringQuerySchema } from "./schemas.js";
+import {
+  effectiveChecklistQuerySchema,
+  listMonitoringCategoriesQuerySchema,
+  listMonitoringQuerySchema,
+} from "./schemas.js";
 import * as service from "./service.js";
 
 function paramId(value: string | string[] | undefined): string {
@@ -16,12 +20,12 @@ export async function listCategories(
   next: NextFunction,
 ): Promise<void> {
   try {
-    const includeInactive = req.query.includeInactive === "true";
-    const categories = await service.listMonitoringCategories(
+    const query = listMonitoringCategoriesQuerySchema.parse(req.query);
+    const result = await service.listMonitoringCategories(
       req.user as Actor,
-      includeInactive,
+      query,
     );
-    res.status(200).json({ data: { categories } });
+    res.status(200).json({ data: result });
   } catch (err) {
     next(err);
   }
@@ -89,6 +93,92 @@ export async function updateChecklistItem(
       req.body,
     );
     res.status(200).json({ data: { item } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getEffectiveChecklist(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = effectiveChecklistQuerySchema.parse(req.query);
+    const result = await service.getEffectiveChecklist(
+      req.user as Actor,
+      paramId(req.params.profileId),
+      query.categoryId,
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function addSeChecklistItem(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.addSeChecklistItem(
+      req.user as Actor,
+      paramId(req.params.profileId),
+      req.body,
+    );
+    res.status(result.persisted ? 201 : 200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function removeSeChecklistItem(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const item = await service.removeSeChecklistItem(
+      req.user as Actor,
+      paramId(req.params.profileId),
+      paramId(req.params.itemId),
+    );
+    res.status(200).json({ data: { item } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function removeTemplateItemFromSe(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const item = await service.removeTemplateItemFromSe(
+      req.user as Actor,
+      paramId(req.params.profileId),
+      req.body,
+    );
+    res.status(200).json({ data: { item } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function restoreTemplateItemForSe(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.restoreTemplateItemForSe(
+      req.user as Actor,
+      paramId(req.params.profileId),
+      req.body,
+    );
+    res.status(200).json({ data: result });
   } catch (err) {
     next(err);
   }

@@ -1,32 +1,63 @@
+import type { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { conflict, forbidden, notFound } from "../../lib/errors.js";
 import { hasPermission } from "../../lib/authorization.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
+import {
+  paginationMeta,
+  prismaPageArgs,
+} from "../../lib/pagination.js";
 import type { z } from "zod";
 import type {
   createActivityTypeSchema,
+  listActivityTypesQuerySchema,
   updateActivityTypeSchema,
 } from "./schemas.js";
 
 type CreateInput = z.infer<typeof createActivityTypeSchema>;
 type UpdateInput = z.infer<typeof updateActivityTypeSchema>;
+type ListQuery = z.infer<typeof listActivityTypesQuerySchema>;
 
-export async function listActivityTypes(
-  actor: Actor,
-  includeInactive: boolean,
-) {
+export async function listActivityTypes(actor: Actor, query: ListQuery) {
   const canManage = hasPermission(actor, PERMISSIONS.ACTIVITY_TYPE_MANAGE);
-  const where =
-    canManage && includeInactive
-      ? {}
-      : { isActive: true, archivedAt: null };
+  const includeInactive = Boolean(query.includeInactive && canManage);
 
-  return prisma.activityType.findMany({
-    where,
-    orderBy: { name: "asc" },
-  });
+  const where: Prisma.ActivityTypeWhereInput = {
+    ...(includeInactive ? {} : { isActive: true, archivedAt: null }),
+    ...(query.search
+      ? {
+          OR: [
+            { code: { contains: query.search, mode: "insensitive" } },
+            { name: { contains: query.search, mode: "insensitive" } },
+            { description: { contains: query.search, mode: "insensitive" } },
+          ],
+        }
+      : {}),
+  };
+
+  // Form catalogs: return a large active page without forcing admin pagination UX.
+  const pageSize = query.catalog
+    ? Math.min(query.pageSize || 100, 100)
+    : query.pageSize;
+  const page = query.catalog ? 1 : query.page;
+  const { skip, take } = prismaPageArgs(page, pageSize);
+
+  const [total, activityTypes] = await Promise.all([
+    prisma.activityType.count({ where }),
+    prisma.activityType.findMany({
+      where,
+      orderBy: { name: "asc" },
+      skip,
+      take,
+    }),
+  ]);
+
+  return {
+    activityTypes,
+    ...paginationMeta(page, pageSize, total),
+  };
 }
 
 export async function createActivityType(actor: Actor, input: CreateInput) {

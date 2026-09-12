@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { paginationQuerySchema } from "../../lib/pagination.js";
 
 export const createActivityTypeSchema = z.object({
   code: z
@@ -19,8 +20,14 @@ export const updateActivityTypeSchema = z.object({
   archivedAt: z.coerce.date().nullable().optional(),
 });
 
-export const listActivityTypesQuerySchema = z.object({
+export const listActivityTypesQuerySchema = paginationQuerySchema.extend({
   includeInactive: z
+    .enum(["true", "false"])
+    .optional()
+    .transform((v) => v === "true"),
+  search: z.string().trim().optional(),
+  /** When true, return active types for form selectors (pageSize defaults to 100). */
+  catalog: z
     .enum(["true", "false"])
     .optional()
     .transform((v) => v === "true"),

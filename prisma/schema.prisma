@@ -110,7 +110,9 @@ enum SupportTaskPriority {
 
 enum SupportTaskStatus {
   PENDING
+  ACCEPTED
   IN_PROGRESS
+  BLOCKED
   COMPLETED
 }
 
@@ -194,17 +196,23 @@ model User {
   syncEvalsAsSupport     SyncEvaluation[]        @relation("SyncEvalSupport")
   eisenhowerCreated      EisenhowerTask[]        @relation("EisenhowerCreator")
   monitoringCreated      LiveMonitoringRecord[]  @relation("MonitoringCreator")
+  seMonitoringItemsCreated SeMonitoringChecklistItem[] @relation("SeMonitoringChecklistCreator")
   actionItemsCreated     ActionItem[]            @relation("ActionItemCreator")
   feedbackCreated        Feedback[]              @relation("FeedbackCreator")
   performanceCreated     PerformanceEvaluation[] @relation("PerformanceCreator")
   supportTasksCreated    SupportTask[]           @relation("SupportTaskCreator")
   supportTasksAssignedBy SupportTask[]           @relation("SupportTaskAssignedBy")
   supportTasksAssigned   SupportTask[]           @relation("SupportTaskAssignee")
+  supportTaskProgressNotes SupportTaskProgressNote[] @relation("SupportTaskProgressAuthor")
+  supportTaskAssignmentEvents SupportTaskAssignmentEvent[] @relation("SupportTaskAssignmentActor")
   auditLogs              AuditLog[]              @relation("AuditActor")
   notifications          Notification[]          @relation("NotificationRecipient")
   salesSupportLinks      SalesSupportLink[]      @relation("SupportUser")
+  supportLinksAssigned   SalesSupportLink[]      @relation("SupportLinkAssigner")
+  supportLinksEnded      SalesSupportLink[]      @relation("SupportLinkEnder")
   supportRoleAssignments SupportRoleAssignment[] @relation("SupportRoleAssignee")
   supportRolesCreated    SupportRoleAssignment[] @relation("SupportRoleCreator")
+  monitoringSupportInvolvements MonitoringSupportInvolvement[]
   refreshTokens          RefreshToken[]
 
   @@index([roleId])
@@ -288,6 +296,7 @@ model SalesExecutiveProfile {
   syncEvaluations   SyncEvaluation[]
   eisenhowerTasks   EisenhowerTask[]
   monitoringRecords LiveMonitoringRecord[]
+  seMonitoringChecklistItems SeMonitoringChecklistItem[]
   actionItems       ActionItem[]
   feedback          Feedback[]
   performanceEvals  PerformanceEvaluation[]
@@ -310,17 +319,26 @@ model SalesSupportLink {
   startedAt                DateTime  @default(now())
   endedAt                  DateTime?
   isActive                 Boolean   @default(true)
+  responsibilityType       String?
+  note                     String?
+  assignedById             String?
+  endedById                String?
   createdAt                DateTime  @default(now())
   updatedAt                DateTime  @updatedAt
 
   profile      SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
   supportUser  User                  @relation("SupportUser", fields: [salesSupportUserId], references: [id], onDelete: Restrict)
+  assignedBy   User?                 @relation("SupportLinkAssigner", fields: [assignedById], references: [id], onDelete: SetNull)
+  endedBy      User?                 @relation("SupportLinkEnder", fields: [endedById], references: [id], onDelete: SetNull)
   syncEvaluations SyncEvaluation[]
   roleAssignments SupportRoleAssignment[]
   supportTasks SupportTask[]
+  monitoringInvolvements MonitoringSupportInvolvement[]
 
   @@index([salesExecutiveProfileId, isActive])
   @@index([salesSupportUserId, isActive])
+  @@index([assignedById])
+  @@index([endedById])
 }
 
 // ─────────────────────────────────────────────
@@ -631,8 +649,9 @@ model MonitoringCategory {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  checklistItems MonitoringChecklistItem[]
-  records        LiveMonitoringRecord[]
+  checklistItems             MonitoringChecklistItem[]
+  records                    LiveMonitoringRecord[]
+  seMonitoringChecklistItems SeMonitoringChecklistItem[]
 
   @@index([isActive])
   @@index([sortOrder])
@@ -649,30 +668,60 @@ model MonitoringChecklistItem {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  category  MonitoringCategory             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
-  responses MonitoringChecklistResponse[]
+  category            MonitoringCategory              @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  responses           MonitoringChecklistResponse[]
+  seRemovals          SeMonitoringChecklistItem[]     @relation("SeRemovedTemplateItem")
 
   @@unique([categoryId, code])
   @@index([categoryId, isActive])
 }
 
+/// SE-specific checklist customization. Never mutates global template items.
+/// kind=CUSTOM: additional item for this SE + category
+/// kind=TEMPLATE_REMOVED: hide a global template item for this SE + category
+model SeMonitoringChecklistItem {
+  id                      String    @id @default(cuid())
+  salesExecutiveProfileId String
+  categoryId              String
+  kind                    String
+  sourceTemplateItemId    String?
+  label                   String?
+  description             String?
+  sortOrder               Int       @default(0)
+  isActive                Boolean   @default(true)
+  createdById             String
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  profile            SalesExecutiveProfile         @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  category           MonitoringCategory            @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  sourceTemplateItem MonitoringChecklistItem?      @relation("SeRemovedTemplateItem", fields: [sourceTemplateItemId], references: [id], onDelete: Restrict)
+  createdBy          User                          @relation("SeMonitoringChecklistCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  responses          MonitoringChecklistResponse[]
+
+  @@index([salesExecutiveProfileId, categoryId, isActive])
+  @@index([sourceTemplateItemId])
+  @@index([createdById])
+}
+
 model LiveMonitoringRecord {
-  id                      String   @id @default(cuid())
+  id                      String    @id @default(cuid())
   salesExecutiveProfileId String
   assignmentId            String?
   categoryId              String
   observation             String?
   createdById             String
-  observedAt              DateTime @default(now())
+  observedAt              DateTime  @default(now())
   archivedAt              DateTime?
-  createdAt               DateTime @default(now())
-  updatedAt               DateTime @updatedAt
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
 
-  profile    SalesExecutiveProfile        @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
-  assignment CommandoAssignment?          @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
-  category   MonitoringCategory           @relation(fields: [categoryId], references: [id], onDelete: Restrict)
-  createdBy  User                         @relation("MonitoringCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  profile    SalesExecutiveProfile         @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?           @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  category   MonitoringCategory            @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  createdBy  User                          @relation("MonitoringCreator", fields: [createdById], references: [id], onDelete: Restrict)
   responses  MonitoringChecklistResponse[]
+  supportInvolvements MonitoringSupportInvolvement[]
 
   @@index([salesExecutiveProfileId])
   @@index([assignmentId])
@@ -681,18 +730,46 @@ model LiveMonitoringRecord {
   @@index([observedAt])
 }
 
+/// Snapshot of Sales Support involvement on a monitoring session (historical integrity)
+model MonitoringSupportInvolvement {
+  id                         String   @id @default(cuid())
+  recordId                   String
+  salesSupportUserId         String
+  salesSupportLinkId         String?
+  displayNameSnapshot        String
+  responsibilityTypeSnapshot String?
+  createdAt                  DateTime @default(now())
+
+  record           LiveMonitoringRecord @relation(fields: [recordId], references: [id], onDelete: Cascade)
+  salesSupportUser User                 @relation(fields: [salesSupportUserId], references: [id], onDelete: Restrict)
+  salesSupportLink SalesSupportLink?    @relation(fields: [salesSupportLinkId], references: [id], onDelete: SetNull)
+
+  @@unique([recordId, salesSupportUserId])
+  @@index([recordId])
+  @@index([salesSupportUserId])
+  @@index([salesSupportLinkId])
+}
+
 model MonitoringChecklistResponse {
-  id              String   @id @default(cuid())
-  recordId        String
-  checklistItemId String
-  value           String
-  createdAt       DateTime @default(now())
+  id                   String   @id @default(cuid())
+  recordId             String
+  checklistItemId      String?
+  seChecklistItemId    String?
+  labelSnapshot        String
+  descriptionSnapshot  String?
+  codeSnapshot         String?
+  sortOrderSnapshot    Int      @default(0)
+  sourceType           String   @default("TEMPLATE")
+  value                String
+  createdAt            DateTime @default(now())
 
-  record        LiveMonitoringRecord    @relation(fields: [recordId], references: [id], onDelete: Cascade)
-  checklistItem MonitoringChecklistItem @relation(fields: [checklistItemId], references: [id], onDelete: Restrict)
+  record          LiveMonitoringRecord      @relation(fields: [recordId], references: [id], onDelete: Cascade)
+  checklistItem   MonitoringChecklistItem?  @relation(fields: [checklistItemId], references: [id], onDelete: Restrict)
+  seChecklistItem SeMonitoringChecklistItem? @relation(fields: [seChecklistItemId], references: [id], onDelete: SetNull)
 
-  @@unique([recordId, checklistItemId])
   @@index([checklistItemId])
+  @@index([seChecklistItemId])
+  @@index([recordId])
 }
 
 // ─────────────────────────────────────────────
@@ -764,11 +841,14 @@ model SupportTask {
   id                      String              @id @default(cuid())
   title                   String
   description             String?
+  purpose                 String?
   priority                SupportTaskPriority @default(MEDIUM)
   status                  SupportTaskStatus   @default(PENDING)
   dueDate                 DateTime?
   completedAt             DateTime?
   completionNotes         String?
+  blockedReason           String?
+  blockedAt               DateTime?
   salesExecutiveProfileId String
   salesSupportUserId      String
   assignedById            String
@@ -785,14 +865,74 @@ model SupportTask {
   createdBy        User                  @relation("SupportTaskCreator", fields: [createdById], references: [id], onDelete: Restrict)
   assignment       CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
   salesSupportLink SalesSupportLink?     @relation(fields: [salesSupportLinkId], references: [id], onDelete: SetNull)
+  shouldDoItems    SupportTaskShouldDoItem[]
+  shouldNotDoItems SupportTaskShouldNotDoItem[]
+  progressNotes    SupportTaskProgressNote[]
+  assignmentEvents SupportTaskAssignmentEvent[]
 
   @@index([salesSupportUserId, status])
   @@index([salesExecutiveProfileId, status])
   @@index([assignedById])
   @@index([createdById])
   @@index([assignmentId])
+  @@index([salesSupportLinkId])
   @@index([dueDate])
   @@index([createdAt])
+}
+
+model SupportTaskShouldDoItem {
+  id           String   @id @default(cuid())
+  supportTaskId String
+  text         String
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  supportTask SupportTask @relation(fields: [supportTaskId], references: [id], onDelete: Cascade)
+
+  @@index([supportTaskId, sortOrder])
+}
+
+model SupportTaskShouldNotDoItem {
+  id           String   @id @default(cuid())
+  supportTaskId String
+  text         String
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  supportTask SupportTask @relation(fields: [supportTaskId], references: [id], onDelete: Cascade)
+
+  @@index([supportTaskId, sortOrder])
+}
+
+model SupportTaskProgressNote {
+  id            String   @id @default(cuid())
+  supportTaskId String
+  body          String
+  createdById   String
+  createdAt     DateTime @default(now())
+
+  supportTask SupportTask @relation(fields: [supportTaskId], references: [id], onDelete: Cascade)
+  createdBy   User        @relation("SupportTaskProgressAuthor", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([supportTaskId, createdAt])
+  @@index([createdById])
+}
+
+model SupportTaskAssignmentEvent {
+  id                  String   @id @default(cuid())
+  supportTaskId       String
+  fromSupportUserId   String?
+  toSupportUserId     String
+  salesSupportLinkId  String?
+  reason              String?
+  changedById         String
+  createdAt           DateTime @default(now())
+
+  supportTask SupportTask @relation(fields: [supportTaskId], references: [id], onDelete: Cascade)
+  changedBy   User        @relation("SupportTaskAssignmentActor", fields: [changedById], references: [id], onDelete: Restrict)
+
+  @@index([supportTaskId, createdAt])
+  @@index([changedById])
 }
 
 // ─────────────────────────────────────────────

@@ -12,6 +12,7 @@ import {
 } from "../../lib/errors.js";
 import { hashPassword } from "../../lib/password.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
+import { getActiveTeamIds } from "../../lib/scope.js";
 import type {
   createSalesExecutiveSchema,
   createUserSchema,
@@ -673,8 +674,17 @@ export async function createSalesExecutive(
   actor: Actor,
   input: CreateSalesExecutiveInput,
 ) {
-  if (!isSuperAdmin(actor)) {
-    throw forbidden("Only Super Admin can create Sales Executives");
+  if (!isSuperAdmin(actor) && actor.roleCode !== "TEAM_LEAD") {
+    throw forbidden("Only Super Admin or Team Lead can create Sales Executives");
+  }
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (!teamIds.includes(input.teamId)) {
+      throw forbidden(
+        "You can only onboard Sales Executives onto teams you lead",
+      );
+    }
   }
 
   const existing = await prisma.user.findFirst({
