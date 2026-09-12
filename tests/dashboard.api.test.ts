@@ -45,7 +45,19 @@ describe("Super Admin Control Tower", () => {
     }
   });
 
-  it("rejects non–Super Admin from organization structure", async ({
+  it("rejects non–viewer roles from organization structure", async ({
+    skip,
+  }) => {
+    if (!dbReady) skip();
+
+    const t = await token("commando@commando.local");
+    const res = await request(app)
+      .get("/api/dashboard/organization")
+      .set("Authorization", `Bearer ${t}`);
+    expect(res.status).toBe(403);
+  });
+
+  it("Team Lead receives organization structure for their teams", async ({
     skip,
   }) => {
     if (!dbReady) skip();
@@ -54,7 +66,9 @@ describe("Super Admin Control Tower", () => {
     const res = await request(app)
       .get("/api/dashboard/organization")
       .set("Authorization", `Bearer ${t}`);
-    expect(res.status).toBe(403);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.data.teams)).toBe(true);
   });
 
   it("rejects non–Super Admin from reports overview", async ({ skip }) => {

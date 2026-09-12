@@ -2,11 +2,20 @@ import { prisma } from "../../lib/prisma.js";
 import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { forbidden } from "../../lib/errors.js";
+import { teamScopeWhere } from "../../lib/scope.js";
+import type { Prisma } from "@prisma/client";
 
 function assertSuperAdmin(actor: Actor): void {
   if (!isSuperAdmin(actor)) {
     throw forbidden("Only Super Admin may access the control tower");
   }
+}
+
+function assertOrganizationViewer(actor: Actor): void {
+  if (isSuperAdmin(actor) || actor.roleCode === "TEAM_LEAD") {
+    return;
+  }
+  throw forbidden("Only Super Admin or Team Lead may view the organization structure");
 }
 
 /**
@@ -326,12 +335,15 @@ export async function getControlTower(actor: Actor) {
 /**
  * Organization structure for governance:
  * Team → Team Lead(s) → Sales Executives (with current Commando if any)
+ * Super Admin: all teams. Team Lead: teams in their membership scope.
  */
 export async function getOrganizationStructure(actor: Actor) {
-  assertSuperAdmin(actor);
+  assertOrganizationViewer(actor);
+
+  const scope = (await teamScopeWhere(prisma, actor)) as Prisma.TeamWhereInput;
 
   const teams = await prisma.team.findMany({
-    where: { archivedAt: null },
+    where: scope,
     orderBy: { name: "asc" },
     include: {
       memberships: {

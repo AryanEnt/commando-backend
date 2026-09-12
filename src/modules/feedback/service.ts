@@ -6,6 +6,7 @@ import { isSuperAdmin } from "../../lib/authorization.js";
 import { forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import {
+  coachingSourcesVisibleToSalesExecutive,
   getCommandoLifecycleState,
   salesExecutiveCanViewCoachingSource,
 } from "../../lib/lifecycleVisibility.js";
@@ -96,8 +97,7 @@ async function scopeWhere(
       });
       if (!profile) return { id: "__none__" };
       const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
-      const sources: FeedbackSource[] = ["TEAM_LEAD"];
-      if (lifecycle.isAfterCommando) sources.push("COMMANDO");
+      const sources = coachingSourcesVisibleToSalesExecutive(lifecycle);
       return {
         archivedAt: null,
         salesExecutiveProfileId: profile.id,
@@ -147,7 +147,7 @@ async function assertCanAccess(actor: Actor, row: FeedbackRow): Promise<void> {
     );
     if (!salesExecutiveCanViewCoachingSource(row.source, lifecycle)) {
       throw forbidden(
-        "Commando feedback is not visible during an active Commando assignment",
+        "Feedback is not visible for this Sales Executive",
       );
     }
     return;

@@ -185,10 +185,14 @@ async function assertCanAccess(actor: Actor, row: EvalRow): Promise<void> {
       prisma,
       row.salesExecutiveProfileId,
     );
-    if (!salesExecutiveCanViewCoachingSource(row.source, lifecycle)) {
-      throw forbidden(
-        "Commando performance is not visible during an active Commando assignment",
-      );
+    if (row.source === "COMMANDO") {
+      if (!roleCanViewCommandoPerformance(actor.roleCode, lifecycle)) {
+        throw forbidden(
+          "Commando performance is not visible during an active Commando assignment",
+        );
+      }
+    } else if (!salesExecutiveCanViewCoachingSource(row.source, lifecycle)) {
+      throw forbidden("Performance evaluation is not visible");
     }
     return;
   }

@@ -17,6 +17,7 @@ export const PERMISSIONS = {
   USER_ROLE_UPDATE: "USER_ROLE_UPDATE",
   USER_STATUS_UPDATE: "USER_STATUS_UPDATE",
   SALES_EXECUTIVE_CREATE: "SALES_EXECUTIVE_CREATE",
+  SALES_SUPPORT_CREATE: "SALES_SUPPORT_CREATE",
   ROLE_VIEW: "ROLE_VIEW",
   PERMISSION_VIEW: "PERMISSION_VIEW",
 
@@ -117,6 +118,11 @@ export const PERMISSION_META: Record<
   SALES_EXECUTIVE_CREATE: {
     name: "Create Sales Executives",
     description: "Onboard Sales Executive accounts with team and profile",
+  },
+  SALES_SUPPORT_CREATE: {
+    name: "Create Sales Support",
+    description:
+      "Create Sales Support Executive accounts and place them on a team",
   },
   ROLE_VIEW: { name: "View roles", description: "View roles and mappings" },
   PERMISSION_VIEW: {
@@ -300,6 +306,7 @@ export const ROLE_PERMISSION_MAP: Record<RoleCode, PermissionCode[]> = {
     PERMISSIONS.TEAM_VIEW,
     PERMISSIONS.PROFILE_VIEW,
     PERMISSIONS.SALES_EXECUTIVE_CREATE,
+    PERMISSIONS.SALES_SUPPORT_CREATE,
     PERMISSIONS.ASSIGNMENT_VIEW,
     PERMISSIONS.REFERRAL_VIEW,
     PERMISSIONS.SWOT_CREATE,

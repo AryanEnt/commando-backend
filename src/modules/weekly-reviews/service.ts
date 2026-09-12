@@ -64,6 +64,9 @@ function serialize(row: ReviewRow, users: Map<string, UserBrief>, viewerId?: str
   const myAttendee = viewerId
     ? row.attendees.find((a) => a.userId === viewerId)
     : undefined;
+  const salesExecutiveAttendee = row.attendees.find(
+    (a) => a.userId === row.profile.userId,
+  );
 
   return {
     id: row.id,
@@ -100,7 +103,10 @@ function serialize(row: ReviewRow, users: Map<string, UserBrief>, viewerId?: str
           ? "PENDING_SIGNATURE"
           : "DRAFT"
       : null,
+    /** Whether the current viewer has signed (attendee ack). */
     signed: Boolean(myAttendee?.signedAt),
+    /** Whether the Sales Executive has signed — used in manager lists. */
+    salesExecutiveSigned: Boolean(salesExecutiveAttendee?.signedAt),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     isEditable: row.status === "DRAFT",
@@ -147,7 +153,6 @@ async function scopeWhere(actor: Actor): Promise<Prisma.WeeklyReviewWhereInput> 
       if (!profile) return { id: "__none__" };
       return {
         archivedAt: null,
-        status: "SUBMITTED",
         salesExecutiveProfileId: profile.id,
       };
     }
@@ -182,9 +187,6 @@ async function assertCanAccess(actor: Actor, row: ReviewRow): Promise<void> {
   }
 
   if (actor.roleCode === "SALES_EXECUTIVE") {
-    if (row.status !== "SUBMITTED") {
-      throw forbidden("Draft reviews are not visible");
-    }
     if (row.profile.userId !== actor.id) {
       throw forbidden("You may only view your own weekly reviews");
     }
@@ -198,6 +200,13 @@ export async function listWeeklyReviews(
   actor: Actor,
   query: ListWeeklyReviewsQuery,
 ) {
+  // Product rule: reviews are sent on create. Promote any legacy drafts so
+  // Sales Executives see them without a second submit step.
+  await prisma.weeklyReview.updateMany({
+    where: { status: "DRAFT", archivedAt: null },
+    data: { status: "SUBMITTED", submittedAt: new Date() },
+  });
+
   const scope = await scopeWhere(actor);
   const where: Prisma.WeeklyReviewWhereInput = {
     AND: [
@@ -237,11 +246,13 @@ export async function listWeeklyReviews(
     ],
   };
 
-  // Non-owners cannot filter to DRAFT (scope already forces SUBMITTED for SE)
+  // Sales Executives may filter drafts of their own reviews; others already
+  // scoped above. Keep this guard only for unsupported roles.
   if (
     query.status === "DRAFT" &&
     actor.roleCode !== "COMMANDO_EXECUTIVE" &&
     actor.roleCode !== "TEAM_LEAD" &&
+    actor.roleCode !== "SALES_EXECUTIVE" &&
     !isSuperAdmin(actor)
   ) {
     return { page: query.page, pageSize: query.pageSize, total: 0, reviews: [] };
@@ -267,6 +278,12 @@ export async function listWeeklyReviews(
 }
 
 export async function getWeeklyReview(actor: Actor, id: string) {
+  // Promote legacy draft if this record was created before auto-send.
+  await prisma.weeklyReview.updateMany({
+    where: { id, status: "DRAFT", archivedAt: null },
+    data: { status: "SUBMITTED", submittedAt: new Date() },
+  });
+
   const row = await prisma.weeklyReview.findFirst({
     where: { id, archivedAt: null },
     include: reviewInclude,
@@ -347,7 +364,8 @@ export async function createWeeklyReview(
       whatWentWell: input.whatWentWell,
       improvement: input.improvement,
       nextWeekAction: input.nextWeekAction,
-      status: "DRAFT",
+      status: "SUBMITTED",
+      submittedAt: new Date(),
       createdById: actor.id,
       attendees: {
         create: [...attendeeIds].map((userId) => ({ userId })),
@@ -362,7 +380,16 @@ export async function createWeeklyReview(
       action: "WEEKLY_REVIEW_CREATED",
       entityType: "WeeklyReview",
       entityId: created.id,
-      metadata: { profileId: profile.id, status: "DRAFT" },
+      metadata: { profileId: profile.id, status: "SUBMITTED" },
+    },
+  });
+  await prisma.auditLog.create({
+    data: {
+      actorId: actor.id,
+      action: "WEEKLY_REVIEW_SUBMITTED",
+      entityType: "WeeklyReview",
+      entityId: created.id,
+      metadata: { from: "CREATE", to: "SUBMITTED" },
     },
   });
 
@@ -536,7 +563,31 @@ export async function acknowledgeWeeklyReview(actor: Actor, id: string) {
     throw badRequest("Only submitted reviews can be acknowledged");
   }
 
-  const attendee = existing.attendees.find((a) => a.userId === actor.id);
+  // Prefer attendee row; if missing for the SE owner, create it so they can sign.
+  let attendee = existing.attendees.find((a) => a.userId === actor.id);
+  if (!attendee && existing.profile.userId === actor.id) {
+    attendee = await prisma.weeklyReviewAttendee.upsert({
+      where: {
+        weeklyReviewId_userId: {
+          weeklyReviewId: id,
+          userId: actor.id,
+        },
+      },
+      update: {},
+      create: { weeklyReviewId: id, userId: actor.id },
+      include: {
+        user: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            role: { select: { code: true } },
+          },
+        },
+      },
+    });
+  }
   if (!attendee) {
     throw forbidden("You are not an attendee on this weekly review");
   }

@@ -309,9 +309,9 @@ describe("Phase 14 — lifecycle visibility & unauthorized access", () => {
 
     expect(salesExecutiveCanViewSwotSource("COMMANDO", during)).toBe(false);
     expect(salesExecutiveCanViewSwotSource("COMMANDO", after)).toBe(true);
-    expect(salesExecutiveCanViewCoachingSource("COMMANDO", during)).toBe(false);
+    expect(salesExecutiveCanViewCoachingSource("COMMANDO", during)).toBe(true);
     expect(salesExecutiveCanViewCoachingSource("COMMANDO", after)).toBe(true);
-    expect(salesExecutiveCanViewMonitoring(during)).toBe(false);
+    expect(salesExecutiveCanViewMonitoring(during)).toBe(true);
     expect(salesExecutiveCanViewMonitoring(after)).toBe(true);
     expect(salesExecutiveCanViewActionItemStatus("COMPLETED", during)).toBe(
       false,
@@ -335,7 +335,7 @@ describe("Phase 14 — lifecycle visibility & unauthorized access", () => {
     ).toBe(true);
   });
 
-  it("during: SE cannot retrieve hidden Commando records by ID", async ({
+  it("during: SE cannot retrieve still-hidden Commando records by ID", async ({
     skip,
   }) => {
     if (!dbReady) skip();
@@ -357,7 +357,7 @@ describe("Phase 14 — lifecycle visibility & unauthorized access", () => {
           .get(`/api/feedback/${commandoFeedbackId}`)
           .set("Authorization", `Bearer ${se}`)
       ).status,
-    ).toBe(403);
+    ).toBe(200);
     expect(
       (
         await request(app)
@@ -372,7 +372,7 @@ describe("Phase 14 — lifecycle visibility & unauthorized access", () => {
             .get(`/api/monitoring/${monitoringId}`)
             .set("Authorization", `Bearer ${se}`)
         ).status,
-      ).toBe(403);
+      ).toBe(200);
     }
     expect(
       (
@@ -388,15 +388,6 @@ describe("Phase 14 — lifecycle visibility & unauthorized access", () => {
           .set("Authorization", `Bearer ${se}`)
       ).status,
     ).toBe(403);
-    if (draftReviewId) {
-      expect(
-        (
-          await request(app)
-            .get(`/api/weekly-reviews/${draftReviewId}`)
-            .set("Authorization", `Bearer ${se}`)
-        ).status,
-      ).toBe(403);
-    }
   });
 
   it("during: SE can retrieve permitted records by ID", async ({ skip }) => {

@@ -132,14 +132,14 @@ describe("live monitoring", () => {
     });
   }
 
-  it("unit: SE cannot view monitoring during active assignment", () => {
+  it("unit: SE can view monitoring during and after assignment", () => {
     const during = {
       hasActiveAssignment: true,
       hasCompletedAssignment: false,
       isDuringCommando: true,
       isAfterCommando: false,
     };
-    expect(salesExecutiveCanViewMonitoring(during)).toBe(false);
+    expect(salesExecutiveCanViewMonitoring(during)).toBe(true);
 
     const after = {
       hasActiveAssignment: false,
@@ -294,7 +294,7 @@ describe("live monitoring", () => {
     expect(detail.body.data.record.observation).toContain("Follow-up");
   });
 
-  it("during Commando: SE cannot view monitoring even by id", async ({
+  it("during Commando: SE can view monitoring for their profile", async ({
     skip,
   }) => {
     if (!dbReady || !recordId || !assignmentId) skip();
@@ -303,7 +303,6 @@ describe("live monitoring", () => {
     expect(lifecycle.isDuringCommando).toBe(true);
 
     const se = await token("sales@commando.local");
-    // Ensure SE has MONITORING_VIEW (permission map); if seed not re-run, skip soft
     const me = await request(app)
       .get("/api/auth/me")
       .set("Authorization", `Bearer ${se}`);
@@ -315,12 +314,12 @@ describe("live monitoring", () => {
       .get("/api/monitoring")
       .set("Authorization", `Bearer ${se}`);
     expect(list.status).toBe(200);
-    expect(list.body.data.total).toBe(0);
+    expect(list.body.data.total).toBeGreaterThan(0);
 
     const detail = await request(app)
       .get(`/api/monitoring/${recordId}`)
       .set("Authorization", `Bearer ${se}`);
-    expect(detail.status).toBe(403);
+    expect(detail.status).toBe(200);
   });
 
   it("after Commando: SE can view own monitoring history", async ({ skip }) => {

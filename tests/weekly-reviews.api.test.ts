@@ -16,7 +16,6 @@ async function token(email: string) {
 describe("weekly reviews", () => {
   let dbReady = false;
   let profileId: string;
-  let reviewId: string;
   let submittedId: string;
 
   beforeAll(async () => {
@@ -36,7 +35,7 @@ describe("weekly reviews", () => {
     }
   });
 
-  it("commando creates a draft weekly review", async ({ skip }) => {
+  it("commando creates a weekly review already submitted", async ({ skip }) => {
     if (!dbReady) skip();
     const c = await token("commando@commando.local");
     const res = await request(app)
@@ -53,70 +52,27 @@ describe("weekly reviews", () => {
         nextWeekAction: "Book three strategic account reviews.",
       });
     expect(res.status).toBe(201);
-    expect(res.body.data.review.status).toBe("DRAFT");
-    expect(res.body.data.review.isEditable).toBe(true);
+    expect(res.body.data.review.status).toBe("SUBMITTED");
+    expect(res.body.data.review.isEditable).toBe(false);
+    expect(res.body.data.review.submittedAt).toBeTruthy();
     expect(res.body.data.review.attendees.length).toBeGreaterThanOrEqual(3);
-    reviewId = res.body.data.review.id;
+    submittedId = res.body.data.review.id;
 
-    const audit = await prisma.auditLog.findFirst({
+    const createdAudit = await prisma.auditLog.findFirst({
       where: {
-        entityId: reviewId,
+        entityId: submittedId,
         action: "WEEKLY_REVIEW_CREATED",
       },
     });
-    expect(audit).toBeTruthy();
-  });
+    expect(createdAudit).toBeTruthy();
 
-  it("commando can edit draft before submission", async ({ skip }) => {
-    if (!dbReady || !reviewId) skip();
-    const c = await token("commando@commando.local");
-    const res = await request(app)
-      .patch(`/api/weekly-reviews/${reviewId}`)
-      .set("Authorization", `Bearer ${c}`)
-      .send({
-        nextWeekAction: "Updated: close two mid-funnel deals.",
-      });
-    expect(res.status).toBe(200);
-    expect(res.body.data.review.nextWeekAction).toContain("Updated:");
-  });
-
-  it("team lead cannot see draft reviews", async ({ skip }) => {
-    if (!dbReady || !reviewId) skip();
-    const tl = await token("teamlead@commando.local");
-    const res = await request(app)
-      .get(`/api/weekly-reviews/${reviewId}`)
-      .set("Authorization", `Bearer ${tl}`);
-    expect(res.status).toBe(403);
-  });
-
-  it("sales executive cannot see draft reviews", async ({ skip }) => {
-    if (!dbReady || !reviewId) skip();
-    const se = await token("sales@commando.local");
-    const res = await request(app)
-      .get(`/api/weekly-reviews/${reviewId}`)
-      .set("Authorization", `Bearer ${se}`);
-    expect(res.status).toBe(403);
-  });
-
-  it("commando submits review and it becomes read-only", async ({ skip }) => {
-    if (!dbReady || !reviewId) skip();
-    const c = await token("commando@commando.local");
-    const submit = await request(app)
-      .post(`/api/weekly-reviews/${reviewId}/submit`)
-      .set("Authorization", `Bearer ${c}`);
-    expect(submit.status).toBe(200);
-    expect(submit.body.data.review.status).toBe("SUBMITTED");
-    expect(submit.body.data.review.isEditable).toBe(false);
-    expect(submit.body.data.review.submittedAt).toBeTruthy();
-    submittedId = reviewId;
-
-    const audit = await prisma.auditLog.findFirst({
+    const submittedAudit = await prisma.auditLog.findFirst({
       where: {
         entityId: submittedId,
         action: "WEEKLY_REVIEW_SUBMITTED",
       },
     });
-    expect(audit).toBeTruthy();
+    expect(submittedAudit).toBeTruthy();
 
     const edit = await request(app)
       .patch(`/api/weekly-reviews/${submittedId}`)
@@ -195,37 +151,18 @@ describe("weekly reviews", () => {
         weekLabel: `2026-W-NEXT-${Date.now()}`,
         weekStartDate: "2026-03-09",
         meetingDate: "2026-03-13T10:00:00.000Z",
-        performanceSummary: "Next week notes",
-        whatWentWell: "Continued momentum",
-        improvement: "Forecast accuracy",
-        nextWeekAction: "Prepare QBR deck",
+        performanceSummary: "Next week notes.",
+        whatWentWell: "Momentum.",
+        improvement: "Pipeline hygiene.",
+        nextWeekAction: "Close one deal.",
       });
     expect(next.status).toBe(201);
     expect(next.body.data.review.id).not.toBe(submittedId);
+    expect(next.body.data.review.status).toBe("SUBMITTED");
 
-    const still = await prisma.weeklyReview.findUniqueOrThrow({
+    const stillThere = await prisma.weeklyReview.findUniqueOrThrow({
       where: { id: submittedId },
     });
-    expect(still.performanceSummary).toBe(original.performanceSummary);
-    expect(still.status).toBe("SUBMITTED");
-  });
-
-  it("team lead cannot create or submit", async ({ skip }) => {
-    if (!dbReady) skip();
-    const tl = await token("teamlead@commando.local");
-    const create = await request(app)
-      .post("/api/weekly-reviews")
-      .set("Authorization", `Bearer ${tl}`)
-      .send({
-        salesExecutiveProfileId: profileId,
-        weekLabel: "nope",
-        weekStartDate: "2026-03-02",
-        meetingDate: "2026-03-06T10:00:00.000Z",
-        performanceSummary: "x",
-        whatWentWell: "x",
-        improvement: "x",
-        nextWeekAction: "x",
-      });
-    expect(create.status).toBe(403);
+    expect(stillThere.performanceSummary).toBe(original.performanceSummary);
   });
 });

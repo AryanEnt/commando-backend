@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   requireAuthentication,
+  requireAnyPermission,
   requirePermission,
 } from "../../middleware/auth.js";
 import { validate } from "../../middleware/validate.js";
@@ -27,7 +28,10 @@ usersRouter.get(
 
 usersRouter.post(
   "/",
-  requirePermission(PERMISSIONS.USER_CREATE),
+  requireAnyPermission([
+    PERMISSIONS.USER_CREATE,
+    PERMISSIONS.SALES_SUPPORT_CREATE,
+  ]),
   rateLimit({
     windowMs: 60_000,
     max: 20,

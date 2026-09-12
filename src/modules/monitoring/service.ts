@@ -230,7 +230,7 @@ async function assertCanAccessRecord(
     );
     if (!salesExecutiveCanViewMonitoring(lifecycle)) {
       throw forbidden(
-        "Commando monitoring is not visible during an active assignment",
+        "Monitoring record is not visible for this Sales Executive",
       );
     }
     return;
@@ -368,7 +368,7 @@ async function assertCanViewSeChecklist(actor: Actor, profileId: string) {
     const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
     if (!salesExecutiveCanViewMonitoring(lifecycle)) {
       throw forbidden(
-        "Commando monitoring is not visible during an active assignment",
+        "Monitoring record is not visible for this Sales Executive",
       );
     }
     return profile;

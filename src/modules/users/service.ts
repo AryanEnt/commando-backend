@@ -2,7 +2,7 @@ import type { MembershipRole, Prisma, RoleCode } from "@prisma/client";
 import type { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import type { Actor } from "../../lib/authorization.js";
-import { isSuperAdmin } from "../../lib/authorization.js";
+import { hasPermission, isSuperAdmin } from "../../lib/authorization.js";
 import {
   AppError,
   badRequest,
@@ -12,6 +12,7 @@ import {
 } from "../../lib/errors.js";
 import { hashPassword } from "../../lib/password.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
+import { PERMISSIONS } from "../../lib/permissions.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import type {
   createSalesExecutiveSchema,
@@ -382,15 +383,41 @@ export async function getUserProfile(actor: Actor, userId: string) {
 }
 
 export async function createUser(actor: Actor, input: CreateUserInput) {
-  if (!isSuperAdmin(actor)) {
-    throw forbidden("Only Super Admin can create users");
+  const canCreateAny = isSuperAdmin(actor) || hasPermission(actor, PERMISSIONS.USER_CREATE);
+  const canCreateSupport =
+    actor.roleCode === "TEAM_LEAD" &&
+    hasPermission(actor, PERMISSIONS.SALES_SUPPORT_CREATE);
+
+  if (!canCreateAny && !canCreateSupport) {
+    throw forbidden("You do not have permission to create users");
+  }
+
+  let teamId = input.teamId ?? null;
+
+  if (!canCreateAny) {
+    if (input.roleCode !== "SALES_SUPPORT_EXECUTIVE") {
+      throw forbidden(
+        "Team Leads may only create Sales Support Executive accounts",
+      );
+    }
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (teamIds.length === 0) {
+      throw badRequest("You must lead a team to create Sales Support");
+    }
+    if (!teamId) {
+      teamId = teamIds[0]!;
+    } else if (!teamIds.includes(teamId)) {
+      throw forbidden(
+        "You can only add Sales Support Executives to teams you lead",
+      );
+    }
   }
 
   await assertEmailAvailable(input.email);
   const role = await resolveRole(input.roleCode);
 
-  if (input.teamId) {
-    await assertTeamActive(input.teamId);
+  if (teamId) {
+    await assertTeamActive(teamId);
   }
 
   const passwordHash = await hashPassword(input.password);
@@ -408,12 +435,12 @@ export async function createUser(actor: Actor, input: CreateUserInput) {
       select: userPublicSelect,
     });
 
-    if (input.teamId) {
+    if (teamId) {
       await ensureTeamMembership(
         tx,
         actor.id,
         created.id,
-        input.teamId,
+        teamId,
         membershipRoleFor(input.roleCode),
       );
     }
@@ -427,7 +454,8 @@ export async function createUser(actor: Actor, input: CreateUserInput) {
         metadata: {
           email: created.email,
           roleCode: created.role.code,
-          teamId: input.teamId ?? null,
+          teamId,
+          via: canCreateAny ? "user_create" : "team_lead_sales_support",
         },
       },
       tx,

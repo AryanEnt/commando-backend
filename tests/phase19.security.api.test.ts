@@ -259,7 +259,7 @@ describe("Phase 19 — comprehensive security hardening", () => {
   });
 
   describe("critical lifecycle IDOR — during Commando", () => {
-    it("SE cannot fetch Commando SWOT / feedback / performance by ID", async ({
+    it("SE cannot fetch Commando SWOT / performance by ID; feedback is visible", async ({
       skip,
     }) => {
       if (!dbReady) skip();
@@ -267,7 +267,6 @@ describe("Phase 19 — comprehensive security hardening", () => {
 
       for (const path of [
         `/api/swot/${commandoSwotId}`,
-        `/api/feedback/${commandoFeedbackId}`,
         `/api/performance/${commandoPerfId}`,
       ]) {
         const res = await request(app)
@@ -276,9 +275,14 @@ describe("Phase 19 — comprehensive security hardening", () => {
         expect(res.status).toBe(403);
         expect(JSON.stringify(res.body)).not.toMatch(/secret/i);
       }
+
+      const fb = await request(app)
+        .get(`/api/feedback/${commandoFeedbackId}`)
+        .set("Authorization", `Bearer ${se}`);
+      expect(fb.status).toBe(200);
     });
 
-    it("SE list with source=COMMANDO returns no Commando records during", async ({
+    it("SE list with source=COMMANDO returns feedback during, not SWOT/performance", async ({
       skip,
     }) => {
       if (!dbReady) skip();
@@ -304,7 +308,7 @@ describe("Phase 19 — comprehensive security hardening", () => {
         (fb.body.data.feedback as { id: string }[]).some(
           (s) => s.id === commandoFeedbackId,
         ),
-      ).toBe(false);
+      ).toBe(true);
 
       const perf = await request(app)
         .get("/api/performance")

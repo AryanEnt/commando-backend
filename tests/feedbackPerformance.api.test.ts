@@ -83,7 +83,7 @@ describe("Feedback & performance (Phase 13)", () => {
       isAfterCommando: false,
     };
     expect(salesExecutiveCanViewCoachingSource("TEAM_LEAD", during)).toBe(true);
-    expect(salesExecutiveCanViewCoachingSource("COMMANDO", during)).toBe(false);
+    expect(salesExecutiveCanViewCoachingSource("COMMANDO", during)).toBe(true);
 
     const after = {
       hasActiveAssignment: false,
@@ -147,7 +147,7 @@ describe("Feedback & performance (Phase 13)", () => {
     expect(original?.body).toBe(firstTlFeedbackBody);
   });
 
-  it("during Commando: SE sees TL feedback, not Commando", async ({
+  it("during Commando: SE sees TL and Commando feedback", async ({
     skip,
   }) => {
     if (!dbReady || !tlFeedbackId || !commandoFeedbackId) skip();
@@ -162,10 +162,10 @@ describe("Feedback & performance (Phase 13)", () => {
       .set("Authorization", `Bearer ${se}`);
     expect(tlView.status).toBe(200);
 
-    const hidden = await request(app)
+    const commandoView = await request(app)
       .get(`/api/feedback/${commandoFeedbackId}`)
       .set("Authorization", `Bearer ${se}`);
-    expect(hidden.status).toBe(403);
+    expect(commandoView.status).toBe(200);
 
     const list = await request(app)
       .get("/api/feedback")
@@ -175,7 +175,7 @@ describe("Feedback & performance (Phase 13)", () => {
       (f: { source: string }) => f.source,
     );
     expect(sources).toContain("TEAM_LEAD");
-    expect(sources).not.toContain("COMMANDO");
+    expect(sources).toContain("COMMANDO");
   });
 
   it("creates performance evaluations with preserved scores and source", async ({

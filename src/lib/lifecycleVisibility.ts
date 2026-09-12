@@ -72,26 +72,26 @@ export function swotSourcesVisibleToSalesExecutive(
 
 /**
  * Live monitoring is Commando-authored.
- * During active assignment: hidden from SE.
- * After assignment completes: visible (historical, read-only).
+ * Visible to the Sales Executive during and after the assignment (read-only for SE).
  */
 export function salesExecutiveCanViewMonitoring(
   lifecycle: CommandoLifecycleState,
 ): boolean {
-  return lifecycle.isAfterCommando;
+  return lifecycle.isDuringCommando || lifecycle.isAfterCommando;
 }
 
 /**
  * Feedback / performance source visibility for Sales Executives.
- * During Commando: TEAM_LEAD visible; COMMANDO hidden.
- * After Commando: both visible.
+ * TEAM_LEAD always visible; COMMANDO visible during and after intervention.
  */
 export function salesExecutiveCanViewCoachingSource(
   source: FeedbackSource | PerformanceSource,
   lifecycle: CommandoLifecycleState,
 ): boolean {
   if (source === "TEAM_LEAD") return true;
-  if (source === "COMMANDO") return lifecycle.isAfterCommando;
+  if (source === "COMMANDO") {
+    return lifecycle.isDuringCommando || lifecycle.isAfterCommando;
+  }
   return false;
 }
 
@@ -100,7 +100,9 @@ export function coachingSourcesVisibleToSalesExecutive(
   lifecycle: CommandoLifecycleState,
 ): Array<"TEAM_LEAD" | "COMMANDO"> {
   const sources: Array<"TEAM_LEAD" | "COMMANDO"> = ["TEAM_LEAD"];
-  if (lifecycle.isAfterCommando) sources.push("COMMANDO");
+  if (lifecycle.isDuringCommando || lifecycle.isAfterCommando) {
+    sources.push("COMMANDO");
+  }
   return sources;
 }
 

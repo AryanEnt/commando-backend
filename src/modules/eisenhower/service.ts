@@ -4,7 +4,6 @@ import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
-import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import {
   getCommandoLifecycleState,
   salesExecutiveCanViewEisenhowerMonth,
@@ -206,12 +205,11 @@ async function assertCanManage(actor: Actor, row: TaskRow): Promise<void> {
     return;
   }
   if (actor.roleCode === "TEAM_LEAD") {
-    await assertTeamLeadOperationalWriteAllowed(
-      prisma,
-      actor,
-      row.salesExecutiveProfileId,
-      { action: "EISENHOWER_UPDATE" },
-    );
+    // Monthly planning stays with the Team Lead even during Commando intervention.
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (!teamIds.includes(row.profile.teamId)) {
+      throw forbidden("Profile is outside your team scope");
+    }
     return;
   }
   throw forbidden("Only Commandos and Team Leads can manage Eisenhower tasks");
@@ -243,9 +241,6 @@ export async function createEisenhowerTask(
     if (!teamIds.includes(profile.teamId)) {
       throw forbidden("Profile is outside your team scope");
     }
-    await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
-      action: "EISENHOWER_CREATE",
-    });
   } else {
     const assignment = await prisma.commandoAssignment.findFirst({
       where: {

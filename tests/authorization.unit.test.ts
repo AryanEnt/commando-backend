@@ -55,6 +55,16 @@ describe("permission matrix (least privilege)", () => {
     );
   });
 
+  it("grants team lead sales executive and sales support create", () => {
+    expect(ROLE_PERMISSION_MAP.TEAM_LEAD).toContain(
+      PERMISSIONS.SALES_EXECUTIVE_CREATE,
+    );
+    expect(ROLE_PERMISSION_MAP.TEAM_LEAD).toContain(
+      PERMISSIONS.SALES_SUPPORT_CREATE,
+    );
+    expect(ROLE_PERMISSION_MAP.TEAM_LEAD).not.toContain(PERMISSIONS.USER_CREATE);
+  });
+
   it("grants team lead support link assign and view", () => {
     expect(ROLE_PERMISSION_MAP.TEAM_LEAD).toContain(
       PERMISSIONS.SALES_SUPPORT_LINK_VIEW,
