@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import type { Actor } from "../../lib/authorization.js";
 import { badRequest } from "../../lib/errors.js";
 import {
+  createSwotSchema,
   listSwotQuerySchema,
   setSwotVisibilitySchema,
 } from "./schemas.js";
@@ -49,7 +50,8 @@ export async function createSwot(
   next: NextFunction,
 ): Promise<void> {
   try {
-    const item = await swotService.createSwot(req.user as Actor, req.body);
+    const body = createSwotSchema.parse(req.body);
+    const item = await swotService.createSwot(req.user as Actor, body);
     res.status(201).json({ data: { swot: item } });
   } catch (err) {
     next(err);

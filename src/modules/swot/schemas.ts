@@ -12,7 +12,7 @@ const pointsList = z.array(swotPointInput).min(1).max(40);
 
 export const createSwotSchema = z
   .object({
-    salesExecutiveProfileId: z.string().cuid(),
+    salesExecutiveProfileId: z.string().trim().min(1).max(64),
     strength: text.optional(),
     weakness: text.optional(),
     opportunity: text.optional(),
