@@ -197,14 +197,23 @@ describe("SWOT visibility (TL↔Commando share + SE gate)", () => {
     const share = await request(app)
       .patch(`/api/swot/${tlSwotId}/visibility`)
       .set("Authorization", `Bearer ${tl}`)
-      .send({ visibleToSalesExecutive: true });
+      .send({
+        visibleStrength: true,
+        visibleWeakness: true,
+        visibleOpportunity: false,
+        visibleThreat: false,
+      });
     expect(share.status).toBe(200);
     expect(share.body.data.swot.visibleToSalesExecutive).toBe(true);
+    expect(share.body.data.swot.visibleStrength).toBe(true);
+    expect(share.body.data.swot.visibleThreat).toBe(false);
 
     const seSeesTl = await request(app)
       .get(`/api/swot/${tlSwotId}`)
       .set("Authorization", `Bearer ${se}`);
     expect(seSeesTl.status).toBe(200);
+    expect(seSeesTl.body.data.swot.strength).toBe(body.strength);
+    expect(seSeesTl.body.data.swot.threat).toBeNull();
 
     // Commando shares own SWOT
     const shareC = await request(app)
@@ -228,6 +237,52 @@ describe("SWOT visibility (TL↔Commando share + SE gate)", () => {
       .get(`/api/swot/${commandoSwotId}`)
       .set("Authorization", `Bearer ${se}`);
     expect(seHiddenAgain.status).toBe(403);
+  });
+
+  it("shares individual points with the Sales Executive", async ({ skip }) => {
+    if (!dbReady) skip();
+    const c = await token("commando@commando.local");
+    const se = await token("sales@commando.local");
+
+    const created = await request(app)
+      .post("/api/swot")
+      .set("Authorization", `Bearer ${c}`)
+      .send({
+        salesExecutiveProfileId: profileId,
+        strengthPoints: [
+          { text: "Closes discovery well", visible: true },
+          { text: "Internal pipeline hygiene", visible: false },
+        ],
+        weaknessPoints: [{ text: "Late CRM notes", visible: false }],
+        opportunityPoints: [{ text: "Upsell existing book", visible: true }],
+        threatPoints: [
+          { text: "Price war on SKU A", visible: false },
+          { text: "Champion leaving", visible: true },
+          { text: "Legal delay on MSA", visible: false },
+        ],
+      });
+    expect(created.status).toBe(201);
+    const id = created.body.data.swot.id as string;
+    expect(created.body.data.swot.threatPoints).toHaveLength(3);
+
+    const seView = await request(app)
+      .get(`/api/swot/${id}`)
+      .set("Authorization", `Bearer ${se}`);
+    expect(seView.status).toBe(200);
+    expect(seView.body.data.swot.strengthPoints).toHaveLength(1);
+    expect(seView.body.data.swot.strengthPoints[0].text).toBe(
+      "Closes discovery well",
+    );
+    expect(seView.body.data.swot.weakness).toBeNull();
+    expect(seView.body.data.swot.threatPoints).toHaveLength(1);
+    expect(seView.body.data.swot.threatPoints[0].text).toBe("Champion leaving");
+
+    const tl = await token("teamlead@commando.local");
+    const tlView = await request(app)
+      .get(`/api/swot/${id}`)
+      .set("Authorization", `Bearer ${tl}`);
+    expect(tlView.status).toBe(200);
+    expect(tlView.body.data.swot.threatPoints).toHaveLength(3);
   });
 
   it("super admin is read-only and can filter by source", async ({ skip }) => {

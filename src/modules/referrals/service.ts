@@ -9,6 +9,11 @@ import {
   requireRecordAccess,
 } from "../../lib/scope.js";
 import type { CreateReferralInput, ListReferralsQuery } from "./schemas.js";
+import {
+  joinSwotPoints,
+  pointsToJson,
+  textToSwotPoints,
+} from "../../lib/swotPoints.js";
 import type {
   CreateCommandoRequestInput,
   ProvideReferralInformationInput,
@@ -851,16 +856,25 @@ export async function provideReferralInformation(
         include: referralInclude,
       });
 
+      const strengthPoints = textToSwotPoints(input.swot.strength, false);
+      const weaknessPoints = textToSwotPoints(input.swot.weakness, false);
+      const opportunityPoints = textToSwotPoints(input.swot.opportunity, false);
+      const threatPoints = textToSwotPoints(input.swot.threat, false);
+
       const swotRow = await tx.swotAnalysis.create({
         data: {
           salesExecutiveProfileId: referral.salesExecutiveProfileId,
           teamId: referral.teamId,
           assignmentId,
           source: "TEAM_LEAD",
-          strength: input.swot.strength,
-          weakness: input.swot.weakness,
-          opportunity: input.swot.opportunity,
-          threat: input.swot.threat,
+          strength: joinSwotPoints(strengthPoints),
+          weakness: joinSwotPoints(weaknessPoints),
+          opportunity: joinSwotPoints(opportunityPoints),
+          threat: joinSwotPoints(threatPoints),
+          strengthPoints: pointsToJson(strengthPoints),
+          weaknessPoints: pointsToJson(weaknessPoints),
+          opportunityPoints: pointsToJson(opportunityPoints),
+          threatPoints: pointsToJson(threatPoints),
           createdById: actor.id,
         },
         select: {

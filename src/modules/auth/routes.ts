@@ -1,6 +1,9 @@
 import { Router } from "express";
 import { validate } from "../../middleware/validate.js";
-import { requireAuthentication } from "../../middleware/auth.js";
+import {
+  optionalAuthentication,
+  requireAuthentication,
+} from "../../middleware/auth.js";
 import { rateLimit } from "../../middleware/rateLimit.js";
 import { loginSchema, refreshSchema } from "./schemas.js";
 import * as controller from "./controller.js";
@@ -28,5 +31,5 @@ authRouter.post(
   validate(refreshSchema),
   controller.refresh,
 );
-authRouter.post("/logout", requireAuthentication, controller.logout);
+authRouter.post("/logout", optionalAuthentication, controller.logout);
 authRouter.get("/me", requireAuthentication, controller.me);

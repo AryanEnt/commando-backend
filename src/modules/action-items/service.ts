@@ -357,6 +357,18 @@ async function assertCanManage(actor: Actor, row: ItemRow): Promise<void> {
   throw forbidden("Only Commandos and Team Leads can manage action items");
 }
 
+/** SE may mark their own ACTIVE assignments complete; coaches keep full lifecycle. */
+async function assertCanComplete(actor: Actor, row: ItemRow): Promise<void> {
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    await assertCanAccess(actor, row);
+    if (row.profile.userId !== actor.id) {
+      throw forbidden("You may only complete your own assignments");
+    }
+    return;
+  }
+  await assertCanManage(actor, row);
+}
+
 export async function listActionItems(
   actor: Actor,
   query: ListActionItemsQuery,
@@ -656,7 +668,7 @@ export async function completeActionItem(actor: Actor, id: string) {
     include: itemInclude,
   });
   if (!existing) throw notFound("Action item not found");
-  await assertCanManage(actor, asItemRow(existing));
+  await assertCanComplete(actor, asItemRow(existing));
 
   if (existing.status !== "ACTIVE") {
     throw badRequest("Only ACTIVE action items can be completed");

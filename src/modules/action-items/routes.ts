@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   requireAuthentication,
+  requireAnyPermission,
   requirePermission,
 } from "../../middleware/auth.js";
 import { validate } from "../../middleware/validate.js";
@@ -45,7 +46,10 @@ actionItemsRouter.patch(
 /** Named lifecycle transitions — no arbitrary status PATCH. */
 actionItemsRouter.post(
   "/:id/complete",
-  requirePermission(PERMISSIONS.ACTION_ITEM_UPDATE),
+  requireAnyPermission([
+    PERMISSIONS.ACTION_ITEM_UPDATE,
+    PERMISSIONS.ACTION_ITEM_VIEW,
+  ]),
   controller.completeActionItem,
 );
 

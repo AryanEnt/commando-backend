@@ -195,18 +195,21 @@ export async function getCurrentUser(userId: string): Promise<AuthUser> {
   return toAuthUser(user);
 }
 
-export function setAuthCookies(
-  res: Response,
-  accessToken: string,
-  refreshToken: string,
-): void {
-  const common = {
+function cookieBase() {
+  return {
     httpOnly: true,
     secure: env.cookieSecure,
     sameSite: "lax" as const,
     path: "/",
   };
+}
 
+export function setAuthCookies(
+  res: Response,
+  accessToken: string,
+  refreshToken: string,
+): void {
+  const common = cookieBase();
   res.cookie(ACCESS_COOKIE, accessToken, {
     ...common,
     maxAge: env.accessCookieMaxAgeMs,
@@ -218,8 +221,21 @@ export function setAuthCookies(
 }
 
 export function clearAuthCookies(res: Response): void {
-  res.clearCookie(ACCESS_COOKIE, { path: "/" });
-  res.clearCookie(REFRESH_COOKIE, { path: "/" });
+  const common = cookieBase();
+  res.clearCookie(ACCESS_COOKIE, common);
+  res.clearCookie(REFRESH_COOKIE, common);
+}
+
+export async function logoutFromRefreshCookie(refreshToken: string) {
+  const stored = await prisma.refreshToken.findFirst({
+    where: {
+      tokenHash: hashToken(refreshToken),
+      revokedAt: null,
+    },
+    select: { userId: true },
+  });
+  if (!stored) return;
+  await logout(stored.userId, refreshToken);
 }
 
 export { REFRESH_COOKIE };

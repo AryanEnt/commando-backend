@@ -2,23 +2,78 @@ import { z } from "zod";
 
 const text = z.string().trim().min(1).max(5000);
 
+const swotPointInput = z.object({
+  id: z.string().trim().min(1).max(80).optional(),
+  text: z.string().trim().min(1).max(2000),
+  visible: z.boolean().optional(),
+});
+
+const pointsList = z.array(swotPointInput).min(1).max(40);
+
 export const createSwotSchema = z
   .object({
     salesExecutiveProfileId: z.string().cuid(),
-    strength: text,
-    weakness: text,
-    opportunity: text,
-    threat: text,
-    /** TL/Commando only — share this version with the Sales Executive. */
+    strength: text.optional(),
+    weakness: text.optional(),
+    opportunity: text.optional(),
+    threat: text.optional(),
+    strengthPoints: pointsList.optional(),
+    weaknessPoints: pointsList.optional(),
+    opportunityPoints: pointsList.optional(),
+    threatPoints: pointsList.optional(),
+    /** TL/Commando only — share every point with the Sales Executive. */
     visibleToSalesExecutive: z.boolean().optional(),
+    visibleStrength: z.boolean().optional(),
+    visibleWeakness: z.boolean().optional(),
+    visibleOpportunity: z.boolean().optional(),
+    visibleThreat: z.boolean().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((v, ctx) => {
+    const quadrants = [
+      ["strength", v.strength, v.strengthPoints],
+      ["weakness", v.weakness, v.weaknessPoints],
+      ["opportunity", v.opportunity, v.opportunityPoints],
+      ["threat", v.threat, v.threatPoints],
+    ] as const;
+    for (const [key, blob, points] of quadrants) {
+      if (!blob?.trim() && (!points || points.length === 0)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `Add at least one ${key} point`,
+          path: [key],
+        });
+      }
+    }
+  });
 
 export const setSwotVisibilitySchema = z
   .object({
-    visibleToSalesExecutive: z.boolean(),
+    /** Shorthand: share or hide every point. */
+    visibleToSalesExecutive: z.boolean().optional(),
+    visibleStrength: z.boolean().optional(),
+    visibleWeakness: z.boolean().optional(),
+    visibleOpportunity: z.boolean().optional(),
+    visibleThreat: z.boolean().optional(),
+    point: z
+      .object({
+        quadrant: z.enum(["strength", "weakness", "opportunity", "threat"]),
+        id: z.string().min(1),
+        visible: z.boolean(),
+      })
+      .optional(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (v) =>
+      v.visibleToSalesExecutive !== undefined ||
+      v.visibleStrength !== undefined ||
+      v.visibleWeakness !== undefined ||
+      v.visibleOpportunity !== undefined ||
+      v.visibleThreat !== undefined ||
+      v.point !== undefined,
+    { message: "Provide at least one visibility field" },
+  );
 
 export const listSwotQuerySchema = z.object({
   search: z.string().trim().optional(),

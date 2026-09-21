@@ -496,10 +496,19 @@ model SwotAnalysis {
   weakness                String
   opportunity             String
   threat                  String
+  /** Numbered points: [{ id, text, visible }]. SE sees only visible:true. */
+  strengthPoints          Json       @default("[]")
+  weaknessPoints          Json       @default("[]")
+  opportunityPoints       Json       @default("[]")
+  threatPoints            Json       @default("[]")
   versionNumber           Int        @default(1)
   supersedesId            String?
-  /** When true, Sales Executives may view this SWOT version. TL/Commando/Admin always can. */
+  /** When true, Sales Executives may view this SWOT version (any point shared). */
   visibleToSalesExecutive Boolean    @default(false)
+  visibleStrength         Boolean    @default(false)
+  visibleWeakness         Boolean    @default(false)
+  visibleOpportunity      Boolean    @default(false)
+  visibleThreat           Boolean    @default(false)
   createdById             String
   archivedAt              DateTime?
   createdAt               DateTime   @default(now())

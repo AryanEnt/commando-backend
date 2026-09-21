@@ -16,11 +16,7 @@ import type { RecordAccessContext } from "../lib/scope.js";
 
 const ACCESS_COOKIE = "access_token";
 
-export function getAccessTokenFromRequest(req: Request): string | null {
-  const header = req.headers.authorization;
-  if (header?.startsWith("Bearer ")) {
-    return header.slice("Bearer ".length).trim();
-  }
+function readAccessCookie(req: Request): string | null {
   const fromParser = req.cookies?.[ACCESS_COOKIE];
   if (typeof fromParser === "string" && fromParser.length > 0) {
     return fromParser;
@@ -36,6 +32,27 @@ export function getAccessTokenFromRequest(req: Request): string | null {
     }
   }
   return null;
+}
+
+function isUsableJwt(token: string): boolean {
+  try {
+    verifyAccessToken(token);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function getAccessTokenFromRequest(req: Request): string | null {
+  const header = req.headers.authorization;
+  const bearer = header?.startsWith("Bearer ")
+    ? header.slice("Bearer ".length).trim()
+    : "";
+  const cookie = readAccessCookie(req);
+
+  if (bearer && isUsableJwt(bearer)) return bearer;
+  if (cookie && isUsableJwt(cookie)) return cookie;
+  return bearer || cookie || null;
 }
 
 async function loadAuthUser(userId: string): Promise<AuthUser | null> {
@@ -65,6 +82,27 @@ async function loadAuthUser(userId: string): Promise<AuthUser | null> {
       (rp) => rp.permission.code as PermissionCode,
     ),
   };
+}
+
+/** Attaches req.user when a valid access token is present; never rejects. */
+export async function optionalAuthentication(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const token = getAccessTokenFromRequest(req);
+    if (!token || !isUsableJwt(token)) {
+      next();
+      return;
+    }
+    const payload = verifyAccessToken(token);
+    const user = await loadAuthUser(payload.sub);
+    if (user) req.user = user;
+  } catch {
+    /* stay anonymous */
+  }
+  next();
 }
 
 export async function requireAuthentication(

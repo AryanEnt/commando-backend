@@ -69,6 +69,8 @@ export async function logout(
     const refresh = readRefreshToken(req);
     if (req.user) {
       await authService.logout(req.user.id, refresh);
+    } else if (refresh) {
+      await authService.logoutFromRefreshCookie(refresh);
     }
     authService.clearAuthCookies(res);
     res.status(200).json({ data: { ok: true } });

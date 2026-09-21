@@ -196,7 +196,7 @@ describe("action items lifecycle", () => {
     ).toBe(true);
   });
 
-  it("sales executive is view-only for current ACTIVE items during Commando", async ({
+  it("sales executive can complete own ACTIVE items but cannot create or expire", async ({
     skip,
   }) => {
     if (!dbReady || !replacementId) skip();
@@ -240,7 +240,9 @@ describe("action items lifecycle", () => {
     const complete = await request(app)
       .post(`/api/action-items/${replacementId}/complete`)
       .set("Authorization", `Bearer ${se}`);
-    expect(complete.status).toBe(403);
+    expect(complete.status).toBe(200);
+    expect(complete.body.data.actionItem.status).toBe("COMPLETED");
+    expect(complete.body.data.actionItem.completedById).toBeTruthy();
 
     const expire = await request(app)
       .post(`/api/action-items/${replacementId}/expire`)

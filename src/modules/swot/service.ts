@@ -3,7 +3,7 @@ import { prisma } from "../../lib/prisma.js";
 import { writeAuditLog } from "../../lib/audit.js";
 import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
-import { forbidden, notFound } from "../../lib/errors.js";
+import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import {
   assertProfileInScope,
   getActiveTeamIds,
@@ -15,6 +15,17 @@ import {
 } from "../../lib/lifecycleVisibility.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
+import {
+  flagsFromPoints,
+  joinSwotPoints,
+  loadQuadrantPoints,
+  normalizeSwotPoints,
+  pointsToJson,
+  setAllPointsVisible,
+  setPointVisible,
+  setQuadrantPointsVisible,
+  type SwotPoint,
+} from "../../lib/swotPoints.js";
 import type {
   CreateSwotInput,
   ListSwotQuery,
@@ -57,7 +68,79 @@ function sourceForRole(roleCode: Actor["roleCode"]): SwotSource {
   }
 }
 
-function serialize(row: SwotRow) {
+type QuadrantFlags = {
+  visibleStrength: boolean;
+  visibleWeakness: boolean;
+  visibleOpportunity: boolean;
+  visibleThreat: boolean;
+};
+
+function anyQuadrantShared(flags: QuadrantFlags): boolean {
+  return (
+    flags.visibleStrength ||
+    flags.visibleWeakness ||
+    flags.visibleOpportunity ||
+    flags.visibleThreat
+  );
+}
+
+function flagsFromRow(row: {
+  visibleStrength?: boolean | null;
+  visibleWeakness?: boolean | null;
+  visibleOpportunity?: boolean | null;
+  visibleThreat?: boolean | null;
+  visibleToSalesExecutive?: boolean | null;
+}): QuadrantFlags {
+  const visibleStrength = Boolean(row.visibleStrength);
+  const visibleWeakness = Boolean(row.visibleWeakness);
+  const visibleOpportunity = Boolean(row.visibleOpportunity);
+  const visibleThreat = Boolean(row.visibleThreat);
+  // Legacy rows: overall share with no per-box flags yet
+  if (
+    row.visibleToSalesExecutive &&
+    !visibleStrength &&
+    !visibleWeakness &&
+    !visibleOpportunity &&
+    !visibleThreat
+  ) {
+    return {
+      visibleStrength: true,
+      visibleWeakness: true,
+      visibleOpportunity: true,
+      visibleThreat: true,
+    };
+  }
+  return {
+    visibleStrength,
+    visibleWeakness,
+    visibleOpportunity,
+    visibleThreat,
+  };
+}
+
+function presentPoints(points: SwotPoint[], redact: boolean) {
+  const shown = redact ? points.filter((p) => p.visible) : points;
+  if (redact && shown.length === 0) {
+    return { text: null as string | null, points: [] as SwotPoint[] };
+  }
+  return {
+    text: joinSwotPoints(shown),
+    points: redact
+      ? shown.map((p) => ({ ...p, visible: true }))
+      : shown,
+  };
+}
+
+function serialize(row: SwotRow, actor?: Actor) {
+  const all = loadQuadrantPoints(row);
+  const flags = flagsFromPoints(all);
+  const isSe = actor?.roleCode === "SALES_EXECUTIVE";
+  const own = row.source === "SALES_EXECUTIVE";
+  const redact = isSe && !own;
+  const strength = presentPoints(all.strength, redact);
+  const weakness = presentPoints(all.weakness, redact);
+  const opportunity = presentPoints(all.opportunity, redact);
+  const threat = presentPoints(all.threat, redact);
   return {
     id: row.id,
     salesExecutiveProfileId: row.salesExecutiveProfileId,
@@ -66,13 +149,21 @@ function serialize(row: SwotRow) {
     team: row.team,
     assignmentId: row.assignmentId,
     source: row.source,
-    strength: row.strength,
-    weakness: row.weakness,
-    opportunity: row.opportunity,
-    threat: row.threat,
+    strength: strength.text,
+    weakness: weakness.text,
+    opportunity: opportunity.text,
+    threat: threat.text,
+    strengthPoints: strength.points,
+    weaknessPoints: weakness.points,
+    opportunityPoints: opportunity.points,
+    threatPoints: threat.points,
     versionNumber: row.versionNumber ?? 1,
     supersedesId: row.supersedesId ?? null,
-    visibleToSalesExecutive: row.visibleToSalesExecutive,
+    visibleToSalesExecutive: anyQuadrantShared(flags) || own,
+    visibleStrength: own ? true : flags.visibleStrength,
+    visibleWeakness: own ? true : flags.visibleWeakness,
+    visibleOpportunity: own ? true : flags.visibleOpportunity,
+    visibleThreat: own ? true : flags.visibleThreat,
     createdById: row.createdById,
     createdBy: row.createdBy,
     createdAt: row.createdAt,
@@ -295,7 +386,7 @@ export async function listSwot(actor: Actor, query: ListSwotQuery) {
     page: query.page,
     pageSize: query.pageSize,
     total,
-    items: rows.map(serialize),
+    items: rows.map((row) => serialize(row, actor)),
   };
 }
 
@@ -306,7 +397,7 @@ export async function getSwot(actor: Actor, id: string) {
   });
   if (!row) throw notFound("SWOT analysis not found");
   await assertCanViewSwot(actor, row);
-  return serialize(row);
+  return serialize(row, actor);
 }
 
 export async function createSwot(actor: Actor, input: CreateSwotInput) {
@@ -367,15 +458,68 @@ export async function createSwot(actor: Actor, input: CreateSwotInput) {
       id: true,
       versionNumber: true,
       visibleToSalesExecutive: true,
+      visibleStrength: true,
+      visibleWeakness: true,
+      visibleOpportunity: true,
+      visibleThreat: true,
     },
   });
 
-  const visibleToSalesExecutive =
-    source === "SALES_EXECUTIVE"
-      ? true
-      : (input.visibleToSalesExecutive ??
-        previous?.visibleToSalesExecutive ??
-        false);
+  const previousFlags = previous
+    ? flagsFromRow(previous)
+    : {
+        visibleStrength: false,
+        visibleWeakness: false,
+        visibleOpportunity: false,
+        visibleThreat: false,
+      };
+
+  const fromInput =
+    input.visibleToSalesExecutive !== undefined
+      ? {
+          visibleStrength: input.visibleToSalesExecutive,
+          visibleWeakness: input.visibleToSalesExecutive,
+          visibleOpportunity: input.visibleToSalesExecutive,
+          visibleThreat: input.visibleToSalesExecutive,
+        }
+      : {
+          visibleStrength: input.visibleStrength ?? previousFlags.visibleStrength,
+          visibleWeakness: input.visibleWeakness ?? previousFlags.visibleWeakness,
+          visibleOpportunity:
+            input.visibleOpportunity ?? previousFlags.visibleOpportunity,
+          visibleThreat: input.visibleThreat ?? previousFlags.visibleThreat,
+        };
+
+  const seAuthor = source === "SALES_EXECUTIVE";
+  const shareAll = input.visibleToSalesExecutive === true;
+  const strengthPoints = normalizeSwotPoints(
+    input.strengthPoints,
+    input.strength,
+    seAuthor || shareAll || fromInput.visibleStrength,
+  );
+  const weaknessPoints = normalizeSwotPoints(
+    input.weaknessPoints,
+    input.weakness,
+    seAuthor || shareAll || fromInput.visibleWeakness,
+  );
+  const opportunityPoints = normalizeSwotPoints(
+    input.opportunityPoints,
+    input.opportunity,
+    seAuthor || shareAll || fromInput.visibleOpportunity,
+  );
+  const threatPoints = normalizeSwotPoints(
+    input.threatPoints,
+    input.threat,
+    seAuthor || shareAll || fromInput.visibleThreat,
+  );
+
+  const flags = flagsFromPoints({
+    strength: strengthPoints,
+    weakness: weaknessPoints,
+    opportunity: opportunityPoints,
+    threat: threatPoints,
+  });
+  const visibleToSalesExecutive = anyQuadrantShared(flags);
 
   const created = await prisma.swotAnalysis.create({
     data: {
@@ -383,13 +527,21 @@ export async function createSwot(actor: Actor, input: CreateSwotInput) {
       teamId: profile.teamId,
       assignmentId: activeAssignment?.id ?? null,
       source,
-      strength: input.strength,
-      weakness: input.weakness,
-      opportunity: input.opportunity,
-      threat: input.threat,
+      strength: joinSwotPoints(strengthPoints),
+      weakness: joinSwotPoints(weaknessPoints),
+      opportunity: joinSwotPoints(opportunityPoints),
+      threat: joinSwotPoints(threatPoints),
+      strengthPoints: pointsToJson(strengthPoints),
+      weaknessPoints: pointsToJson(weaknessPoints),
+      opportunityPoints: pointsToJson(opportunityPoints),
+      threatPoints: pointsToJson(threatPoints),
       versionNumber: (previous?.versionNumber ?? 0) + 1,
       supersedesId: previous?.id ?? null,
       visibleToSalesExecutive,
+      visibleStrength: flags.visibleStrength,
+      visibleWeakness: flags.visibleWeakness,
+      visibleOpportunity: flags.visibleOpportunity,
+      visibleThreat: flags.visibleThreat,
       createdById: actor.id,
     },
     include: swotInclude,
@@ -423,7 +575,7 @@ export async function createSwot(actor: Actor, input: CreateSwotInput) {
     createdById: actor.id,
   });
 
-  return serialize(created);
+  return serialize(created, actor);
 }
 
 export async function setSwotVisibility(
@@ -438,9 +590,61 @@ export async function setSwotVisibility(
   if (!row) throw notFound("SWOT analysis not found");
   await assertCanManageVisibility(actor, row);
 
+  let points = loadQuadrantPoints(row);
+  if (input.point) {
+    const next = setPointVisible(
+      points,
+      input.point.quadrant,
+      input.point.id,
+      input.point.visible,
+    );
+    if (!next) throw badRequest("SWOT point not found");
+    points = next;
+  } else if (input.visibleToSalesExecutive !== undefined) {
+    points = setAllPointsVisible(points, input.visibleToSalesExecutive);
+  } else {
+    if (input.visibleStrength !== undefined) {
+      points = setQuadrantPointsVisible(
+        points,
+        "strength",
+        input.visibleStrength,
+      );
+    }
+    if (input.visibleWeakness !== undefined) {
+      points = setQuadrantPointsVisible(
+        points,
+        "weakness",
+        input.visibleWeakness,
+      );
+    }
+    if (input.visibleOpportunity !== undefined) {
+      points = setQuadrantPointsVisible(
+        points,
+        "opportunity",
+        input.visibleOpportunity,
+      );
+    }
+    if (input.visibleThreat !== undefined) {
+      points = setQuadrantPointsVisible(points, "threat", input.visibleThreat);
+    }
+  }
+
+  const flags = flagsFromPoints(points);
+  const visibleToSalesExecutive = anyQuadrantShared(flags);
+
   const updated = await prisma.swotAnalysis.update({
     where: { id },
-    data: { visibleToSalesExecutive: input.visibleToSalesExecutive },
+    data: {
+      visibleToSalesExecutive,
+      visibleStrength: flags.visibleStrength,
+      visibleWeakness: flags.visibleWeakness,
+      visibleOpportunity: flags.visibleOpportunity,
+      visibleThreat: flags.visibleThreat,
+      strengthPoints: pointsToJson(points.strength),
+      weaknessPoints: pointsToJson(points.weakness),
+      opportunityPoints: pointsToJson(points.opportunity),
+      threatPoints: pointsToJson(points.threat),
+    },
     include: swotInclude,
   });
 
@@ -450,12 +654,13 @@ export async function setSwotVisibility(
     entityType: "SwotAnalysis",
     entityId: updated.id,
     metadata: {
-      visibleToSalesExecutive: input.visibleToSalesExecutive,
+      visibleToSalesExecutive,
+      ...flags,
       source: updated.source,
       profileId: updated.salesExecutiveProfileId,
       verb: "UPDATE",
     },
   });
 
-  return serialize(updated);
+  return serialize(updated, actor);
 }
