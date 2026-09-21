@@ -195,12 +195,11 @@ async function scopeWhere(actor: Actor): Promise<Prisma.WeeklyReviewWhereInput> 
         select: { id: true },
       });
       if (!profile) return { id: "__none__" };
-      // SE may only see Commando-authored reviews (not Team Lead reviews).
-      // Commando create always sets commandoUserId; TL create leaves it null.
+      // SE sees submitted reviews on their own profile (TL and Commando).
       return {
         archivedAt: null,
         salesExecutiveProfileId: profile.id,
-        commandoUserId: { not: null },
+        status: "SUBMITTED",
       };
     }
     default:
@@ -237,9 +236,8 @@ async function assertCanAccess(actor: Actor, row: ReviewRow): Promise<void> {
     if (row.profile.userId !== actor.id) {
       throw forbidden("You may only view your own weekly reviews");
     }
-    // Hide Team Lead-authored reviews from the SE surface.
-    if (!row.commandoUserId) {
-      throw forbidden("This weekly review is not available");
+    if (row.status !== "SUBMITTED") {
+      throw forbidden("This weekly review is not available yet");
     }
     return;
   }
@@ -1022,9 +1020,9 @@ export async function getWeeklyReviewHub(
         salesExecutiveProfileId: profile.id,
         archivedAt: null,
         weekStartDate: { gte: week.start, lt: weekEndExclusive },
-        // SE hub must never surface a TL-authored review as "this week's review".
+        // SE hub only shows submitted reviews (create already submits).
         ...(actor.roleCode === "SALES_EXECUTIVE"
-          ? { commandoUserId: { not: null } }
+          ? { status: "SUBMITTED" }
           : {}),
       },
       orderBy: { createdAt: "desc" },

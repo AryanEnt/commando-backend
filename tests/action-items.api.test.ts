@@ -213,15 +213,15 @@ describe("action items lifecycle", () => {
       ),
     ).toBe(true);
 
-    const historyBlocked = await request(app)
+    const history = await request(app)
       .get(`/api/action-items?view=history`)
       .set("Authorization", `Bearer ${se}`);
-    expect(historyBlocked.status).toBe(403);
+    expect(history.status).toBe(200);
 
-    const allBlocked = await request(app)
+    const all = await request(app)
       .get(`/api/action-items?view=all`)
       .set("Authorization", `Bearer ${se}`);
-    expect(allBlocked.status).toBe(403);
+    expect(all.status).toBe(200);
 
     const detail = await request(app)
       .get(`/api/action-items/${replacementId}`)

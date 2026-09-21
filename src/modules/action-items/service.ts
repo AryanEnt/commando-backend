@@ -265,14 +265,9 @@ async function scopeWhere(actor: Actor): Promise<Prisma.ActionItemWhereInput> {
         select: { id: true },
       });
       if (!profile) return { id: "__none__" };
-      const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
-      const statuses = lifecycle.isAfterCommando
-        ? (["ACTIVE", "COMPLETED", "EXPIRED", "REPLACED", "CANCELLED"] as const)
-        : (["ACTIVE"] as const);
       return {
         archivedAt: null,
         salesExecutiveProfileId: profile.id,
-        status: { in: [...statuses] },
       };
     }
     default:
@@ -316,9 +311,7 @@ async function assertCanAccess(actor: Actor, row: ItemRow): Promise<void> {
       row.salesExecutiveProfileId,
     );
     if (!salesExecutiveCanViewActionItemStatus(row.status, lifecycle)) {
-      throw forbidden(
-        "Action item history is not visible during an active Commando assignment",
-      );
+      throw forbidden("You may not view this assignment");
     }
     return;
   }
@@ -375,38 +368,12 @@ export async function listActionItems(
 ) {
   const scope = await scopeWhere(actor);
 
-  // SE during Commando: force ACTIVE only — ignore view/status query bypasses
-  let effectiveView = query.view;
-  let effectiveStatus = query.status;
-  if (actor.roleCode === "SALES_EXECUTIVE") {
-    const profile = await prisma.salesExecutiveProfile.findFirst({
-      where: { userId: actor.id, archivedAt: null },
-      select: { id: true },
-    });
-    if (profile) {
-      const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
-      if (lifecycle.isDuringCommando) {
-        if (
-          query.view === "history" ||
-          query.view === "all" ||
-          (query.status && query.status !== "ACTIVE")
-        ) {
-          throw forbidden(
-            "Action item history is not visible during an active Commando assignment",
-          );
-        }
-        effectiveView = "active";
-        effectiveStatus = undefined;
-      }
-    }
-  }
-
   const viewFilter: Prisma.ActionItemWhereInput =
-    effectiveStatus
-      ? { status: effectiveStatus }
-      : effectiveView === "active"
+    query.status
+      ? { status: query.status }
+      : query.view === "active"
         ? { status: "ACTIVE" }
-        : effectiveView === "history"
+        : query.view === "history"
           ? {
               status: {
                 in: ["COMPLETED", "EXPIRED", "REPLACED", "CANCELLED"],

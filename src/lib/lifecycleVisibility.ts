@@ -125,24 +125,20 @@ export function coachingSourcesVisibleToSalesExecutive(
 }
 
 /**
- * Action items for Sales Executives.
- * During Commando: ACTIVE (current) only.
- * After Commando: ACTIVE + history.
+ * Action items for Sales Executives: current assignments plus their own history
+ * (completed, expired, replaced, cancelled), including during Commando.
  */
 export function salesExecutiveCanViewActionItemStatus(
   status: string,
-  lifecycle: CommandoLifecycleState,
+  _lifecycle: CommandoLifecycleState,
 ): boolean {
-  if (status === "ACTIVE") return true;
-  if (lifecycle.isAfterCommando) {
-    return (
-      status === "COMPLETED" ||
-      status === "EXPIRED" ||
-      status === "REPLACED" ||
-      status === "CANCELLED"
-    );
-  }
-  return false;
+  return (
+    status === "ACTIVE" ||
+    status === "COMPLETED" ||
+    status === "EXPIRED" ||
+    status === "REPLACED" ||
+    status === "CANCELLED"
+  );
 }
 
 /**

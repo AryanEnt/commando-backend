@@ -315,7 +315,7 @@ describe("Phase 14 — lifecycle visibility & unauthorized access", () => {
     expect(salesExecutiveCanViewMonitoring(during)).toBe(true);
     expect(salesExecutiveCanViewMonitoring(after)).toBe(true);
     expect(salesExecutiveCanViewActionItemStatus("COMPLETED", during)).toBe(
-      false,
+      true,
     );
     expect(salesExecutiveCanViewActionItemStatus("COMPLETED", after)).toBe(
       true,
@@ -482,27 +482,24 @@ describe("Phase 14 — lifecycle visibility & unauthorized access", () => {
       expect(rows).toHaveLength(0);
     }
 
-    expect(
-      (
-        await request(app)
-          .get("/api/action-items?view=history")
-          .set("Authorization", `Bearer ${se}`)
-      ).status,
-    ).toBe(403);
+    const historyDuring = await request(app)
+      .get("/api/action-items?view=history")
+      .set("Authorization", `Bearer ${se}`);
+    expect(historyDuring.status).toBe(200);
     expect(
       (
         await request(app)
           .get("/api/action-items?view=all")
           .set("Authorization", `Bearer ${se}`)
       ).status,
-    ).toBe(403);
+    ).toBe(200);
     expect(
       (
         await request(app)
           .get("/api/action-items?status=COMPLETED")
           .set("Authorization", `Bearer ${se}`)
       ).status,
-    ).toBe(403);
+    ).toBe(200);
 
     const prior = new Date();
     prior.setUTCMonth(prior.getUTCMonth() - 1);
