@@ -45,10 +45,14 @@ export const env = {
   ),
   accessTokenTtl: process.env.JWT_ACCESS_TTL ?? "15m",
   refreshTokenTtlDays: Number(process.env.JWT_REFRESH_TTL_DAYS ?? 7),
-  cookieSecure: process.env.COOKIE_SECURE === "true" || isProd,
+  // Explicit COOKIE_SECURE=false wins (needed for HTTP mesh hosts without TLS).
+  cookieSecure:
+    process.env.COOKIE_SECURE !== undefined
+      ? process.env.COOKIE_SECURE === "true"
+      : isProd,
   corsOrigin: isProd
     ? required("CORS_ORIGIN")
-    : (process.env.CORS_ORIGIN ?? "http://localhost:3000"),
+    : (process.env.CORS_ORIGIN ?? "http://localhost:3000,http://localhost:3001"),
   accessCookieMaxAgeMs: Number(
     process.env.ACCESS_COOKIE_MAX_AGE_MS ?? 15 * 60 * 1000,
   ),

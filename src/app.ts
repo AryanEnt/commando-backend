@@ -63,18 +63,20 @@ export function createApp() {
           callback(null, true);
           return;
         }
-        // Local / LAN Next.js (dev): localhost or private network hosts
+        // Internal mesh / LAN Next.js on :3000|:3001 (e.g. http://10.80.80.225:3001)
+        // Allowed even when NODE_ENV=production so HTTP mesh hosts keep working.
         if (
-          !isProd &&
-          (/^http:\/\/(localhost|127\.0\.0\.1):(3000|3001)$/.test(origin) ||
-            /^http:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}):(3000|3001)$/.test(
-              origin,
-            ))
+          /^http:\/\/(localhost|127\.0\.0\.1):(3000|3001)$/.test(origin) ||
+          /^http:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}):(3000|3001)$/.test(
+            origin,
+          )
         ) {
           callback(null, true);
           return;
         }
-        callback(new Error(`CORS blocked for origin ${origin}`));
+        // Deny without throwing — throwing skips CORS headers and looks like a blank preflight failure
+        logger.warn("cors_blocked", { origin });
+        callback(null, false);
       },
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],

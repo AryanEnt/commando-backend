@@ -10,6 +10,8 @@ const server = app.listen(env.port, "0.0.0.0", () => {
     port: env.port,
     host: "0.0.0.0",
     env: env.nodeEnv,
+    corsOrigin: env.corsOrigin,
+    cookieSecure: env.cookieSecure,
   });
 });
 
