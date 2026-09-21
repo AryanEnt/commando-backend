@@ -64,6 +64,22 @@ export async function updateCategory(
   }
 }
 
+export async function deleteCategory(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.deleteMonitoringCategory(
+      req.user as Actor,
+      paramId(req.params.id),
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function createChecklistItem(
   req: Request,
   res: Response,

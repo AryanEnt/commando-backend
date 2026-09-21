@@ -4,7 +4,7 @@ import { writeAuditLog } from "../../lib/audit.js";
 import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { forbidden, notFound } from "../../lib/errors.js";
-import { getActiveTeamIds } from "../../lib/scope.js";
+import { assertProfileInScope, getActiveTeamIds } from "../../lib/scope.js";
 import { totalDaysUnderCommando } from "../../lib/assignmentDays.js";
 import {
   getCommandoLifecycleState,
@@ -386,28 +386,10 @@ export async function getPerformanceMetrics(actor: Actor, profileId?: string) {
   });
   if (!profile) throw notFound("Sales executive profile not found");
 
-  // Scope check for non-SE viewers
-  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: profile.id,
-        commandoUserId: actor.id,
-      },
-    });
-    if (!assigned && !isSuperAdmin(actor)) {
-      throw forbidden("Profile is outside your assignment scope");
-    }
-  } else if (actor.roleCode === "TEAM_LEAD") {
-    const teamIds = await getActiveTeamIds(prisma, actor.id);
-    if (!teamIds.includes(profile.teamId) && !isSuperAdmin(actor)) {
-      throw forbidden("Profile is outside your team scope");
-    }
-  } else if (
-    actor.roleCode !== "SALES_EXECUTIVE" &&
-    !isSuperAdmin(actor)
-  ) {
-    throw forbidden("Not allowed to view performance metrics");
-  }
+  // Same profile scope as the SE workspace itself (team membership OR
+  // assignment ownership). Do not use a narrower team-only check here —
+  // that caused metrics 403 while the profile page loaded successfully.
+  await assertProfileInScope(prisma, actor, profile.id);
 
   const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
   // Align with list/get: Team Leads never see Commando performance;

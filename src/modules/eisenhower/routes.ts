@@ -28,6 +28,12 @@ eisenhowerRouter.get(
   controller.getMatrix,
 );
 
+eisenhowerRouter.get(
+  "/workspace",
+  requirePermission(PERMISSIONS.EISENHOWER_VIEW),
+  controller.getWorkspace,
+);
+
 eisenhowerRouter.post(
   "/",
   requirePermission(PERMISSIONS.EISENHOWER_CREATE),

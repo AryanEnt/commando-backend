@@ -64,6 +64,11 @@ enum WeeklyReviewStatus {
   SUBMITTED
 }
 
+enum DailyLogStatus {
+  DRAFT
+  SUBMITTED
+}
+
 enum EisenhowerCategory {
   DO_FIRST
   SCHEDULE
@@ -75,6 +80,36 @@ enum EisenhowerTaskStatus {
   OPEN
   IN_PROGRESS
   DONE
+  CANCELLED
+}
+
+enum WorkspaceEventType {
+  MONITORING
+  COACHING
+  FEEDBACK
+  DAILY_LOG
+  REVIEW
+  ACTION
+  SUPPORT
+  INTERVENTION
+  SWOT
+  GENERAL
+}
+
+enum EventUrgency {
+  URGENT
+  NOT_URGENT
+}
+
+enum EventImportance {
+  IMPORTANT
+  NOT_IMPORTANT
+}
+
+enum WorkspaceEventStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
   CANCELLED
 }
 
@@ -190,6 +225,7 @@ model User {
 
   swotCreated            SwotAnalysis[]          @relation("SwotCreator")
   dailyLogsCreated       DailyLog[]              @relation("DailyLogCreator")
+  dailyLogEntriesCreated DailyLogEntry[]         @relation("DailyLogEntryCreator")
   weeklyReviewsCreated   WeeklyReview[]          @relation("WeeklyReviewCreator")
   weeklyReviewAttendance WeeklyReviewAttendee[]
   syncEvalsCreated       SyncEvaluation[]        @relation("SyncEvalCreator")
@@ -198,6 +234,7 @@ model User {
   monitoringCreated      LiveMonitoringRecord[]  @relation("MonitoringCreator")
   seMonitoringItemsCreated SeMonitoringChecklistItem[] @relation("SeMonitoringChecklistCreator")
   actionItemsCreated     ActionItem[]            @relation("ActionItemCreator")
+  actionItemsCompleted   ActionItem[]            @relation("ActionItemCompleter")
   feedbackCreated        Feedback[]              @relation("FeedbackCreator")
   performanceCreated     PerformanceEvaluation[] @relation("PerformanceCreator")
   supportTasksCreated    SupportTask[]           @relation("SupportTaskCreator")
@@ -213,6 +250,7 @@ model User {
   supportRoleAssignments SupportRoleAssignment[] @relation("SupportRoleAssignee")
   supportRolesCreated    SupportRoleAssignment[] @relation("SupportRoleCreator")
   monitoringSupportInvolvements MonitoringSupportInvolvement[]
+  workspaceEventsCreated WorkspaceEvent[]        @relation("WorkspaceEventCreator")
   refreshTokens          RefreshToken[]
 
   @@index([roleId])
@@ -305,6 +343,7 @@ model SalesExecutiveProfile {
   supportTasks      SupportTask[]
   interventionGoals InterventionGoal[]
   recordAcknowledgements RecordAcknowledgement[]
+  workspaceEvents   WorkspaceEvent[]
 
   @@index([teamId])
   @@index([archivedAt])
@@ -386,6 +425,7 @@ model CommandoAssignment {
   supportRoleAssignments SupportRoleAssignment[]
   supportTasks      SupportTask[]
   interventionGoals InterventionGoal[]
+  workspaceEvents   WorkspaceEvent[]
 
   @@index([salesExecutiveProfileId, status])
   @@index([commandoUserId, status])
@@ -456,20 +496,28 @@ model SwotAnalysis {
   weakness                String
   opportunity             String
   threat                  String
+  versionNumber           Int        @default(1)
+  supersedesId            String?
+  /** When true, Sales Executives may view this SWOT version. TL/Commando/Admin always can. */
+  visibleToSalesExecutive Boolean    @default(false)
   createdById             String
   archivedAt              DateTime?
   createdAt               DateTime   @default(now())
   updatedAt               DateTime   @updatedAt
 
-  profile   SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
-  team      Team                  @relation(fields: [teamId], references: [id], onDelete: Restrict)
-  createdBy User                  @relation("SwotCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  team       Team                  @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  createdBy  User                  @relation("SwotCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  supersedes SwotAnalysis?         @relation("SwotVersionChain", fields: [supersedesId], references: [id], onDelete: SetNull)
+  supersededBy SwotAnalysis[]      @relation("SwotVersionChain")
 
   @@index([salesExecutiveProfileId, source])
+  @@index([salesExecutiveProfileId, source, versionNumber])
   @@index([teamId])
   @@index([assignmentId])
   @@index([createdById])
   @@index([createdAt])
+  @@index([supersedesId])
 }
 
 // ─────────────────────────────────────────────
@@ -486,36 +534,67 @@ model ActivityType {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  dailyLogs DailyLog[]
+  entries DailyLogEntry[]
 
   @@index([isActive])
 }
 
+/// One Daily Log per Sales Executive per calendar day (container for entries).
 model DailyLog {
-  id                      String   @id @default(cuid())
+  id                      String         @id @default(cuid())
   salesExecutiveProfileId String
   assignmentId            String?
-  activityTypeId          String
-  sessionTitle            String
-  observation             String
-  evidence                String?
-  seResponse               String?
-  coachingGiven           String?
-  expectedChange          String?
-  followUp                String?
+  /// Calendar day for this log (date-only).
+  logDate                 DateTime       @db.Date
+  status                  DailyLogStatus @default(DRAFT)
+  submittedAt             DateTime?
   createdById             String
-  loggedAt                DateTime @default(now())
   archivedAt              DateTime?
-  createdAt               DateTime @default(now())
-  updatedAt               DateTime @updatedAt
+  createdAt               DateTime       @default(now())
+  updatedAt               DateTime       @updatedAt
 
-  profile      SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
-  assignment   CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
-  activityType ActivityType          @relation(fields: [activityTypeId], references: [id], onDelete: Restrict)
-  createdBy    User                  @relation("DailyLogCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy  User                  @relation("DailyLogCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  entries    DailyLogEntry[]
 
+  @@unique([salesExecutiveProfileId, logDate])
   @@index([salesExecutiveProfileId])
   @@index([assignmentId])
+  @@index([createdById])
+  @@index([logDate])
+  @@index([status])
+}
+
+/// Individual activity recorded inside a Daily Log.
+model DailyLogEntry {
+  id               String               @id @default(cuid())
+  dailyLogId       String
+  activityTypeId   String
+  sessionTitle     String
+  observation      String
+  evidence         String?
+  seResponse       String?
+  coachingGiven    String?
+  expectedChange   String?
+  followUp         String?
+  /// Set during Review & Prioritize submit (null = not prioritized).
+  urgency          EventUrgency?
+  importance       EventImportance?
+  eisenhowerCategory EisenhowerCategory?
+  /// Prevents duplicate Eisenhower tasks on retry/resubmit.
+  eisenhowerTaskId String?              @unique
+  sortOrder        Int                  @default(0)
+  loggedAt         DateTime             @default(now())
+  createdById      String
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  dailyLog     DailyLog     @relation(fields: [dailyLogId], references: [id], onDelete: Cascade)
+  activityType ActivityType @relation(fields: [activityTypeId], references: [id], onDelete: Restrict)
+  createdBy    User         @relation("DailyLogEntryCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([dailyLogId])
   @@index([activityTypeId])
   @@index([createdById])
   @@index([loggedAt])
@@ -534,6 +613,16 @@ model WeeklyReview {
   weekLabel               String
   weekStartDate           DateTime           @db.Date
   meetingDate             DateTime
+  /// Meeting room / location label
+  roomName                String?
+  /// Local meeting time as HH:mm (24h)
+  meetingTime             String?
+  /// Cloudflare R2 object key for uploaded minutes
+  meetingMinutesKey         String?
+  meetingMinutesFileName    String?
+  meetingMinutesContentType String?
+  meetingMinutesSize        Int?
+  meetingMinutesUploadedAt  DateTime?
   performanceSummary      String
   whatWentWell            String
   improvement             String
@@ -545,10 +634,11 @@ model WeeklyReview {
   createdAt               DateTime           @default(now())
   updatedAt               DateTime           @updatedAt
 
-  profile    SalesExecutiveProfile  @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
-  assignment CommandoAssignment?    @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
-  createdBy  User                   @relation("WeeklyReviewCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  attendees  WeeklyReviewAttendee[]
+  profile     SalesExecutiveProfile  @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment  CommandoAssignment?    @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy   User                   @relation("WeeklyReviewCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  attendees   WeeklyReviewAttendee[]
+  actionItems ActionItem[]
 
   @@index([salesExecutiveProfileId])
   @@index([assignmentId])
@@ -943,11 +1033,13 @@ model ActionItem {
   id                      String           @id @default(cuid())
   salesExecutiveProfileId String
   assignmentId            String?
+  weeklyReviewId          String?
   title                   String
   description             String?
   status                  ActionItemStatus @default(ACTIVE)
   dueDate                 DateTime?
   completedAt             DateTime?
+  completedById           String?
   expiredAt               DateTime?
   replacesId              String?
   createdById             String
@@ -955,15 +1047,19 @@ model ActionItem {
   createdAt               DateTime         @default(now())
   updatedAt               DateTime         @updatedAt
 
-  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
-  assignment CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
-  createdBy  User                  @relation("ActionItemCreator", fields: [createdById], references: [id], onDelete: Restrict)
-  replaces   ActionItem?           @relation("ActionItemReplacement", fields: [replacesId], references: [id], onDelete: SetNull)
-  replacedBy ActionItem[]          @relation("ActionItemReplacement")
+  profile      SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment   CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  weeklyReview WeeklyReview?         @relation(fields: [weeklyReviewId], references: [id], onDelete: SetNull)
+  createdBy    User                  @relation("ActionItemCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  completedBy  User?                 @relation("ActionItemCompleter", fields: [completedById], references: [id], onDelete: SetNull)
+  replaces     ActionItem?           @relation("ActionItemReplacement", fields: [replacesId], references: [id], onDelete: SetNull)
+  replacedBy   ActionItem[]          @relation("ActionItemReplacement")
 
   @@index([salesExecutiveProfileId, status])
   @@index([assignmentId])
+  @@index([weeklyReviewId])
   @@index([createdById])
+  @@index([completedById])
   @@index([dueDate])
   @@index([replacesId])
 }
@@ -1106,4 +1202,41 @@ model Notification {
 
   @@index([recipientId, readAt])
   @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// SE workspace activity events
+// ─────────────────────────────────────────────
+
+model WorkspaceEvent {
+  id                      String               @id @default(cuid())
+  salesExecutiveProfileId String
+  assignmentId            String?
+  type                    WorkspaceEventType
+  title                   String
+  notes                   String?
+  nextAction              String?
+  urgency                 EventUrgency         @default(NOT_URGENT)
+  importance              EventImportance      @default(IMPORTANT)
+  status                  WorkspaceEventStatus @default(COMPLETED)
+  eisenhowerCategory      EisenhowerCategory
+  occurredAt              DateTime             @default(now())
+  sourceType              String?
+  sourceId                String?
+  createdById             String
+  archivedAt              DateTime?
+  createdAt               DateTime             @default(now())
+  updatedAt               DateTime             @updatedAt
+
+  profile    SalesExecutiveProfile @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  assignment CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  createdBy  User                  @relation("WorkspaceEventCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([salesExecutiveProfileId, occurredAt])
+  @@index([salesExecutiveProfileId, type])
+  @@index([salesExecutiveProfileId, eisenhowerCategory])
+  @@index([assignmentId])
+  @@index([createdById])
+  @@index([sourceType, sourceId])
+  @@index([archivedAt])
 }

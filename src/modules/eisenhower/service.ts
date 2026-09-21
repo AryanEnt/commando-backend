@@ -6,10 +6,11 @@ import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import {
   getCommandoLifecycleState,
-  salesExecutiveCanViewEisenhowerMonth,
+  salesExecutiveCanViewEisenhowerOwnership,
 } from "../../lib/lifecycleVisibility.js";
 import type {
   CreateEisenhowerTaskInput,
+  EisenhowerWorkspaceQuery,
   ListEisenhowerQuery,
   UpdateEisenhowerStatusInput,
   UpdateEisenhowerTaskInput,
@@ -23,7 +24,15 @@ const taskInclude = {
     select: { id: true, firstName: true, lastName: true, email: true },
   },
   assignment: {
-    select: { id: true, status: true, startedAt: true, endedAt: true },
+    select: {
+      id: true,
+      status: true,
+      startedAt: true,
+      endedAt: true,
+      commando: {
+        select: { id: true, firstName: true, lastName: true, email: true },
+      },
+    },
   },
 } satisfies Prisma.EisenhowerTaskInclude;
 
@@ -33,14 +42,34 @@ function startOfMonthUtc(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
 }
 
+/** Normalize Prisma `@db.Date` values that may shift across midnight in local TZ. */
+function calendarMonthStart(d: Date): Date {
+  const isoDay = d.toISOString().slice(0, 10);
+  const [y, m] = isoDay.split("-").map(Number);
+  // If the instant is late in the UTC day, prefer local calendar month for @db.Date
+  const localY = d.getFullYear();
+  const localM = d.getMonth();
+  const utcY = d.getUTCFullYear();
+  const utcM = d.getUTCMonth();
+  // Prefer the date components that match a 1st-of-month stored date
+  if (d.getUTCDate() === 1) {
+    return new Date(Date.UTC(utcY, utcM, 1));
+  }
+  if (d.getDate() === 1) {
+    return new Date(Date.UTC(localY, localM, 1));
+  }
+  return new Date(Date.UTC(y, m - 1, 1));
+}
+
 function currentMonthStart(): Date {
   const now = new Date();
-  return startOfMonthUtc(now);
+  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), 1));
 }
 
 function monthLabel(d: Date): string {
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const start = calendarMonthStart(d);
+  const y = start.getUTCFullYear();
+  const m = String(start.getUTCMonth() + 1).padStart(2, "0");
   return `${y}-${m}`;
 }
 
@@ -51,7 +80,7 @@ function isExpired(row: TaskRow, now = new Date()): boolean {
 }
 
 function serialize(row: TaskRow) {
-  const monthStart = startOfMonthUtc(row.month);
+  const monthStart = calendarMonthStart(row.month);
   const current = currentMonthStart();
   const isCurrentMonth = monthStart.getTime() === current.getTime();
   const expired = isExpired(row);
@@ -63,7 +92,7 @@ function serialize(row: TaskRow) {
     assignmentId: row.assignmentId,
     assignment: row.assignment,
     month: row.month,
-    monthLabel: monthLabel(monthStart),
+    monthLabel: monthLabel(row.month),
     category: row.category,
     title: row.title,
     notes: row.notes,
@@ -116,17 +145,18 @@ async function scopeWhere(
         select: { id: true },
       });
       if (!profile) return { id: "__none__" };
-      const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
-      if (lifecycle.isDuringCommando) {
-        return {
-          archivedAt: null,
-          salesExecutiveProfileId: profile.id,
-          month: currentMonthStart(),
-        };
-      }
+      // TL matrix always visible; active Commando matrix never returned.
       return {
         archivedAt: null,
         salesExecutiveProfileId: profile.id,
+        OR: [
+          { assignmentId: null },
+          {
+            assignment: {
+              status: { in: ["COMPLETED", "EXITED"] },
+            },
+          },
+        ],
       };
     }
     default:
@@ -164,19 +194,15 @@ async function assertCanAccess(actor: Actor, row: TaskRow): Promise<void> {
     if (row.profile.userId !== actor.id) {
       throw forbidden("You may only view your own Eisenhower tasks");
     }
-    const lifecycle = await getCommandoLifecycleState(
-      prisma,
-      row.salesExecutiveProfileId,
-    );
+    const assignmentStatus = row.assignment?.status ?? null;
     if (
-      !salesExecutiveCanViewEisenhowerMonth(
-        startOfMonthUtc(row.month),
-        currentMonthStart(),
-        lifecycle,
+      !salesExecutiveCanViewEisenhowerOwnership(
+        row.assignmentId,
+        assignmentStatus,
       )
     ) {
       throw forbidden(
-        "Eisenhower history is not visible during an active Commando assignment",
+        "Commando intervention priorities are not visible while the intervention is active",
       );
     }
     return;
@@ -295,28 +321,6 @@ export async function listEisenhowerTasks(
 ) {
   const scope = await scopeWhere(actor);
 
-  // SE during Commando: reject historical month query bypasses
-  if (actor.roleCode === "SALES_EXECUTIVE" && query.month) {
-    const profile = await prisma.salesExecutiveProfile.findFirst({
-      where: { userId: actor.id, archivedAt: null },
-      select: { id: true },
-    });
-    if (profile) {
-      const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
-      if (
-        !salesExecutiveCanViewEisenhowerMonth(
-          startOfMonthUtc(query.month),
-          currentMonthStart(),
-          lifecycle,
-        )
-      ) {
-        throw forbidden(
-          "Eisenhower history is not visible during an active Commando assignment",
-        );
-      }
-    }
-  }
-
   const where: Prisma.EisenhowerTaskWhereInput = {
     AND: [
       scope,
@@ -382,27 +386,6 @@ export async function getEisenhowerMatrix(
   query: { profileId?: string; month?: Date },
 ) {
   const month = query.month ?? currentMonthStart();
-
-  if (actor.roleCode === "SALES_EXECUTIVE") {
-    const profile = await prisma.salesExecutiveProfile.findFirst({
-      where: { userId: actor.id, archivedAt: null },
-      select: { id: true },
-    });
-    if (profile) {
-      const lifecycle = await getCommandoLifecycleState(prisma, profile.id);
-      if (
-        !salesExecutiveCanViewEisenhowerMonth(
-          startOfMonthUtc(month),
-          currentMonthStart(),
-          lifecycle,
-        )
-      ) {
-        throw forbidden(
-          "Eisenhower history is not visible during an active Commando assignment",
-        );
-      }
-    }
-  }
 
   const scope = await scopeWhere(actor);
   const where: Prisma.EisenhowerTaskWhereInput = {
@@ -534,4 +517,337 @@ export async function updateEisenhowerTaskStatus(
   });
 
   return serialize(updated);
+}
+
+type PersonRef = {
+  id: string;
+  firstName: string;
+  lastName: string;
+  email?: string;
+};
+
+function personRef(u: {
+  id: string;
+  firstName: string;
+  lastName: string;
+  email?: string;
+}): PersonRef {
+  return {
+    id: u.id,
+    firstName: u.firstName,
+    lastName: u.lastName,
+    email: u.email,
+  };
+}
+
+function matrixMeta(tasks: ReturnType<typeof serialize>[]) {
+  if (tasks.length === 0) {
+    return {
+      updatedAt: null as string | Date | null,
+      updatedBy: null as PersonRef | null,
+    };
+  }
+  const latest = tasks.reduce((a, b) =>
+    new Date(a.updatedAt).getTime() >= new Date(b.updatedAt).getTime() ? a : b,
+  );
+  return {
+    updatedAt: latest.updatedAt,
+    updatedBy: personRef(latest.createdBy),
+  };
+}
+
+async function assertCanViewEisenhowerProfile(
+  actor: Actor,
+  profileId: string,
+): Promise<{ id: string; teamId: string; userId: string }> {
+  const profile = await prisma.salesExecutiveProfile.findFirst({
+    where: { id: profileId, archivedAt: null },
+    select: { id: true, teamId: true, userId: true },
+  });
+  if (!profile) throw notFound("Sales executive profile not found");
+
+  if (isSuperAdmin(actor)) return profile;
+
+  switch (actor.roleCode) {
+    case "TEAM_LEAD": {
+      const teamIds = await getActiveTeamIds(prisma, actor.id);
+      if (!teamIds.includes(profile.teamId)) {
+        throw forbidden("Profile is outside your team scope");
+      }
+      return profile;
+    }
+    case "COMMANDO_EXECUTIVE": {
+      const any = await prisma.commandoAssignment.findFirst({
+        where: {
+          salesExecutiveProfileId: profile.id,
+          commandoUserId: actor.id,
+        },
+        select: { id: true },
+      });
+      if (!any) {
+        throw forbidden("You do not have access to this profile");
+      }
+      return profile;
+    }
+    case "SALES_EXECUTIVE": {
+      if (profile.userId !== actor.id) {
+        throw forbidden("You may only view your own Eisenhower workspace");
+      }
+      return profile;
+    }
+    default:
+      throw forbidden("Not allowed to access Eisenhower workspace");
+  }
+}
+
+/**
+ * SE-facing (and manager) workspace payload:
+ * - Team Lead matrix (always for SE)
+ * - Commando matrix (locked for SE while ACTIVE; contents never returned)
+ * - Intervention history (completed/exited only for SE matrix access)
+ */
+export async function getEisenhowerWorkspace(
+  actor: Actor,
+  query: EisenhowerWorkspaceQuery,
+) {
+  await assertCanViewEisenhowerProfile(actor, query.profileId);
+  const isSe = actor.roleCode === "SALES_EXECUTIVE";
+  const lifecycle = await getCommandoLifecycleState(prisma, query.profileId);
+
+  const assignments = await prisma.commandoAssignment.findMany({
+    where: { salesExecutiveProfileId: query.profileId },
+    orderBy: { startedAt: "asc" },
+    select: {
+      id: true,
+      status: true,
+      startedAt: true,
+      endedAt: true,
+      commando: {
+        select: { id: true, firstName: true, lastName: true, email: true },
+      },
+      _count: { select: { eisenhowerTasks: true } },
+    },
+  });
+
+  const numbered = assignments.map((a, index) => ({
+    ...a,
+    interventionNumber: index + 1,
+  }));
+
+  const activeAssignment =
+    numbered.find((a) => a.status === "ACTIVE") ?? null;
+
+  const scope = await scopeWhere(actor);
+
+  const tlRows = await prisma.eisenhowerTask.findMany({
+    where: {
+      AND: [
+        scope,
+        { salesExecutiveProfileId: query.profileId },
+        { assignmentId: null },
+      ],
+    },
+    orderBy: [{ month: "desc" }, { updatedAt: "desc" }, { createdAt: "desc" }],
+    include: taskInclude,
+  });
+  const teamLeadTasks = tlRows.map(serialize);
+  const teamLeadMeta = matrixMeta(teamLeadTasks);
+
+  let selectedAssignmentId = query.assignmentId ?? null;
+  if (selectedAssignmentId) {
+    const selected = numbered.find((a) => a.id === selectedAssignmentId);
+    if (!selected) throw notFound("Intervention not found");
+    // SE requesting ACTIVE assignment: do not throw — return LOCKED below
+    // with no matrix contents.
+  } else if (!isSe && activeAssignment) {
+    selectedAssignmentId = activeAssignment.id;
+  } else {
+    const latestFinalized = [...numbered]
+      .reverse()
+      .find((a) => a.status === "COMPLETED" || a.status === "EXITED");
+    if (latestFinalized) selectedAssignmentId = latestFinalized.id;
+    else if (!isSe && activeAssignment) {
+      selectedAssignmentId = activeAssignment.id;
+    }
+  }
+
+  type CommandoState = "LOCKED" | "AVAILABLE" | "EMPTY";
+  let commandoState: CommandoState = "EMPTY";
+  let commandoTasks: ReturnType<typeof serialize>[] | null = null;
+  let commandoAssignmentPayload: {
+    id: string;
+    interventionNumber: number;
+    status: string;
+    startedAt: Date;
+    endedAt: Date | null;
+    commando: PersonRef;
+  } | null = null;
+  let lockedMessage: string | null = null;
+
+  const selectedForLock =
+    selectedAssignmentId != null
+      ? numbered.find((a) => a.id === selectedAssignmentId)
+      : null;
+  const shouldLockActiveForSe =
+    isSe &&
+    ((activeAssignment && !query.assignmentId) ||
+      (selectedForLock?.status === "ACTIVE"));
+
+  if (shouldLockActiveForSe) {
+    const locked = selectedForLock?.status === "ACTIVE"
+      ? selectedForLock
+      : activeAssignment!;
+    commandoState = "LOCKED";
+    lockedMessage =
+      "These intervention priorities are locked while your Commando is actively managing them. They become available when the intervention ends.";
+    commandoAssignmentPayload = {
+      id: locked.id,
+      interventionNumber: locked.interventionNumber,
+      status: locked.status,
+      startedAt: locked.startedAt,
+      endedAt: locked.endedAt,
+      commando: personRef(locked.commando),
+    };
+    // Never return ACTIVE Commando task rows to the SE
+    commandoTasks = null;
+  } else if (selectedAssignmentId) {
+    const selected = numbered.find((a) => a.id === selectedAssignmentId)!;
+    const canReveal =
+      !isSe ||
+      selected.status === "COMPLETED" ||
+      selected.status === "EXITED";
+
+    if (!canReveal) {
+      commandoState = "LOCKED";
+      lockedMessage =
+        "These intervention priorities are locked while your Commando is actively managing them. They become available when the intervention ends.";
+      commandoAssignmentPayload = {
+        id: selected.id,
+        interventionNumber: selected.interventionNumber,
+        status: selected.status,
+        startedAt: selected.startedAt,
+        endedAt: selected.endedAt,
+        commando: personRef(selected.commando),
+      };
+      commandoTasks = null;
+    } else {
+      const rows = await prisma.eisenhowerTask.findMany({
+        where: {
+          AND: [
+            scope,
+            { salesExecutiveProfileId: query.profileId },
+            { assignmentId: selected.id },
+          ],
+        },
+        orderBy: [
+          { month: "desc" },
+          { updatedAt: "desc" },
+          { createdAt: "desc" },
+        ],
+        include: taskInclude,
+      });
+      commandoTasks = rows.map(serialize);
+      commandoState = rows.length > 0 ? "AVAILABLE" : "EMPTY";
+      commandoAssignmentPayload = {
+        id: selected.id,
+        interventionNumber: selected.interventionNumber,
+        status: selected.status,
+        startedAt: selected.startedAt,
+        endedAt: selected.endedAt,
+        commando: personRef(selected.commando),
+      };
+    }
+  }
+
+  const commandoMeta = matrixMeta(commandoTasks ?? []);
+
+  const interventionHistory = numbered
+    .filter((a) => a.status === "COMPLETED" || a.status === "EXITED")
+    .map((a) => ({
+      assignmentId: a.id,
+      interventionNumber: a.interventionNumber,
+      status: a.status,
+      startedAt: a.startedAt,
+      endedAt: a.endedAt,
+      commando: personRef(a.commando),
+      taskCount: a._count.eisenhowerTasks,
+      hasEisenhower: a._count.eisenhowerTasks > 0,
+      canViewMatrix: true,
+    }))
+    .reverse();
+
+  const activeIntervention = activeAssignment
+    ? {
+        id: activeAssignment.id,
+        interventionNumber: activeAssignment.interventionNumber,
+        status: activeAssignment.status,
+        startedAt: activeAssignment.startedAt,
+        endedAt: activeAssignment.endedAt,
+        commando: personRef(activeAssignment.commando),
+      }
+    : null;
+
+  /** Filter options for each Commando cycle (active + completed), newest first. */
+  const commandoOptions = [...numbered]
+    .reverse()
+    .map((a) => {
+      const name =
+        `${a.commando.firstName} ${a.commando.lastName}`.trim() || "Commando";
+      return {
+        assignmentId: a.id,
+        interventionNumber: a.interventionNumber,
+        status: a.status,
+        startedAt: a.startedAt,
+        endedAt: a.endedAt,
+        commando: personRef(a.commando),
+        label: `${name} (Commando)`,
+        lockedForViewer: isSe && a.status === "ACTIVE",
+        hasEisenhower: a._count.eisenhowerTasks > 0,
+        canViewMatrix: !(isSe && a.status === "ACTIVE"),
+      };
+    });
+
+  const latestFocus:
+    | "TEAM_LEAD"
+    | "COMMANDO"
+    | "TEAM_LEAD_WITH_LOCKED_COMMANDO" =
+    isSe && activeAssignment
+      ? "TEAM_LEAD_WITH_LOCKED_COMMANDO"
+      : isSe && commandoState === "AVAILABLE"
+        ? "COMMANDO"
+        : actor.roleCode === "COMMANDO_EXECUTIVE" && activeAssignment
+          ? "COMMANDO"
+          : "TEAM_LEAD";
+
+  return {
+    profileId: query.profileId,
+    lifecycle: {
+      isDuringCommando: lifecycle.isDuringCommando,
+      isAfterCommando: lifecycle.isAfterCommando,
+      hasActiveAssignment: lifecycle.hasActiveAssignment,
+      hasCompletedAssignment: lifecycle.hasCompletedAssignment,
+    },
+    latestFocus,
+    activeIntervention,
+    teamLead: {
+      owner: "TEAM_LEAD" as const,
+      label: "Team Lead Priorities",
+      availability: "AVAILABLE" as const,
+      tasks: teamLeadTasks,
+      updatedAt: teamLeadMeta.updatedAt,
+      updatedBy: teamLeadMeta.updatedBy,
+    },
+    commando: {
+      owner: "COMMANDO" as const,
+      label: "Commando Priorities",
+      state: commandoState,
+      lockedMessage,
+      assignment: commandoAssignmentPayload,
+      tasks: commandoTasks,
+      updatedAt: commandoMeta.updatedAt,
+      updatedBy: commandoMeta.updatedBy,
+    },
+    commandoOptions,
+    interventionHistory,
+  };
 }

@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import type { Actor } from "../../lib/authorization.js";
 import { badRequest } from "../../lib/errors.js";
 import {
+  eisenhowerWorkspaceQuerySchema,
   listEisenhowerQuerySchema,
   monthInputSchema,
 } from "./schemas.js";
@@ -41,6 +42,23 @@ export async function getMatrix(
   try {
     const query = matrixQuerySchema.parse(req.query);
     const result = await service.getEisenhowerMatrix(req.user as Actor, query);
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getWorkspace(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = eisenhowerWorkspaceQuerySchema.parse(req.query);
+    const result = await service.getEisenhowerWorkspace(
+      req.user as Actor,
+      query,
+    );
     res.status(200).json({ data: result });
   } catch (err) {
     next(err);

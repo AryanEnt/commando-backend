@@ -16,7 +16,10 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "types": ["node"]
+    "types": ["node"],
+    "paths": {
+      "@prisma/client": ["./node_modules/@prisma/client"]
+    }
   },
   "include": ["src/**/*", "prisma/**/*", "tests/**/*"],
   "exclude": ["dist", "node_modules"]

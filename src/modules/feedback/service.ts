@@ -11,6 +11,7 @@ import {
   salesExecutiveCanViewCoachingSource,
 } from "../../lib/lifecycleVisibility.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
+import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
 import type { CreateFeedbackInput, ListFeedbackQuery } from "./schemas.js";
 
 const feedbackInclude = {
@@ -278,6 +279,18 @@ export async function createFeedback(actor: Actor, input: CreateFeedbackInput) {
     entityType: "Feedback",
     entityId: created.id,
     metadata: { profileId: profile.id, source, assignmentId, verb: "CREATE" },
+  });
+
+  await recordWorkspaceEvent({
+    salesExecutiveProfileId: profile.id,
+    assignmentId,
+    type: "FEEDBACK",
+    title: created.body.slice(0, 120),
+    notes: created.body,
+    status: "COMPLETED",
+    sourceType: "Feedback",
+    sourceId: created.id,
+    createdById: actor.id,
   });
 
   return serialize(created);

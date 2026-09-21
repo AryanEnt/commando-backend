@@ -65,14 +65,11 @@ export async function createActivityType(actor: Actor, input: CreateInput) {
     throw forbidden("Not allowed to manage activity types");
   }
 
-  const existing = await prisma.activityType.findUnique({
-    where: { code: input.code },
-  });
-  if (existing) throw conflict("Activity type code already exists");
+  const code = await resolveUniqueActivityCode(input.code, input.name);
 
   const created = await prisma.activityType.create({
     data: {
-      code: input.code,
+      code,
       name: input.name,
       description: input.description ?? null,
       isActive: input.isActive ?? true,
@@ -90,6 +87,42 @@ export async function createActivityType(actor: Actor, input: CreateInput) {
   });
 
   return created;
+}
+
+/** UPPER_SNAKE from display name, unique against existing codes. */
+function slugifyActivityCode(name: string): string {
+  const raw = name
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_");
+  let code = raw || "ACTIVITY";
+  if (!/^[A-Z]/.test(code)) code = `A_${code}`;
+  return code.slice(0, 64);
+}
+
+async function resolveUniqueActivityCode(
+  explicit: string | undefined,
+  name: string,
+): Promise<string> {
+  const base = explicit?.trim()
+    ? explicit.trim().toUpperCase()
+    : slugifyActivityCode(name);
+
+  const existing = await prisma.activityType.findUnique({ where: { code: base } });
+  if (!existing) return base;
+  if (explicit?.trim()) {
+    throw conflict("Activity type code already exists");
+  }
+
+  for (let i = 2; i < 1000; i++) {
+    const suffix = `_${i}`;
+    const candidate = `${base.slice(0, Math.max(1, 64 - suffix.length))}${suffix}`;
+    const hit = await prisma.activityType.findUnique({ where: { code: candidate } });
+    if (!hit) return candidate;
+  }
+  throw conflict("Could not generate a unique activity type code");
 }
 
 export async function updateActivityType(
@@ -129,4 +162,62 @@ export async function updateActivityType(
   });
 
   return updated;
+}
+
+/**
+ * Permanently delete unused activity types.
+ * If Daily Log entries reference it, deactivate/archive instead.
+ */
+export async function deleteActivityType(actor: Actor, id: string) {
+  if (!hasPermission(actor, PERMISSIONS.ACTIVITY_TYPE_MANAGE)) {
+    throw forbidden("Not allowed to manage activity types");
+  }
+
+  const existing = await prisma.activityType.findUnique({ where: { id } });
+  if (!existing) throw notFound("Activity type not found");
+
+  const usage = await prisma.dailyLogEntry.count({
+    where: { activityTypeId: id },
+  });
+
+  if (usage > 0) {
+    const updated = await prisma.activityType.update({
+      where: { id },
+      data: { isActive: false, archivedAt: new Date() },
+    });
+    await prisma.auditLog.create({
+      data: {
+        actorId: actor.id,
+        action: "ACTIVITY_TYPE_ARCHIVED",
+        entityType: "ActivityType",
+        entityId: updated.id,
+        metadata: { reason: "delete_requested_with_history", usage },
+      },
+    });
+    return {
+      deleted: false as const,
+      archived: true as const,
+      activityType: updated,
+      message: `This activity type was used in ${usage} Daily Log entr${usage === 1 ? "y" : "ies"}, so it was deactivated instead of permanently deleted.`,
+    };
+  }
+
+  await prisma.activityType.delete({ where: { id } });
+
+  await prisma.auditLog.create({
+    data: {
+      actorId: actor.id,
+      action: "ACTIVITY_TYPE_DELETED",
+      entityType: "ActivityType",
+      entityId: id,
+      metadata: { code: existing.code, name: existing.name },
+    },
+  });
+
+  return {
+    deleted: true as const,
+    archived: false as const,
+    activityType: null,
+    message: "Activity type deleted",
+  };
 }

@@ -45,6 +45,12 @@ monitoringRouter.patch(
   controller.updateCategory,
 );
 
+monitoringRouter.delete(
+  "/categories/:id",
+  requirePermission(PERMISSIONS.MONITORING_CHECKLIST_MANAGE),
+  controller.deleteCategory,
+);
+
 monitoringRouter.post(
   "/categories/:categoryId/items",
   requirePermission(PERMISSIONS.MONITORING_CHECKLIST_MANAGE),

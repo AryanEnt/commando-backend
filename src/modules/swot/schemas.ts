@@ -9,6 +9,14 @@ export const createSwotSchema = z
     weakness: text,
     opportunity: text,
     threat: text,
+    /** TL/Commando only — share this version with the Sales Executive. */
+    visibleToSalesExecutive: z.boolean().optional(),
+  })
+  .strict();
+
+export const setSwotVisibilitySchema = z
+  .object({
+    visibleToSalesExecutive: z.boolean(),
   })
   .strict();
 
@@ -23,4 +31,5 @@ export const listSwotQuerySchema = z.object({
 });
 
 export type CreateSwotInput = z.infer<typeof createSwotSchema>;
+export type SetSwotVisibilityInput = z.infer<typeof setSwotVisibilitySchema>;
 export type ListSwotQuery = z.infer<typeof listSwotQuerySchema>;

@@ -6,6 +6,7 @@ import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
 import type {
   AddSupportTaskProgressNoteInput,
   CreateSupportTaskInput,
@@ -496,6 +497,20 @@ export async function createSupportTask(
       shouldDoCount: shouldDo.length,
       shouldNotDoCount: shouldNotDo.length,
     },
+  });
+
+  await recordWorkspaceEvent({
+    salesExecutiveProfileId: created.salesExecutiveProfileId,
+    assignmentId: created.assignmentId,
+    type: "SUPPORT",
+    title: created.title,
+    notes: created.description,
+    status: "OPEN",
+    urgency: created.priority === "HIGH" ? "URGENT" : "NOT_URGENT",
+    importance: "IMPORTANT",
+    sourceType: "SupportTask",
+    sourceId: created.id,
+    createdById: actor.id,
   });
 
   return serialize(created);

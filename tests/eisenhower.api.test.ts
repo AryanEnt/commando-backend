@@ -158,7 +158,7 @@ describe("eisenhower matrix", () => {
     ).toBe(true);
   });
 
-  it("sales executive is read-only (current month during Commando)", async ({
+  it("sales executive is read-only and never receives active Commando tasks", async ({
     skip,
   }) => {
     if (!dbReady || !taskId) skip();
@@ -168,11 +168,19 @@ describe("eisenhower matrix", () => {
       .get(`/api/eisenhower?profileId=${profileId}`)
       .set("Authorization", `Bearer ${se}`);
     expect(list.status).toBe(200);
-    // March tasks are history relative to current month — hidden during Commando
+    // Active Commando-owned tasks must not be returned to the SE
+    expect(
+      list.body.data.tasks.some((t: { id: string }) => t.id === taskId),
+    ).toBe(false);
     expect(
       list.body.data.tasks.every(
-        (t: { monthLabel: string }) =>
-          t.monthLabel === list.body.data.currentMonth,
+        (t: {
+          assignmentId: string | null;
+          assignment: { status: string } | null;
+        }) =>
+          t.assignmentId == null ||
+          t.assignment?.status === "COMPLETED" ||
+          t.assignment?.status === "EXITED",
       ),
     ).toBe(true);
 
@@ -200,7 +208,7 @@ describe("eisenhower matrix", () => {
     expect(status.status).toBe(403);
   });
 
-  it("historical Eisenhower tasks hidden from SE during Commando", async ({
+  it("active Commando Eisenhower tasks hidden from SE", async ({
     skip,
   }) => {
     if (!dbReady || !priorMonthTaskId) skip();
@@ -223,9 +231,12 @@ describe("eisenhower matrix", () => {
       .set("Authorization", `Bearer ${se}`);
     expect(seView.status).toBe(403);
 
-    const seMonth = await request(app)
-      .get(`/api/eisenhower/matrix?month=2026-02`)
+    const workspace = await request(app)
+      .get(`/api/eisenhower/workspace?profileId=${profileId}`)
       .set("Authorization", `Bearer ${se}`);
-    expect(seMonth.status).toBe(403);
+    expect(workspace.status).toBe(200);
+    expect(workspace.body.data.commando.state).toBe("LOCKED");
+    expect(workspace.body.data.commando.tasks).toBeNull();
+    expect(workspace.body.data.teamLead.availability).toBe("AVAILABLE");
   });
 });

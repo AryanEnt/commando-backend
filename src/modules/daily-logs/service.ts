@@ -2,33 +2,76 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
-import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import {
+  badRequest,
+  conflict,
+  forbidden,
+  notFound,
+} from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
-import type { CreateDailyLogInput, ListDailyLogsQuery } from "./schemas.js";
+import { recordWorkspaceEvent, eisenhowerCategoryFrom } from "../../lib/workspaceEvents.js";
+import type {
+  CreateDailyLogEntryInput,
+  CreateDailyLogInput,
+  EnsureDailyLogInput,
+  ListDailyLogsQuery,
+  SubmitDailyLogInput,
+  UpdateDailyLogEntryInput,
+} from "./schemas.js";
 
-const logInclude = {
-  profile: {
-    select: { id: true, displayName: true, userId: true, teamId: true },
-  },
+const entryInclude = {
   activityType: {
     select: { id: true, code: true, name: true },
   },
   createdBy: {
     select: { id: true, firstName: true, lastName: true, email: true },
   },
+} satisfies Prisma.DailyLogEntryInclude;
+
+const logInclude = {
+  profile: {
+    select: { id: true, displayName: true, userId: true, teamId: true },
+  },
+  createdBy: {
+    select: { id: true, firstName: true, lastName: true, email: true },
+  },
   assignment: {
-    select: { id: true, status: true, startedAt: true, endedAt: true },
+    select: {
+      id: true,
+      status: true,
+      startedAt: true,
+      endedAt: true,
+      commando: {
+        select: { id: true, firstName: true, lastName: true, email: true },
+      },
+    },
+  },
+  entries: {
+    orderBy: [{ loggedAt: "asc" as const }, { createdAt: "asc" as const }],
+    include: entryInclude,
   },
 } satisfies Prisma.DailyLogInclude;
 
 type LogRow = Prisma.DailyLogGetPayload<{ include: typeof logInclude }>;
+type EntryRow = Prisma.DailyLogEntryGetPayload<{ include: typeof entryInclude }>;
 
-function serialize(row: LogRow) {
+/** Calendar day as UTC date-only, using local Y/M/D (matches Eisenhower month pattern). */
+export function calendarDateOnly(d = new Date()): Date {
+  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+}
+
+export function parseLogDateInput(value?: string): Date {
+  if (!value) return calendarDateOnly();
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) throw badRequest("logDate must be YYYY-MM-DD");
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+}
+
+function serializeEntry(row: EntryRow) {
   return {
     id: row.id,
-    salesExecutiveProfileId: row.salesExecutiveProfileId,
-    profile: row.profile,
+    dailyLogId: row.dailyLogId,
     activityTypeId: row.activityTypeId,
     activityType: row.activityType,
     sessionTitle: row.sessionTitle,
@@ -38,13 +81,36 @@ function serialize(row: LogRow) {
     coachingGiven: row.coachingGiven,
     expectedChange: row.expectedChange,
     followUp: row.followUp,
-    assignmentId: row.assignmentId,
-    assignment: row.assignment,
+    urgency: row.urgency,
+    importance: row.importance,
+    eisenhowerCategory: row.eisenhowerCategory,
+    eisenhowerTaskId: row.eisenhowerTaskId,
+    sortOrder: row.sortOrder,
+    loggedAt: row.loggedAt,
     createdById: row.createdById,
     createdBy: row.createdBy,
-    loggedAt: row.loggedAt,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  };
+}
+
+function serialize(row: LogRow) {
+  return {
+    id: row.id,
+    salesExecutiveProfileId: row.salesExecutiveProfileId,
+    profile: row.profile,
+    assignmentId: row.assignmentId,
+    assignment: row.assignment,
+    logDate: row.logDate,
+    status: row.status,
+    submittedAt: row.submittedAt,
+    createdById: row.createdById,
+    createdBy: row.createdBy,
+    entryCount: row.entries.length,
+    entries: row.entries.map(serializeEntry),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    isEditable: row.status === "DRAFT",
   };
 }
 
@@ -119,6 +185,61 @@ async function assertCanAccessLog(actor: Actor, row: LogRow): Promise<void> {
   throw forbidden("Not allowed to access daily logs");
 }
 
+async function assertCanWriteProfile(
+  actor: Actor,
+  profileId: string,
+): Promise<{ assignmentId: string | null; teamId: string }> {
+  if (isSuperAdmin(actor)) {
+    throw forbidden("Super Admin is read-only for daily coaching logs");
+  }
+  if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD"
+  ) {
+    throw forbidden("Not allowed to create daily coaching logs");
+  }
+
+  const profile = await prisma.salesExecutiveProfile.findFirst({
+    where: { id: profileId, archivedAt: null },
+    select: { id: true, teamId: true },
+  });
+  if (!profile) throw notFound("Sales executive profile not found");
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (!teamIds.includes(profile.teamId)) {
+      throw forbidden("Profile is outside your team scope");
+    }
+    await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
+      action: "DAILY_LOG_CREATE",
+    });
+    return { assignmentId: null, teamId: profile.teamId };
+  }
+
+  const assignment = await prisma.commandoAssignment.findFirst({
+    where: {
+      salesExecutiveProfileId: profile.id,
+      commandoUserId: actor.id,
+      status: "ACTIVE",
+    },
+  });
+  if (!assignment) {
+    throw forbidden(
+      "You may only create logs for profiles with an active assignment to you",
+    );
+  }
+  return { assignmentId: assignment.id, teamId: profile.teamId };
+}
+
+async function loadLog(id: string): Promise<LogRow> {
+  const row = await prisma.dailyLog.findFirst({
+    where: { id, archivedAt: null },
+    include: logInclude,
+  });
+  if (!row) throw notFound("Daily log not found");
+  return row;
+}
+
 export async function listDailyLogs(actor: Actor, query: ListDailyLogsQuery) {
   const scope = await scopeWhere(actor);
   const where: Prisma.DailyLogWhereInput = {
@@ -127,25 +248,25 @@ export async function listDailyLogs(actor: Actor, query: ListDailyLogsQuery) {
       ...(query.profileId
         ? [{ salesExecutiveProfileId: query.profileId }]
         : []),
-      ...(query.activityTypeId
-        ? [{ activityTypeId: query.activityTypeId }]
+      ...(query.status ? [{ status: query.status }] : []),
+      ...(query.dateFrom || query.dateTo
+        ? [
+            {
+              logDate: {
+                ...(query.dateFrom
+                  ? { gte: parseLogDateInput(query.dateFrom) }
+                  : {}),
+                ...(query.dateTo
+                  ? { lte: parseLogDateInput(query.dateTo) }
+                  : {}),
+              },
+            },
+          ]
         : []),
       ...(query.search
         ? [
             {
               OR: [
-                {
-                  sessionTitle: {
-                    contains: query.search,
-                    mode: "insensitive" as const,
-                  },
-                },
-                {
-                  observation: {
-                    contains: query.search,
-                    mode: "insensitive" as const,
-                  },
-                },
                 {
                   profile: {
                     displayName: {
@@ -155,10 +276,22 @@ export async function listDailyLogs(actor: Actor, query: ListDailyLogsQuery) {
                   },
                 },
                 {
-                  activityType: {
-                    name: {
-                      contains: query.search,
-                      mode: "insensitive" as const,
+                  entries: {
+                    some: {
+                      OR: [
+                        {
+                          sessionTitle: {
+                            contains: query.search,
+                            mode: "insensitive" as const,
+                          },
+                        },
+                        {
+                          observation: {
+                            contains: query.search,
+                            mode: "insensitive" as const,
+                          },
+                        },
+                      ],
                     },
                   },
                 },
@@ -175,7 +308,7 @@ export async function listDailyLogs(actor: Actor, query: ListDailyLogsQuery) {
       where,
       skip: (query.page - 1) * query.pageSize,
       take: query.pageSize,
-      orderBy: { loggedAt: "desc" },
+      orderBy: [{ logDate: "desc" }, { createdAt: "desc" }],
       include: logInclude,
     }),
   ]);
@@ -189,55 +322,117 @@ export async function listDailyLogs(actor: Actor, query: ListDailyLogsQuery) {
 }
 
 export async function getDailyLog(actor: Actor, id: string) {
-  const row = await prisma.dailyLog.findFirst({
-    where: { id, archivedAt: null },
-    include: logInclude,
-  });
-  if (!row) throw notFound("Daily log not found");
+  const row = await loadLog(id);
   await assertCanAccessLog(actor, row);
   return serialize(row);
 }
 
-export async function createDailyLog(actor: Actor, input: CreateDailyLogInput) {
-  if (isSuperAdmin(actor)) {
-    throw forbidden("Super Admin is read-only for daily coaching logs");
-  }
-  if (
-    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
-    actor.roleCode !== "TEAM_LEAD"
-  ) {
-    throw forbidden("Not allowed to create daily coaching logs");
-  }
-
-  const profile = await prisma.salesExecutiveProfile.findFirst({
-    where: { id: input.salesExecutiveProfileId, archivedAt: null },
+/** Previous-day (and older) DRAFT logs that still need submission. */
+export async function listAttentionDailyLogs(
+  actor: Actor,
+  profileId: string,
+) {
+  const scope = await scopeWhere(actor);
+  const today = calendarDateOnly();
+  const rows = await prisma.dailyLog.findMany({
+    where: {
+      AND: [
+        scope,
+        {
+          archivedAt: null,
+          salesExecutiveProfileId: profileId,
+          status: "DRAFT",
+          logDate: { lt: today },
+        },
+      ],
+    },
+    orderBy: { logDate: "desc" },
+    include: logInclude,
   });
-  if (!profile) throw notFound("Sales executive profile not found");
+  return { logs: rows.map(serialize) };
+}
 
-  let assignmentId: string | null = null;
+/**
+ * Get or create today's (or given day's) DRAFT Daily Log for the SE.
+ * Never creates a second log for the same profile + date.
+ */
+export async function ensureDailyLog(actor: Actor, input: EnsureDailyLogInput) {
+  const { assignmentId } = await assertCanWriteProfile(
+    actor,
+    input.salesExecutiveProfileId,
+  );
+  const logDate = parseLogDateInput(input.logDate);
 
-  if (actor.roleCode === "TEAM_LEAD") {
-    const teamIds = await getActiveTeamIds(prisma, actor.id);
-    if (!teamIds.includes(profile.teamId)) {
-      throw forbidden("Profile is outside your team scope");
-    }
-    await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
-      action: "DAILY_LOG_CREATE",
+  const existing = await prisma.dailyLog.findFirst({
+    where: {
+      salesExecutiveProfileId: input.salesExecutiveProfileId,
+      logDate,
+      archivedAt: null,
+    },
+    include: logInclude,
+  });
+  if (existing) {
+    await assertCanAccessLog(actor, existing);
+    return serialize(existing);
+  }
+
+  try {
+    const created = await prisma.dailyLog.create({
+      data: {
+        salesExecutiveProfileId: input.salesExecutiveProfileId,
+        assignmentId,
+        logDate,
+        status: "DRAFT",
+        createdById: actor.id,
+      },
+      include: logInclude,
     });
-  } else {
-    const assignment = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: profile.id,
-        commandoUserId: actor.id,
-        status: "ACTIVE",
+    await prisma.auditLog.create({
+      data: {
+        actorId: actor.id,
+        action: "DAILY_LOG_CREATED",
+        entityType: "DailyLog",
+        entityId: created.id,
+        metadata: {
+          profileId: input.salesExecutiveProfileId,
+          logDate: logDate.toISOString().slice(0, 10),
+        },
       },
     });
-    if (!assignment) {
-      throw forbidden(
-        "You may only create logs for profiles with an active assignment to you",
-      );
+    return serialize(created);
+  } catch (err) {
+    // Race: unique constraint — re-fetch
+    if (
+      err &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err as { code?: string }).code === "P2002"
+    ) {
+      const again = await prisma.dailyLog.findFirst({
+        where: {
+          salesExecutiveProfileId: input.salesExecutiveProfileId,
+          logDate,
+          archivedAt: null,
+        },
+        include: logInclude,
+      });
+      if (again) return serialize(again);
     }
-    assignmentId = assignment.id;
+    throw err;
+  }
+}
+
+export async function addDailyLogEntry(
+  actor: Actor,
+  logId: string,
+  input: CreateDailyLogEntryInput,
+) {
+  const log = await loadLog(logId);
+  await assertCanAccessLog(actor, log);
+  await assertCanWriteProfile(actor, log.salesExecutiveProfileId);
+
+  if (log.status !== "DRAFT") {
+    throw badRequest("Submitted daily logs are read-only");
   }
 
   const activityType = await prisma.activityType.findFirst({
@@ -251,9 +446,10 @@ export async function createDailyLog(actor: Actor, input: CreateDailyLogInput) {
     throw badRequest("Activity type is invalid or inactive");
   }
 
-  const created = await prisma.dailyLog.create({
+  const sortOrder = log.entries.length;
+  await prisma.dailyLogEntry.create({
     data: {
-      salesExecutiveProfileId: profile.id,
+      dailyLogId: log.id,
       activityTypeId: activityType.id,
       sessionTitle: input.sessionTitle,
       observation: input.observation,
@@ -262,26 +458,284 @@ export async function createDailyLog(actor: Actor, input: CreateDailyLogInput) {
       coachingGiven: input.coachingGiven ?? null,
       expectedChange: input.expectedChange ?? null,
       followUp: input.followUp ?? null,
-      createdById: actor.id,
-      assignmentId,
+      sortOrder,
       loggedAt: input.loggedAt ?? new Date(),
+      createdById: actor.id,
     },
-    include: logInclude,
   });
 
   await prisma.auditLog.create({
     data: {
       actorId: actor.id,
-      action: "DAILY_LOG_CREATED",
+      action: "DAILY_LOG_ENTRY_CREATED",
       entityType: "DailyLog",
-      entityId: created.id,
-      metadata: {
-        profileId: profile.id,
-        activityTypeId: activityType.id,
-        assignmentId,
-      },
+      entityId: log.id,
+      metadata: { sessionTitle: input.sessionTitle },
     },
   });
 
-  return serialize(created);
+  return serialize(await loadLog(logId));
+}
+
+export async function updateDailyLogEntry(
+  actor: Actor,
+  logId: string,
+  entryId: string,
+  input: UpdateDailyLogEntryInput,
+) {
+  const log = await loadLog(logId);
+  await assertCanAccessLog(actor, log);
+  await assertCanWriteProfile(actor, log.salesExecutiveProfileId);
+
+  if (log.status !== "DRAFT") {
+    throw badRequest("Submitted daily logs are read-only");
+  }
+
+  const entry = log.entries.find((e) => e.id === entryId);
+  if (!entry) throw notFound("Daily log entry not found");
+
+  if (input.activityTypeId) {
+    const activityType = await prisma.activityType.findFirst({
+      where: {
+        id: input.activityTypeId,
+        isActive: true,
+        archivedAt: null,
+      },
+    });
+    if (!activityType) {
+      throw badRequest("Activity type is invalid or inactive");
+    }
+  }
+
+  await prisma.dailyLogEntry.update({
+    where: { id: entryId },
+    data: {
+      activityTypeId: input.activityTypeId,
+      sessionTitle: input.sessionTitle,
+      observation: input.observation,
+      evidence: input.evidence,
+      seResponse: input.seResponse,
+      coachingGiven: input.coachingGiven,
+      expectedChange: input.expectedChange,
+      followUp: input.followUp,
+      loggedAt: input.loggedAt,
+    },
+  });
+
+  return serialize(await loadLog(logId));
+}
+
+export async function deleteDailyLogEntry(
+  actor: Actor,
+  logId: string,
+  entryId: string,
+) {
+  const log = await loadLog(logId);
+  await assertCanAccessLog(actor, log);
+  await assertCanWriteProfile(actor, log.salesExecutiveProfileId);
+
+  if (log.status !== "DRAFT") {
+    throw badRequest("Submitted daily logs are read-only");
+  }
+
+  const entry = log.entries.find((e) => e.id === entryId);
+  if (!entry) throw notFound("Daily log entry not found");
+
+  await prisma.dailyLogEntry.delete({ where: { id: entryId } });
+  return serialize(await loadLog(logId));
+}
+
+/**
+ * Submit Daily Log with optional Eisenhower classifications.
+ * Only classified entries become Eisenhower tasks (all four quadrants).
+ * Unclassified entries remain in history only.
+ */
+export async function submitDailyLog(
+  actor: Actor,
+  logId: string,
+  input: SubmitDailyLogInput,
+) {
+  const log = await loadLog(logId);
+  await assertCanAccessLog(actor, log);
+  await assertCanWriteProfile(actor, log.salesExecutiveProfileId);
+
+  if (log.status === "SUBMITTED") {
+    throw conflict("Daily log is already submitted");
+  }
+  if (log.entries.length === 0) {
+    throw badRequest("Add at least one activity before submitting");
+  }
+
+  const entryIds = new Set(log.entries.map((e) => e.id));
+  const seen = new Set<string>();
+  for (const c of input.classifications) {
+    if (!entryIds.has(c.entryId)) {
+      throw badRequest("Classification references an unknown entry");
+    }
+    if (seen.has(c.entryId)) {
+      throw badRequest("Each entry can only be classified once");
+    }
+    seen.add(c.entryId);
+  }
+
+  const classMap = new Map(
+    input.classifications.map((c) => [c.entryId, c] as const),
+  );
+
+  let eisenhowerCreated = 0;
+
+  await prisma.$transaction(async (tx) => {
+    // Re-check status inside transaction
+    const locked = await tx.dailyLog.findFirst({
+      where: { id: logId, archivedAt: null },
+      include: { entries: true },
+    });
+    if (!locked) throw notFound("Daily log not found");
+    if (locked.status === "SUBMITTED") {
+      throw conflict("Daily log is already submitted");
+    }
+
+    for (const entry of locked.entries) {
+      const cls = classMap.get(entry.id);
+      if (!cls) {
+        await tx.dailyLogEntry.update({
+          where: { id: entry.id },
+          data: {
+            urgency: null,
+            importance: null,
+            eisenhowerCategory: null,
+          },
+        });
+        continue;
+      }
+
+      if (entry.eisenhowerTaskId) {
+        // Already linked — keep classification, skip create
+        await tx.dailyLogEntry.update({
+          where: { id: entry.id },
+          data: {
+            urgency: cls.urgency,
+            importance: cls.importance,
+          },
+        });
+        continue;
+      }
+
+      const notes = [entry.observation, entry.followUp]
+        .filter(Boolean)
+        .join("\n\n");
+
+      const category = eisenhowerCategoryFrom(cls.urgency, cls.importance);
+      const now = new Date();
+      const month = new Date(
+        Date.UTC(now.getFullYear(), now.getMonth(), 1),
+      );
+
+      const task = await tx.eisenhowerTask.create({
+        data: {
+          salesExecutiveProfileId: locked.salesExecutiveProfileId,
+          assignmentId: locked.assignmentId,
+          month,
+          category,
+          title: entry.sessionTitle.trim().slice(0, 240),
+          notes: notes ? notes.slice(0, 10000) : null,
+          status: "OPEN",
+          createdById: actor.id,
+        },
+        select: { id: true },
+      });
+
+      await tx.dailyLogEntry.update({
+        where: { id: entry.id },
+        data: {
+          urgency: cls.urgency,
+          importance: cls.importance,
+          eisenhowerCategory: category,
+          eisenhowerTaskId: task.id,
+        },
+      });
+      eisenhowerCreated += 1;
+
+      await tx.auditLog.create({
+        data: {
+          actorId: actor.id,
+          action: "EISENHOWER_TASK_CREATED",
+          entityType: "EisenhowerTask",
+          entityId: task.id,
+          metadata: {
+            profileId: locked.salesExecutiveProfileId,
+            category,
+            via: "DAILY_LOG_SUBMIT",
+            dailyLogEntryId: entry.id,
+          },
+        },
+      });
+    }
+
+    await tx.dailyLog.update({
+      where: { id: logId },
+      data: {
+        status: "SUBMITTED",
+        submittedAt: new Date(),
+      },
+    });
+
+    await tx.auditLog.create({
+      data: {
+        actorId: actor.id,
+        action: "DAILY_LOG_SUBMITTED",
+        entityType: "DailyLog",
+        entityId: logId,
+        metadata: {
+          entryCount: locked.entries.length,
+          prioritizedCount: input.classifications.length,
+          eisenhowerCreated,
+        },
+      },
+    });
+  });
+
+  // Workspace events for each entry (outside txn is OK for timeline)
+  const refreshed = await loadLog(logId);
+  for (const entry of refreshed.entries) {
+    await recordWorkspaceEvent({
+      salesExecutiveProfileId: refreshed.salesExecutiveProfileId,
+      assignmentId: refreshed.assignmentId,
+      type: "DAILY_LOG",
+      title: entry.sessionTitle,
+      notes: entry.observation,
+      urgency: entry.urgency ?? undefined,
+      importance: entry.importance ?? undefined,
+      sourceType: "DailyLogEntry",
+      sourceId: entry.id,
+      createdById: actor.id,
+    });
+  }
+
+  return {
+    log: serialize(refreshed),
+    eisenhowerCreated,
+    prioritizedCount: input.classifications.length,
+  };
+}
+
+/**
+ * Legacy create: ensure today's draft + add one entry (no Eisenhower until submit).
+ * Keeps old clients working without urgency/importance.
+ */
+export async function createDailyLog(actor: Actor, input: CreateDailyLogInput) {
+  const log = await ensureDailyLog(actor, {
+    salesExecutiveProfileId: input.salesExecutiveProfileId,
+  });
+  return addDailyLogEntry(actor, log.id, {
+    activityTypeId: input.activityTypeId,
+    sessionTitle: input.sessionTitle,
+    observation: input.observation,
+    evidence: input.evidence,
+    seResponse: input.seResponse,
+    coachingGiven: input.coachingGiven,
+    expectedChange: input.expectedChange,
+    followUp: input.followUp,
+    loggedAt: input.loggedAt,
+  });
 }

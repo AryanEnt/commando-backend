@@ -23,9 +23,9 @@ import { swotRouter } from "./modules/swot/routes.js";
 import { activityTypesRouter } from "./modules/activity-types/routes.js";
 import { dailyLogsRouter } from "./modules/daily-logs/routes.js";
 import { weeklyReviewsRouter } from "./modules/weekly-reviews/routes.js";
+import { uploadsRouter } from "./modules/uploads/routes.js";
 import { monitoringRouter } from "./modules/monitoring/routes.js";
 import { syncEvaluationsRouter } from "./modules/sync-evaluations/routes.js";
-import { roleAssignmentsRouter } from "./modules/role-assignments/routes.js";
 import { eisenhowerRouter } from "./modules/eisenhower/routes.js";
 import { actionItemsRouter } from "./modules/action-items/routes.js";
 import { supportTasksRouter } from "./modules/support-tasks/routes.js";
@@ -36,6 +36,7 @@ import { reportsRouter } from "./modules/reports/routes.js";
 import { auditLogsRouter } from "./modules/audit-logs/routes.js";
 import { interventionsRouter } from "./modules/interventions/routes.js";
 import { dashboardRouter } from "./modules/dashboard/routes.js";
+import { workspaceEventsRouter } from "./modules/workspace-events/routes.js";
 
 export function createApp() {
   const app = express();
@@ -118,9 +119,9 @@ export function createApp() {
   app.use("/api/activity-types", activityTypesRouter);
   app.use("/api/daily-logs", dailyLogsRouter);
   app.use("/api/weekly-reviews", weeklyReviewsRouter);
+  app.use("/api/uploads", uploadsRouter);
   app.use("/api/monitoring", monitoringRouter);
   app.use("/api/sync-evaluations", syncEvaluationsRouter);
-  app.use("/api/role-assignments", roleAssignmentsRouter);
   app.use("/api/eisenhower", eisenhowerRouter);
   app.use("/api/action-items", actionItemsRouter);
   app.use("/api/support-tasks", supportTasksRouter);
@@ -131,6 +132,7 @@ export function createApp() {
   app.use("/api/audit-logs", auditLogsRouter);
   app.use("/api/interventions", interventionsRouter);
   app.use("/api/dashboard", dashboardRouter);
+  app.use("/api/workspace-events", workspaceEventsRouter);
 
   app.use(errorHandler);
   return app;

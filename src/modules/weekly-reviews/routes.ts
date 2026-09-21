@@ -21,6 +21,12 @@ weeklyReviewsRouter.get(
   controller.listWeeklyReviews,
 );
 
+weeklyReviewsRouter.get(
+  "/hub",
+  requirePermission(PERMISSIONS.WEEKLY_REVIEW_VIEW),
+  controller.getWeeklyReviewHub,
+);
+
 weeklyReviewsRouter.post(
   "/",
   requirePermission(PERMISSIONS.WEEKLY_REVIEW_CREATE),
@@ -32,6 +38,12 @@ weeklyReviewsRouter.get(
   "/:id",
   requirePermission(PERMISSIONS.WEEKLY_REVIEW_VIEW),
   controller.getWeeklyReview,
+);
+
+weeklyReviewsRouter.get(
+  "/:id/minutes-url",
+  requirePermission(PERMISSIONS.WEEKLY_REVIEW_VIEW),
+  controller.getMeetingMinutesDownloadUrl,
 );
 
 weeklyReviewsRouter.patch(

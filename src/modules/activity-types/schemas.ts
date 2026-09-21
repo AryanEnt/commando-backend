@@ -1,13 +1,16 @@
 import { z } from "zod";
 import { paginationQuerySchema } from "../../lib/pagination.js";
 
+const codeSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Z][A-Z0-9_]*$/, "Code must be UPPER_SNAKE_CASE");
+
 export const createActivityTypeSchema = z.object({
-  code: z
-    .string()
-    .trim()
-    .min(1)
-    .max(64)
-    .regex(/^[A-Z][A-Z0-9_]*$/, "Code must be UPPER_SNAKE_CASE"),
+  /** Optional — server generates from name when omitted. */
+  code: codeSchema.optional(),
   name: z.string().trim().min(1).max(120),
   description: z.string().trim().max(2000).optional().nullable(),
   isActive: z.boolean().optional().default(true),

@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import type { Actor } from "../../lib/authorization.js";
 import { badRequest } from "../../lib/errors.js";
-import { listWeeklyReviewsQuerySchema } from "./schemas.js";
+import { listWeeklyReviewsQuerySchema, weeklyReviewHubQuerySchema } from "./schemas.js";
 import * as service from "./service.js";
 
 function paramId(value: string | string[] | undefined): string {
@@ -19,6 +19,20 @@ export async function listWeeklyReviews(
     const query = listWeeklyReviewsQuerySchema.parse(req.query);
     const result = await service.listWeeklyReviews(req.user as Actor, query);
     res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getWeeklyReviewHub(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = weeklyReviewHubQuerySchema.parse(req.query);
+    const hub = await service.getWeeklyReviewHub(req.user as Actor, query);
+    res.status(200).json({ data: hub });
   } catch (err) {
     next(err);
   }
@@ -97,6 +111,22 @@ export async function acknowledgeWeeklyReview(
       paramId(req.params.id),
     );
     res.status(200).json({ data: { review } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getMeetingMinutesDownloadUrl(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.getMeetingMinutesDownloadUrl(
+      req.user as Actor,
+      paramId(req.params.id),
+    );
+    res.status(200).json({ data: result });
   } catch (err) {
     next(err);
   }

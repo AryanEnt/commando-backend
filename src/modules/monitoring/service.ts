@@ -14,6 +14,7 @@ import {
 } from "../../lib/lifecycleVisibility.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
+import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
 import type {
   AddSeChecklistItemInput,
   CreateChecklistItemInput,
@@ -877,6 +878,77 @@ export async function updateMonitoringCategory(
   return updated;
 }
 
+/**
+ * Permanently delete a category unused by monitoring sessions.
+ * If sessions exist, soft-archive (deactivate) instead so history stays intact.
+ */
+export async function deleteMonitoringCategory(actor: Actor, id: string) {
+  if (!hasPermission(actor, PERMISSIONS.MONITORING_CHECKLIST_MANAGE)) {
+    throw forbidden("Not allowed to manage monitoring checklists");
+  }
+
+  const existing = await prisma.monitoringCategory.findUnique({
+    where: { id },
+  });
+  if (!existing) throw notFound("Monitoring category not found");
+
+  const sessionCount = await prisma.liveMonitoringRecord.count({
+    where: { categoryId: id },
+  });
+
+  if (sessionCount > 0) {
+    const updated = await prisma.monitoringCategory.update({
+      where: { id },
+      data: { isActive: false, archivedAt: new Date() },
+      include: {
+        checklistItems: { orderBy: { sortOrder: "asc" } },
+      },
+    });
+    await prisma.auditLog.create({
+      data: {
+        actorId: actor.id,
+        action: "MONITORING_CATEGORY_ARCHIVED",
+        entityType: "MonitoringCategory",
+        entityId: updated.id,
+        metadata: { reason: "delete_requested_with_history", sessionCount },
+      },
+    });
+    return {
+      deleted: false as const,
+      archived: true as const,
+      category: updated,
+      message: `This checklist was used in ${sessionCount} monitoring session(s), so it was deactivated instead of permanently deleted.`,
+    };
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.seMonitoringChecklistItem.deleteMany({
+      where: { categoryId: id },
+    });
+    await tx.monitoringChecklistItem.deleteMany({
+      where: { categoryId: id },
+    });
+    await tx.monitoringCategory.delete({ where: { id } });
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      actorId: actor.id,
+      action: "MONITORING_CATEGORY_DELETED",
+      entityType: "MonitoringCategory",
+      entityId: id,
+      metadata: { code: existing.code, name: existing.name },
+    },
+  });
+
+  return {
+    deleted: true as const,
+    archived: false as const,
+    category: null,
+    message: "Checklist deleted",
+  };
+}
+
 export async function createChecklistItem(
   actor: Actor,
   categoryId: string,
@@ -1270,6 +1342,19 @@ export async function createMonitoringRecord(
       where: { id: record.id },
       include: recordInclude,
     });
+  });
+
+  await recordWorkspaceEvent({
+    salesExecutiveProfileId: created.salesExecutiveProfileId,
+    assignmentId: created.assignmentId,
+    type: "MONITORING",
+    title: `Monitoring · ${created.category?.name ?? "Session"}`,
+    notes: created.observation,
+    status: "COMPLETED",
+    occurredAt: created.observedAt,
+    sourceType: "LiveMonitoringRecord",
+    sourceId: created.id,
+    createdById: actor.id,
   });
 
   return serialize(created);

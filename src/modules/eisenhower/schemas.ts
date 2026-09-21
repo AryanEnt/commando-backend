@@ -57,6 +57,12 @@ export const listEisenhowerQuerySchema = z.object({
   pageSize: z.coerce.number().int().min(1).max(100).default(50),
 });
 
+export const eisenhowerWorkspaceQuerySchema = z.object({
+  profileId: z.string().cuid(),
+  /** Optional: load a specific completed intervention's Commando matrix. */
+  assignmentId: z.string().cuid().optional(),
+});
+
 export type CreateEisenhowerTaskInput = z.infer<
   typeof createEisenhowerTaskSchema
 >;
@@ -67,3 +73,6 @@ export type UpdateEisenhowerStatusInput = z.infer<
   typeof updateEisenhowerStatusSchema
 >;
 export type ListEisenhowerQuery = z.infer<typeof listEisenhowerQuerySchema>;
+export type EisenhowerWorkspaceQuery = z.infer<
+  typeof eisenhowerWorkspaceQuerySchema
+>;

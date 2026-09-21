@@ -5,7 +5,7 @@ import {
 } from "../../middleware/auth.js";
 import { validate } from "../../middleware/validate.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
-import { createSwotSchema } from "./schemas.js";
+import { createSwotSchema, setSwotVisibilitySchema } from "./schemas.js";
 import * as controller from "./controller.js";
 
 export const swotRouter = Router();
@@ -29,4 +29,11 @@ swotRouter.get(
   "/:id",
   requirePermission(PERMISSIONS.SWOT_VIEW),
   controller.getSwot,
+);
+
+swotRouter.patch(
+  "/:id/visibility",
+  requirePermission(PERMISSIONS.SWOT_CREATE),
+  validate(setSwotVisibilitySchema),
+  controller.setSwotVisibility,
 );

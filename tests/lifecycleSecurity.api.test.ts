@@ -8,6 +8,7 @@ import {
   salesExecutiveCanViewActionItemStatus,
   salesExecutiveCanViewCoachingSource,
   salesExecutiveCanViewEisenhowerMonth,
+  salesExecutiveCanViewEisenhowerOwnership,
   salesExecutiveCanViewMonitoring,
   salesExecutiveCanViewSwotSource,
 } from "../src/lib/lifecycleVisibility.js";
@@ -327,12 +328,23 @@ describe("Phase 14 — lifecycle visibility & unauthorized access", () => {
 
     const current = new Date(Date.UTC(2026, 8, 1));
     const prior = new Date(Date.UTC(2026, 7, 1));
+    // Month helper retained for transitional callers; ownership is the SE rule.
     expect(
       salesExecutiveCanViewEisenhowerMonth(prior, current, during),
     ).toBe(false);
     expect(
       salesExecutiveCanViewEisenhowerMonth(prior, current, after),
     ).toBe(true);
+    expect(salesExecutiveCanViewEisenhowerOwnership(null, null)).toBe(true);
+    expect(salesExecutiveCanViewEisenhowerOwnership("a1", "ACTIVE")).toBe(
+      false,
+    );
+    expect(salesExecutiveCanViewEisenhowerOwnership("a1", "COMPLETED")).toBe(
+      true,
+    );
+    expect(salesExecutiveCanViewEisenhowerOwnership("a1", "EXITED")).toBe(
+      true,
+    );
   });
 
   it("during: SE cannot retrieve still-hidden Commando records by ID", async ({

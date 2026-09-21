@@ -53,3 +53,19 @@ export async function updateActivityType(
     next(err);
   }
 }
+
+export async function deleteActivityType(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.deleteActivityType(
+      req.user as Actor,
+      paramId(req.params.id),
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}

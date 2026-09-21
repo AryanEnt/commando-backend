@@ -44,10 +44,19 @@ export async function getCommandoLifecycleState(
 }
 
 /**
- * Sales Executive visibility for SWOT sources (API-enforced).
- * During Commando: TL + self visible; Commando hidden.
- * After Commando: TL + self + Commando visible (read-only).
+ * Sales Executive visibility for a SWOT row.
+ * - Own self-assessment: always visible
+ * - Team Lead / Commando SWOT: only when explicitly shared
  */
+export function salesExecutiveCanViewSwot(
+  source: SwotSource,
+  visibleToSalesExecutive: boolean,
+): boolean {
+  if (source === "SALES_EXECUTIVE") return true;
+  return visibleToSalesExecutive;
+}
+
+/** @deprecated Prefer salesExecutiveCanViewSwot + visibleToSalesExecutive flag */
 export function salesExecutiveCanViewSwotSource(
   source: SwotSource,
   lifecycle: CommandoLifecycleState,
@@ -61,7 +70,16 @@ export function salesExecutiveCanViewSwotSource(
   return false;
 }
 
-/** SWOT sources a Sales Executive may list (SQL filter). */
+/** Prisma where-clause: SWOTs an SE may list (own + shared). */
+export function swotWhereVisibleToSalesExecutive(): {
+  OR: Array<{ source: "SALES_EXECUTIVE" } | { visibleToSalesExecutive: true }>;
+} {
+  return {
+    OR: [{ source: "SALES_EXECUTIVE" }, { visibleToSalesExecutive: true }],
+  };
+}
+
+/** @deprecated Prefer swotWhereVisibleToSalesExecutive */
 export function swotSourcesVisibleToSalesExecutive(
   lifecycle: CommandoLifecycleState,
 ): SwotSource[] {
@@ -128,7 +146,25 @@ export function salesExecutiveCanViewActionItemStatus(
 }
 
 /**
- * Eisenhower for Sales Executives.
+ * Eisenhower for Sales Executives — ownership-based (not month-based).
+ * Team Lead tasks (`assignmentId` null) are always visible.
+ * Commando tasks are visible only when their assignment is COMPLETED or EXITED.
+ * ACTIVE Commando assignment tasks are never readable by the SE.
+ */
+export function salesExecutiveCanViewEisenhowerOwnership(
+  assignmentId: string | null,
+  assignmentStatus: "ACTIVE" | "COMPLETED" | "EXITED" | null,
+): boolean {
+  if (assignmentId == null) return true;
+  if (assignmentStatus === "COMPLETED" || assignmentStatus === "EXITED") {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * @deprecated Prefer ownership-based visibility via
+ * `salesExecutiveCanViewEisenhowerOwnership`. Kept for transitional callers.
  * During Commando: current month only.
  * After Commando: historical months allowed.
  */
@@ -138,6 +174,7 @@ export function salesExecutiveCanViewEisenhowerMonth(
   lifecycle: CommandoLifecycleState,
 ): boolean {
   if (lifecycle.isAfterCommando) return true;
+  if (!lifecycle.isDuringCommando) return true;
   return monthStart.getTime() === currentMonthStart.getTime();
 }
 

@@ -5,8 +5,12 @@ import { disconnectPrisma } from "./lib/prisma.js";
 
 const app = createApp();
 
-const server = app.listen(env.port, () => {
-  logger.info("api_started", { port: env.port, env: env.nodeEnv });
+const server = app.listen(env.port, "0.0.0.0", () => {
+  logger.info("api_started", {
+    port: env.port,
+    host: "0.0.0.0",
+    env: env.nodeEnv,
+  });
 });
 
 let shuttingDown = false;

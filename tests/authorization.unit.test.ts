@@ -34,11 +34,10 @@ describe("permission matrix (least privilege)", () => {
     expect(ROLE_PERMISSION_MAP.TEAM_LEAD).not.toContain(PERMISSIONS.USER_CREATE);
   });
 
-  it("limits sales support to profile, sync eval, role assignment, support tasks, links, and dashboard", () => {
+  it("limits sales support to profile, sync eval, support tasks, links, and dashboard", () => {
     expect(ROLE_PERMISSION_MAP.SALES_SUPPORT_EXECUTIVE).toEqual([
       PERMISSIONS.PROFILE_VIEW,
       PERMISSIONS.SYNC_EVAL_VIEW,
-      PERMISSIONS.ROLE_ASSIGNMENT_VIEW,
       PERMISSIONS.SALES_SUPPORT_TASK_VIEW,
       PERMISSIONS.SALES_SUPPORT_TASK_STATUS_UPDATE,
       PERMISSIONS.SALES_SUPPORT_LINK_VIEW,

@@ -11,7 +11,7 @@ import {
   getCommandoLifecycleState,
   salesExecutiveCanViewActionItemStatus,
   salesExecutiveCanViewMonitoring,
-  swotSourcesVisibleToSalesExecutive,
+  swotWhereVisibleToSalesExecutive,
 } from "../../lib/lifecycleVisibility.js";
 import * as profileService from "../profiles/service.js";
 import type { z } from "zod";
@@ -33,9 +33,10 @@ export async function getIntervention(actor: Actor, profileId: string) {
     actor.roleCode === "SALES_EXECUTIVE"
       ? await getCommandoLifecycleState(prisma, profileId)
       : null;
-  const seSwotSources = lifecycle
-    ? swotSourcesVisibleToSalesExecutive(lifecycle)
-    : null;
+  const seSwotWhere =
+    actor.roleCode === "SALES_EXECUTIVE"
+      ? swotWhereVisibleToSalesExecutive()
+      : null;
   const seCanSeeMonitoring = lifecycle
     ? salesExecutiveCanViewMonitoring(lifecycle)
     : true;
@@ -57,7 +58,7 @@ export async function getIntervention(actor: Actor, profileId: string) {
       where: {
         salesExecutiveProfileId: profileId,
         archivedAt: null,
-        ...(seSwotSources ? { source: { in: seSwotSources } } : {}),
+        ...(seSwotWhere ? seSwotWhere : {}),
       },
       orderBy: { createdAt: "desc" },
     }),
@@ -260,9 +261,10 @@ export async function getInterventionTimeline(actor: Actor, profileId: string) {
     actor.roleCode === "SALES_EXECUTIVE"
       ? await getCommandoLifecycleState(prisma, profileId)
       : null;
-  const seSwotSources = lifecycle
-    ? swotSourcesVisibleToSalesExecutive(lifecycle)
-    : null;
+  const seSwotWhere =
+    actor.roleCode === "SALES_EXECUTIVE"
+      ? swotWhereVisibleToSalesExecutive()
+      : null;
   const seCoachingSources = lifecycle
     ? coachingSourcesVisibleToSalesExecutive(lifecycle)
     : null;
@@ -291,7 +293,7 @@ export async function getInterventionTimeline(actor: Actor, profileId: string) {
       where: {
         salesExecutiveProfileId: profileId,
         archivedAt: null,
-        ...(seSwotSources ? { source: { in: seSwotSources } } : {}),
+        ...(seSwotWhere ? seSwotWhere : {}),
       },
       orderBy: { createdAt: "desc" },
       take: 20,
@@ -307,9 +309,16 @@ export async function getInterventionTimeline(actor: Actor, profileId: string) {
     }),
     prisma.dailyLog.findMany({
       where: { salesExecutiveProfileId: profileId, archivedAt: null },
-      orderBy: { loggedAt: "desc" },
+      orderBy: { logDate: "desc" },
       take: 20,
-      select: { id: true, sessionTitle: true, loggedAt: true },
+      select: {
+        id: true,
+        logDate: true,
+        status: true,
+        submittedAt: true,
+        updatedAt: true,
+        _count: { select: { entries: true } },
+      },
     }),
     seCanSeeMonitoring
       ? prisma.liveMonitoringRecord.findMany({
@@ -410,9 +419,9 @@ export async function getInterventionTimeline(actor: Actor, profileId: string) {
   }
   for (const l of logs) {
     events.push({
-      at: l.loggedAt.toISOString(),
+      at: (l.submittedAt ?? l.updatedAt ?? l.logDate).toISOString(),
       type: "COACHING",
-      title: `Coaching recorded: ${l.sessionTitle}`,
+      title: `Daily Log · ${l._count.entries} ${l._count.entries === 1 ? "activity" : "activities"} (${l.status})`,
       href: `/daily-logs/${l.id}`,
       entityId: l.id,
     });

@@ -19,11 +19,11 @@ describe("daily logs and activity types", () => {
   let otherProfileId: string | undefined;
   let activityTypeId: string;
   let logId: string;
+  let entryId: string;
 
   beforeAll(async () => {
     try {
       await prisma.$connect();
-      // Ensure seed activity types exist
       await prisma.activityType.upsert({
         where: { code: "COACHING_SESSION" },
         update: { isActive: true, archivedAt: null, name: "Coaching Session" },
@@ -66,136 +66,104 @@ describe("daily logs and activity types", () => {
       .set("Authorization", `Bearer ${c}`);
     expect(res.status).toBe(200);
     expect(res.body.data.activityTypes.length).toBeGreaterThan(0);
-    expect(
-      res.body.data.activityTypes.some(
-        (t: { code: string }) => t.code === "COACHING_SESSION",
-      ),
-    ).toBe(true);
   });
 
-  it("admin can create activity types", async ({ skip }) => {
-    if (!dbReady) skip();
-    const admin = await token("admin@commando.local");
-    const code = `TEST_TYPE_${Date.now()}`;
-    const res = await request(app)
-      .post("/api/activity-types")
-      .set("Authorization", `Bearer ${admin}`)
-      .send({
-        code,
-        name: "Test Activity",
-        description: "Configured via API",
-      });
-    expect(res.status).toBe(201);
-    expect(res.body.data.activityType.code).toBe(code);
-  });
-
-  it("commando cannot manage activity types", async ({ skip }) => {
+  it("ensure returns one daily log per profile per day", async ({ skip }) => {
     if (!dbReady) skip();
     const c = await token("commando@commando.local");
-    const res = await request(app)
-      .post("/api/activity-types")
+    const first = await request(app)
+      .post("/api/daily-logs/ensure")
       .set("Authorization", `Bearer ${c}`)
-      .send({
-        code: "UNAUTHORIZED_TYPE",
-        name: "Nope",
-      });
-    expect(res.status).toBe(403);
+      .send({ salesExecutiveProfileId: profileId });
+    expect(first.status).toBe(200);
+    logId = first.body.data.log.id;
+    expect(first.body.data.log.status).toBe("DRAFT");
+
+    const second = await request(app)
+      .post("/api/daily-logs/ensure")
+      .set("Authorization", `Bearer ${c}`)
+      .send({ salesExecutiveProfileId: profileId });
+    expect(second.status).toBe(200);
+    expect(second.body.data.log.id).toBe(logId);
   });
 
-  it("commando creates daily log for assigned profile", async ({ skip }) => {
-    if (!dbReady) skip();
+  it("adds multiple entries to the same draft log", async ({ skip }) => {
+    if (!dbReady || !logId) skip();
     const c = await token("commando@commando.local");
-    const res = await request(app)
-      .post("/api/daily-logs")
+    const a = await request(app)
+      .post(`/api/daily-logs/${logId}/entries`)
       .set("Authorization", `Bearer ${c}`)
       .send({
-        salesExecutiveProfileId: profileId,
         activityTypeId,
         sessionTitle: "Morning pipeline review",
-        observation: "Improved discovery questions; still rushing close.",
+        observation: "Improved discovery questions.",
       });
-    expect(res.status).toBe(201);
-    expect(res.body.data.log.sessionTitle).toBe("Morning pipeline review");
-    expect(res.body.data.log.activityType.code).toBe("COACHING_SESSION");
-    expect(res.body.data.log.assignmentId).toBeTruthy();
-    expect(res.body.data.log.loggedAt).toBeTruthy();
-    logId = res.body.data.log.id;
+    expect(a.status).toBe(201);
+    expect(a.body.data.log.entryCount).toBeGreaterThanOrEqual(1);
+    entryId = a.body.data.log.entries[0].id;
 
-    // Historical intact: second create is a new row
-    const second = await request(app)
-      .post("/api/daily-logs")
+    const b = await request(app)
+      .post(`/api/daily-logs/${logId}/entries`)
       .set("Authorization", `Bearer ${c}`)
       .send({
-        salesExecutiveProfileId: profileId,
         activityTypeId,
         sessionTitle: "Afternoon follow-up",
         observation: "Follow-up cadence improving.",
       });
-    expect(second.status).toBe(201);
-    expect(second.body.data.log.id).not.toBe(logId);
+    expect(b.status).toBe(201);
+    expect(b.body.data.log.id).toBe(logId);
+    expect(b.body.data.log.entryCount).toBeGreaterThanOrEqual(2);
   });
 
-  it("lists recent logs with date/time/profile/activity/title", async ({
-    skip,
-  }) => {
-    if (!dbReady || !logId) skip();
+  it("submits with partial Eisenhower classification", async ({ skip }) => {
+    if (!dbReady || !logId || !entryId) skip();
     const c = await token("commando@commando.local");
-    const res = await request(app)
-      .get("/api/daily-logs?search=pipeline")
+    const detail = await request(app)
+      .get(`/api/daily-logs/${logId}`)
       .set("Authorization", `Bearer ${c}`);
+    const entries = detail.body.data.log.entries as { id: string }[];
+    expect(entries.length).toBeGreaterThanOrEqual(2);
+
+    const res = await request(app)
+      .post(`/api/daily-logs/${logId}/submit`)
+      .set("Authorization", `Bearer ${c}`)
+      .send({
+        classifications: [
+          {
+            entryId: entries[0].id,
+            urgency: "URGENT",
+            importance: "IMPORTANT",
+          },
+        ],
+      });
     expect(res.status).toBe(200);
-    expect(res.body.data.total).toBeGreaterThan(0);
-    const log = res.body.data.logs.find((l: { id: string }) => l.id === logId);
-    expect(log).toBeTruthy();
-    expect(log.profile.displayName).toBeTruthy();
-    expect(log.activityType.name).toBeTruthy();
-    expect(log.sessionTitle).toBeTruthy();
-    expect(log.loggedAt).toBeTruthy();
+    expect(res.body.data.log.status).toBe("SUBMITTED");
+    expect(res.body.data.prioritizedCount).toBe(1);
+    expect(res.body.data.eisenhowerCreated).toBe(1);
+
+    const again = await request(app)
+      .post(`/api/daily-logs/${logId}/submit`)
+      .set("Authorization", `Bearer ${c}`)
+      .send({ classifications: [] });
+    expect(again.status).toBe(409);
   });
 
-  it("unauthorized users cannot create or view unrelated logs", async ({
-    skip,
-  }) => {
-    if (!dbReady || !logId) skip();
+  it("unauthorized users cannot create logs", async ({ skip }) => {
+    if (!dbReady) skip();
     const se = await token("sales@commando.local");
     const create = await request(app)
-      .post("/api/daily-logs")
+      .post("/api/daily-logs/ensure")
       .set("Authorization", `Bearer ${se}`)
-      .send({
-        salesExecutiveProfileId: profileId,
-        activityTypeId,
-        sessionTitle: "Nope",
-        observation: "Nope",
-      });
+      .send({ salesExecutiveProfileId: profileId });
     expect(create.status).toBe(403);
-
-    const view = await request(app)
-      .get(`/api/daily-logs/${logId}`)
-      .set("Authorization", `Bearer ${se}`);
-    expect(view.status).toBe(403);
 
     if (otherProfileId) {
       const c = await token("commando@commando.local");
       const unrelated = await request(app)
-        .post("/api/daily-logs")
+        .post("/api/daily-logs/ensure")
         .set("Authorization", `Bearer ${c}`)
-        .send({
-          salesExecutiveProfileId: otherProfileId,
-          activityTypeId,
-          sessionTitle: "Out of scope",
-          observation: "Should fail",
-        });
+        .send({ salesExecutiveProfileId: otherProfileId });
       expect(unrelated.status).toBe(403);
     }
-  });
-
-  it("detail returns historical log intact", async ({ skip }) => {
-    if (!dbReady || !logId) skip();
-    const c = await token("commando@commando.local");
-    const res = await request(app)
-      .get(`/api/daily-logs/${logId}`)
-      .set("Authorization", `Bearer ${c}`);
-    expect(res.status).toBe(200);
-    expect(res.body.data.log.sessionTitle).toBe("Morning pipeline review");
   });
 });

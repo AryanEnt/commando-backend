@@ -39,3 +39,9 @@ activityTypesRouter.patch(
   validate(updateActivityTypeSchema),
   controller.updateActivityType,
 );
+
+activityTypesRouter.delete(
+  "/:id",
+  requirePermission(PERMISSIONS.ACTIVITY_TYPE_MANAGE),
+  controller.deleteActivityType,
+);

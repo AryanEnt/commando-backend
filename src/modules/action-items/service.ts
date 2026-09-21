@@ -10,6 +10,7 @@ import {
   getCommandoLifecycleState,
   salesExecutiveCanViewActionItemStatus,
 } from "../../lib/lifecycleVisibility.js";
+import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
 import type {
   CreateActionItemInput,
   ListActionItemsQuery,
@@ -32,6 +33,16 @@ const itemInclude = {
     select: { id: true, displayName: true, userId: true, teamId: true },
   },
   createdBy: userBrief,
+  completedBy: userBrief,
+  weeklyReview: {
+    select: {
+      id: true,
+      weekLabel: true,
+      weekStartDate: true,
+      meetingDate: true,
+      createdAt: true,
+    },
+  },
   assignment: {
     select: {
       id: true,
@@ -61,9 +72,79 @@ const itemInclude = {
     orderBy: { createdAt: "desc" as const },
     take: 5,
   },
-} satisfies Prisma.ActionItemInclude;
+};
 
-type ItemRow = Prisma.ActionItemGetPayload<{ include: typeof itemInclude }>;
+type UserRef = {
+  id: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  role: { code: string };
+};
+
+/** Plain row type — avoids Prisma GetPayload `never` on optional relations. */
+type ItemRow = {
+  id: string;
+  salesExecutiveProfileId: string;
+  assignmentId: string | null;
+  weeklyReviewId: string | null;
+  title: string;
+  description: string | null;
+  status: string;
+  dueDate: Date | null;
+  completedAt: Date | null;
+  completedById: string | null;
+  expiredAt: Date | null;
+  replacesId: string | null;
+  createdById: string;
+  archivedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  profile: {
+    id: string;
+    displayName: string;
+    userId: string;
+    teamId: string;
+  };
+  createdBy: UserRef;
+  completedBy: UserRef | null;
+  weeklyReview: {
+    id: string;
+    weekLabel: string;
+    weekStartDate: Date;
+    meetingDate: Date;
+    createdAt: Date;
+  } | null;
+  assignment: {
+    id: string;
+    status: string;
+    startedAt: Date;
+    endedAt: Date | null;
+    commandoUserId: string;
+  } | null;
+  replaces: {
+    id: string;
+    title: string;
+    status: string;
+    createdAt: Date;
+    completedAt: Date | null;
+    expiredAt: Date | null;
+  } | null;
+  replacedBy: Array<{
+    id: string;
+    title: string;
+    status: string;
+    createdAt: Date;
+  }>;
+};
+
+function asItemRow<T>(row: T): ItemRow {
+  return row as unknown as ItemRow;
+}
+
+function asItemRows<T>(rows: T[]): ItemRow[] {
+  return rows as unknown as ItemRow[];
+}
 
 type UserBrief = {
   id: string;
@@ -117,11 +198,15 @@ function serialize(row: ItemRow, extras: Map<string, UserBrief>) {
           endedAt: row.assignment.endedAt,
         }
       : null,
+    weeklyReviewId: row.weeklyReviewId,
+    weeklyReview: row.weeklyReview,
     title: row.title,
     description: row.description,
     status: row.status,
     dueDate: row.dueDate,
     completedAt: row.completedAt,
+    completedById: row.completedById,
+    completedBy: row.completedBy,
     expiredAt: row.expiredAt,
     replacesId: row.replacesId,
     replaces: row.replaces,
@@ -371,7 +456,7 @@ export async function listActionItems(
     pageSize: query.pageSize,
     total,
     view: query.view,
-    actionItems: await serializeMany(rows),
+    actionItems: await serializeMany(asItemRows(rows)),
   };
 }
 
@@ -381,7 +466,7 @@ export async function getActionItem(actor: Actor, id: string) {
     include: itemInclude,
   });
   if (!row) throw notFound("Action item not found");
-  await assertCanAccess(actor, row);
+  await assertCanAccess(actor, asItemRow(row));
 
   // Walk previous chain for history context
   const previous: Array<{
@@ -420,11 +505,12 @@ export async function getActionItem(actor: Actor, id: string) {
     guard += 1;
   }
 
+  const typed = asItemRow(row);
   const extras = await loadUsers(
-    row.assignment ? [row.assignment.commandoUserId] : [],
+    typed.assignment ? [typed.assignment.commandoUserId] : [],
   );
   return {
-    ...serialize(row, extras),
+    ...serialize(typed, extras),
     previousActions: previous,
   };
 }
@@ -497,10 +583,25 @@ export async function createActionItem(
     metadata: { profileId: profile.id, assignmentId, verb: "CREATE" },
   });
 
+  await recordWorkspaceEvent({
+    salesExecutiveProfileId: profile.id,
+    assignmentId,
+    type: "ACTION",
+    title: created.title,
+    notes: created.description,
+    status: "OPEN",
+    urgency: "NOT_URGENT",
+    importance: "IMPORTANT",
+    sourceType: "ActionItem",
+    sourceId: created.id,
+    createdById: actor.id,
+  });
+
+  const typed = asItemRow(created);
   const extras = await loadUsers(
-    created.assignment ? [created.assignment.commandoUserId] : [],
+    typed.assignment ? [typed.assignment.commandoUserId] : [],
   );
-  return serialize(created, extras);
+  return serialize(typed, extras);
 }
 
 export async function updateActionItem(
@@ -513,7 +614,7 @@ export async function updateActionItem(
     include: itemInclude,
   });
   if (!existing) throw notFound("Action item not found");
-  await assertCanManage(actor, existing);
+  await assertCanManage(actor, asItemRow(existing));
 
   if (existing.status !== "ACTIVE") {
     throw badRequest("Only ACTIVE action items can be edited");
@@ -542,10 +643,11 @@ export async function updateActionItem(
     metadata: { title: updated.title, verb: "UPDATE" },
   });
 
+  const typed = asItemRow(updated);
   const extras = await loadUsers(
-    updated.assignment ? [updated.assignment.commandoUserId] : [],
+    typed.assignment ? [typed.assignment.commandoUserId] : [],
   );
-  return serialize(updated, extras);
+  return serialize(typed, extras);
 }
 
 export async function completeActionItem(actor: Actor, id: string) {
@@ -554,7 +656,7 @@ export async function completeActionItem(actor: Actor, id: string) {
     include: itemInclude,
   });
   if (!existing) throw notFound("Action item not found");
-  await assertCanManage(actor, existing);
+  await assertCanManage(actor, asItemRow(existing));
 
   if (existing.status !== "ACTIVE") {
     throw badRequest("Only ACTIVE action items can be completed");
@@ -565,6 +667,7 @@ export async function completeActionItem(actor: Actor, id: string) {
     data: {
       status: "COMPLETED",
       completedAt: new Date(),
+      completedById: actor.id,
     },
     include: itemInclude,
   });
@@ -577,10 +680,23 @@ export async function completeActionItem(actor: Actor, id: string) {
     metadata: { from: "ACTIVE", to: "COMPLETED", verb: "COMPLETE" },
   });
 
+  await recordWorkspaceEvent({
+    salesExecutiveProfileId: updated.salesExecutiveProfileId,
+    assignmentId: updated.assignmentId,
+    type: "ACTION",
+    title: `Completed: ${updated.title}`,
+    notes: updated.description,
+    status: "COMPLETED",
+    sourceType: "ActionItem",
+    sourceId: updated.id,
+    createdById: actor.id,
+  });
+
+  const typed = asItemRow(updated);
   const extras = await loadUsers(
-    updated.assignment ? [updated.assignment.commandoUserId] : [],
+    typed.assignment ? [typed.assignment.commandoUserId] : [],
   );
-  return serialize(updated, extras);
+  return serialize(typed, extras);
 }
 
 export async function expireActionItem(actor: Actor, id: string) {
@@ -589,7 +705,7 @@ export async function expireActionItem(actor: Actor, id: string) {
     include: itemInclude,
   });
   if (!existing) throw notFound("Action item not found");
-  await assertCanManage(actor, existing);
+  await assertCanManage(actor, asItemRow(existing));
 
   if (existing.status !== "ACTIVE") {
     throw badRequest("Only ACTIVE action items can be expired");
@@ -612,10 +728,11 @@ export async function expireActionItem(actor: Actor, id: string) {
     metadata: { from: "ACTIVE", to: "EXPIRED", verb: "ARCHIVE" },
   });
 
+  const typed = asItemRow(updated);
   const extras = await loadUsers(
-    updated.assignment ? [updated.assignment.commandoUserId] : [],
+    typed.assignment ? [typed.assignment.commandoUserId] : [],
   );
-  return serialize(updated, extras);
+  return serialize(typed, extras);
 }
 
 /**
@@ -632,7 +749,7 @@ export async function replaceActionItem(
     include: itemInclude,
   });
   if (!existing) throw notFound("Action item not found");
-  await assertCanManage(actor, existing);
+  await assertCanManage(actor, asItemRow(existing));
 
   if (existing.status !== "ACTIVE") {
     throw badRequest("Only ACTIVE action items can be replaced");
@@ -674,8 +791,9 @@ export async function replaceActionItem(
     },
   });
 
+  const typed = asItemRow(created);
   const extras = await loadUsers(
-    created.assignment ? [created.assignment.commandoUserId] : [],
+    typed.assignment ? [typed.assignment.commandoUserId] : [],
   );
-  return serialize(created, extras);
+  return serialize(typed, extras);
 }
