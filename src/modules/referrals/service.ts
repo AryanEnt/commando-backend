@@ -8,14 +8,10 @@ import {
   getActiveTeamIds,
   requireRecordAccess,
 } from "../../lib/scope.js";
-import type { CreateReferralInput, ListReferralsQuery } from "./schemas.js";
-import {
-  joinSwotPoints,
-  pointsToJson,
-  textToSwotPoints,
-} from "../../lib/swotPoints.js";
 import type {
   CreateCommandoRequestInput,
+  CreateReferralInput,
+  ListReferralsQuery,
   ProvideReferralInformationInput,
   RejectReferralInput,
 } from "./schemas.js";
@@ -85,20 +81,6 @@ type TeamLeadSupportSwotSummary = TeamLeadSwotSummary & {
   supportUser: AssignedSupportPerson;
 };
 
-const swotSummarySelect = {
-  id: true,
-  strength: true,
-  weakness: true,
-  opportunity: true,
-  threat: true,
-  source: true,
-  createdAt: true,
-  executiveUserId: true,
-  executiveUser: {
-    select: { id: true, firstName: true, lastName: true, email: true },
-  },
-} as const;
-
 function serialize(
   referral: ReferralRow,
   teamLeadSwot: TeamLeadSwotSummary | null = null,
@@ -149,33 +131,6 @@ function serialize(
   };
 }
 
-async function findTeamLeadSwot(
-  profileId: string,
-  notBefore?: Date | null,
-): Promise<TeamLeadSwotSummary | null> {
-  return prisma.swotAnalysis.findFirst({
-    where: {
-      subjectType: "PROFILE",
-      salesExecutiveProfileId: profileId,
-      source: "TEAM_LEAD",
-      archivedAt: null,
-      ...(notBefore
-        ? { createdAt: { gte: new Date(notBefore.getTime() - 60_000) } }
-        : {}),
-    },
-    orderBy: { createdAt: "desc" },
-    select: {
-      id: true,
-      strength: true,
-      weakness: true,
-      opportunity: true,
-      threat: true,
-      source: true,
-      createdAt: true,
-    },
-  });
-}
-
 async function listAssignedSupport(
   profileId: string,
 ): Promise<AssignedSupportPerson[]> {
@@ -204,102 +159,13 @@ async function listAssignedSupport(
   return people;
 }
 
-function mapSupportSwotRow(row: {
-  id: string;
-  strength: string;
-  weakness: string;
-  opportunity: string;
-  threat: string;
-  source: string;
-  createdAt: Date;
-  executiveUserId: string | null;
-  executiveUser: {
-    id: string;
-    firstName: string;
-    lastName: string;
-    email: string;
-  } | null;
-}): TeamLeadSupportSwotSummary | null {
-  if (!row.executiveUserId || !row.executiveUser) return null;
-  return {
-    id: row.id,
-    strength: row.strength,
-    weakness: row.weakness,
-    opportunity: row.opportunity,
-    threat: row.threat,
-    source: row.source,
-    createdAt: row.createdAt,
-    executiveUserId: row.executiveUserId,
-    supportUser: {
-      userId: row.executiveUser.id,
-      firstName: row.executiveUser.firstName,
-      lastName: row.executiveUser.lastName,
-      email: row.executiveUser.email,
-    },
-  };
-}
-
-async function findTeamLeadSupportSwots(
-  referral: ReferralRow,
-  assignedSupport: AssignedSupportPerson[],
-): Promise<TeamLeadSupportSwotSummary[]> {
-  if (referral.assignmentId) {
-    const rows = await prisma.swotAnalysis.findMany({
-      where: {
-        assignmentId: referral.assignmentId,
-        subjectType: "EXECUTIVE",
-        source: "TEAM_LEAD",
-        archivedAt: null,
-      },
-      orderBy: { createdAt: "asc" },
-      select: swotSummarySelect,
-    });
-    return rows
-      .map(mapSupportSwotRow)
-      .filter((row): row is TeamLeadSupportSwotSummary => row !== null);
-  }
-
-  if (assignedSupport.length === 0) return [];
-
-  const rows = await prisma.swotAnalysis.findMany({
-    where: {
-      subjectType: "EXECUTIVE",
-      source: "TEAM_LEAD",
-      archivedAt: null,
-      executiveUserId: { in: assignedSupport.map((p) => p.userId) },
-      ...(referral.createdAt
-        ? { createdAt: { gte: new Date(referral.createdAt.getTime() - 60_000) } }
-        : {}),
-    },
-    orderBy: { createdAt: "desc" },
-    select: swotSummarySelect,
-  });
-
-  const latestByUser = new Map<string, TeamLeadSupportSwotSummary>();
-  for (const row of rows) {
-    const mapped = mapSupportSwotRow(row);
-    if (!mapped || latestByUser.has(mapped.executiveUserId)) continue;
-    latestByUser.set(mapped.executiveUserId, mapped);
-  }
-  return assignedSupport
-    .map((p) => latestByUser.get(p.userId))
-    .filter((row): row is TeamLeadSupportSwotSummary => Boolean(row));
-}
-
 async function attachTeamLeadSwot(referral: ReferralRow, actor: Actor | null = null) {
   const assignedSupport = await listAssignedSupport(
     referral.salesExecutiveProfileId,
   );
-  const swot =
-    (await findTeamLeadSwot(referral.salesExecutiveProfileId, referral.createdAt)) ??
-    (await findTeamLeadSwot(referral.salesExecutiveProfileId));
-  const teamLeadSupportSwot = await findTeamLeadSupportSwots(
-    referral,
+  return serialize(referral, null, actor, {
     assignedSupport,
-  );
-  return serialize(referral, swot, actor, {
-    assignedSupport,
-    teamLeadSupportSwot,
+    teamLeadSupportSwot: [],
   });
 }
 
@@ -1010,81 +876,6 @@ export async function provideReferralInformation(
         include: referralInclude,
       });
 
-      const assignedSupportLinks = await tx.salesSupportLink.findMany({
-        where: {
-          salesExecutiveProfileId: referral.salesExecutiveProfileId,
-          isActive: true,
-        },
-        select: { salesSupportUserId: true },
-      });
-      const assignedIds = [
-        ...new Set(assignedSupportLinks.map((l) => l.salesSupportUserId)),
-      ];
-      const providedById = new Map(
-        (input.supportSwot ?? []).map((row) => [row.executiveUserId, row]),
-      );
-      const missingSupport = assignedIds.filter((id) => !providedById.has(id));
-      if (missingSupport.length > 0) {
-        throw badRequest(
-          "Team Lead must provide a SWOT for each Sales Support assigned to this Sales Executive",
-        );
-      }
-      const extraSupport = [...providedById.keys()].filter(
-        (id) => !assignedIds.includes(id),
-      );
-      if (extraSupport.length > 0) {
-        throw badRequest(
-          "supportSwot includes a Sales Support who is not assigned to this Sales Executive",
-        );
-      }
-
-      const previousProfileSwot = await tx.swotAnalysis.findFirst({
-        where: {
-          subjectType: "PROFILE",
-          salesExecutiveProfileId: referral.salesExecutiveProfileId,
-          source: "TEAM_LEAD",
-          archivedAt: null,
-        },
-        orderBy: [{ versionNumber: "desc" }, { createdAt: "desc" }],
-        select: { id: true, versionNumber: true },
-      });
-
-      const strengthPoints = textToSwotPoints(input.swot.strength, false);
-      const weaknessPoints = textToSwotPoints(input.swot.weakness, false);
-      const opportunityPoints = textToSwotPoints(input.swot.opportunity, false);
-      const threatPoints = textToSwotPoints(input.swot.threat, false);
-
-      const swotRow = await tx.swotAnalysis.create({
-        data: {
-          subjectType: "PROFILE",
-          salesExecutiveProfileId: referral.salesExecutiveProfileId,
-          executiveUserId: null,
-          teamId: referral.teamId,
-          assignmentId,
-          source: "TEAM_LEAD",
-          strength: joinSwotPoints(strengthPoints),
-          weakness: joinSwotPoints(weaknessPoints),
-          opportunity: joinSwotPoints(opportunityPoints),
-          threat: joinSwotPoints(threatPoints),
-          strengthPoints: pointsToJson(strengthPoints),
-          weaknessPoints: pointsToJson(weaknessPoints),
-          opportunityPoints: pointsToJson(opportunityPoints),
-          threatPoints: pointsToJson(threatPoints),
-          versionNumber: (previousProfileSwot?.versionNumber ?? 0) + 1,
-          supersedesId: previousProfileSwot?.id ?? null,
-          createdById: actor.id,
-        },
-        select: {
-          id: true,
-          strength: true,
-          weakness: true,
-          opportunity: true,
-          threat: true,
-          source: true,
-          createdAt: true,
-        },
-      });
-
       await writeAuditLog(
         {
           actorId: actor.id,
@@ -1101,78 +892,6 @@ export async function provideReferralInformation(
         },
         tx,
       );
-
-      await writeAuditLog(
-        {
-          actorId: actor.id,
-          action: "SWOT_CREATED",
-          entityType: "SwotAnalysis",
-          entityId: swotRow.id,
-          metadata: {
-            profileId: referral.salesExecutiveProfileId,
-            subjectType: "PROFILE",
-            source: "TEAM_LEAD",
-            via: "provide_information",
-          },
-        },
-        tx,
-      );
-
-      for (const executiveUserId of assignedIds) {
-        const supportInput = providedById.get(executiveUserId);
-        if (!supportInput) continue;
-        const previousExec = await tx.swotAnalysis.findFirst({
-          where: {
-            subjectType: "EXECUTIVE",
-            executiveUserId,
-            source: "TEAM_LEAD",
-            archivedAt: null,
-          },
-          orderBy: [{ versionNumber: "desc" }, { createdAt: "desc" }],
-          select: { id: true, versionNumber: true },
-        });
-        const sPts = textToSwotPoints(supportInput.strength, false);
-        const wPts = textToSwotPoints(supportInput.weakness, false);
-        const oPts = textToSwotPoints(supportInput.opportunity, false);
-        const tPts = textToSwotPoints(supportInput.threat, false);
-        const execSwot = await tx.swotAnalysis.create({
-          data: {
-            subjectType: "EXECUTIVE",
-            salesExecutiveProfileId: null,
-            executiveUserId,
-            teamId: referral.teamId,
-            assignmentId,
-            source: "TEAM_LEAD",
-            strength: joinSwotPoints(sPts),
-            weakness: joinSwotPoints(wPts),
-            opportunity: joinSwotPoints(oPts),
-            threat: joinSwotPoints(tPts),
-            strengthPoints: pointsToJson(sPts),
-            weaknessPoints: pointsToJson(wPts),
-            opportunityPoints: pointsToJson(oPts),
-            threatPoints: pointsToJson(tPts),
-            versionNumber: (previousExec?.versionNumber ?? 0) + 1,
-            supersedesId: previousExec?.id ?? null,
-            createdById: actor.id,
-          },
-          select: { id: true },
-        });
-        await writeAuditLog(
-          {
-            actorId: actor.id,
-            action: "SWOT_CREATED",
-            entityType: "SwotAnalysis",
-            entityId: execSwot.id,
-            metadata: {
-              executiveUserId,
-              subjectType: "EXECUTIVE",
-              source: "TEAM_LEAD",
-              via: "provide_information",
-            },
-          },
-          tx,
-        );
-      }
 
       return { updated: row };
     });

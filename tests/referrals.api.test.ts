@@ -116,20 +116,11 @@ describe("referral lifecycle", () => {
         priority1: "Discovery quality",
         priority2: "Qualification discipline",
         priority3: "Talk-track consistency",
-        swot: {
-          strength: "Strong product knowledge",
-          weakness: "Shallow discovery",
-          opportunity: "Rebuild qualification habit",
-          threat: "Continued pipeline leakage",
-        },
       });
     expect(provided.status).toBe(200);
     expect(provided.body.data.referral.status).toBe("ACKNOWLEDGED");
     expect(provided.body.data.referral.assignment?.status).toBe("ACTIVE");
-    expect(provided.body.data.referral.teamLeadSwot).toMatchObject({
-      strength: "Strong product knowledge",
-      weakness: "Shallow discovery",
-    });
+    expect(provided.body.data.referral.teamLeadSwot).toBeNull();
 
     const audit = await prisma.auditLog.findFirst({
       where: {
@@ -205,9 +196,7 @@ describe("referral lifecycle", () => {
     expect(begin.body.data.referral.status).toBe("IN_PROGRESS");
     expect(begin.body.data.referral.assignmentId).toBe(assignmentId);
     expect(begin.body.data.referral.assignment?.status).toBe("ACTIVE");
-    expect(begin.body.data.referral.teamLeadSwot?.strength).toBe(
-      "Strong product knowledge",
-    );
+    expect(begin.body.data.referral.teamLeadSwot).toBeNull();
 
     const complete = await request(app)
       .post(`/api/referrals/${referralId}/complete`)
@@ -485,13 +474,16 @@ describe("commando request → TL provide information → lock", () => {
     expect(unlocked.status).toBe(201);
   });
 
-  it("requires Team Lead SWOT for assigned Sales Support", async ({ skip }) => {
+  it("approves management packet without Sales Support SWOT", async ({ skip }) => {
     if (!dbReady) skip();
 
     const support = await prisma.user.findUnique({
       where: { email: "support@commando.local" },
     });
-    if (!support) skip();
+    if (!support) {
+      skip();
+      return;
+    }
 
     await prisma.commandoAssignment.updateMany({
       where: { salesExecutiveProfileId: profileId, status: "ACTIVE" },
@@ -515,7 +507,7 @@ describe("commando request → TL provide information → lock", () => {
       .set("Authorization", `Bearer ${c}`)
       .send({
         salesExecutiveProfileId: profileId,
-        requestReason: "Need support-side SWOT on the packet",
+        requestReason: "Packet without support SWOT",
       });
     expect(created.status).toBe(201);
     const id = created.body.data.referral.id as string;
@@ -530,50 +522,18 @@ describe("commando request → TL provide information → lock", () => {
       ]),
     );
 
-    const packet = {
-      ...fields,
-      priority1: "Discovery quality",
-      priority2: "Qualification discipline",
-      priority3: "Talk-track consistency",
-      swot: {
-        strength: "Strong product knowledge",
-        weakness: "Shallow discovery",
-        opportunity: "Rebuild qualification habit",
-        threat: "Continued pipeline leakage",
-      },
-    };
-
     const tl = await token("teamlead@commando.local");
-    const missing = await request(app)
-      .post(`/api/referrals/${id}/provide-information`)
-      .set("Authorization", `Bearer ${tl}`)
-      .send(packet);
-    expect(missing.status).toBe(400);
-
     const provided = await request(app)
       .post(`/api/referrals/${id}/provide-information`)
       .set("Authorization", `Bearer ${tl}`)
       .send({
-        ...packet,
-        supportSwot: [
-          {
-            executiveUserId: support.id,
-            strength: "Reliable follow-through",
-            weakness: "Slow proposal turnaround",
-            opportunity: "Own pricing playbook",
-            threat: "SE wait time grows",
-          },
-        ],
+        ...fields,
+        priority1: "Discovery quality",
+        priority2: "Qualification discipline",
+        priority3: "Talk-track consistency",
       });
     expect(provided.status).toBe(200);
-    expect(provided.body.data.referral.teamLeadSupportSwot).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          executiveUserId: support.id,
-          strength: "Reliable follow-through",
-          weakness: "Slow proposal turnaround",
-        }),
-      ]),
-    );
+    expect(provided.body.data.referral.teamLeadSwot).toBeNull();
+    expect(provided.body.data.referral.teamLeadSupportSwot).toEqual([]);
   });
 });

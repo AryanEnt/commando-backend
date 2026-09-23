@@ -52,20 +52,12 @@ export const createSwotSchema = z
 
     const subjectType = v.subjectType;
     if (subjectType === "PROFILE") {
-      if (!v.salesExecutiveProfileId) {
-        ctx.addIssue({
-          code: "custom",
-          message: "salesExecutiveProfileId is required for Profile SWOT",
-          path: ["salesExecutiveProfileId"],
-        });
-      }
-      if (executiveId) {
-        ctx.addIssue({
-          code: "custom",
-          message: "Profile SWOT cannot include executiveUserId",
-          path: ["executiveUserId"],
-        });
-      }
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "Profile SWOT is no longer used. Create an Executive SWOT for the Sales Executive instead.",
+        path: ["subjectType"],
+      });
     } else if (subjectType === "EXECUTIVE") {
       // May resolve person from salesExecutiveProfileId for SE executives
       if (!executiveId && !v.salesExecutiveProfileId) {
