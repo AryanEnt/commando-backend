@@ -22,6 +22,7 @@ import { referralsRouter } from "./modules/referrals/routes.js";
 import { swotRouter } from "./modules/swot/routes.js";
 import { activityTypesRouter } from "./modules/activity-types/routes.js";
 import { dailyLogsRouter } from "./modules/daily-logs/routes.js";
+import { dailyWorkLogsRouter } from "./modules/daily-work-logs/routes.js";
 import { weeklyReviewsRouter } from "./modules/weekly-reviews/routes.js";
 import { uploadsRouter } from "./modules/uploads/routes.js";
 import { monitoringRouter } from "./modules/monitoring/routes.js";
@@ -120,6 +121,7 @@ export function createApp() {
   app.use("/api/swot", swotRouter);
   app.use("/api/activity-types", activityTypesRouter);
   app.use("/api/daily-logs", dailyLogsRouter);
+  app.use("/api/daily-work-logs", dailyWorkLogsRouter);
   app.use("/api/weekly-reviews", weeklyReviewsRouter);
   app.use("/api/uploads", uploadsRouter);
   app.use("/api/monitoring", monitoringRouter);

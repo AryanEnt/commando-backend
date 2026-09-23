@@ -75,3 +75,18 @@ export async function setSwotVisibility(
     next(err);
   }
 }
+
+export async function listSupportSubjects(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await swotService.listSupportSubjectsForSwot(
+      req.user as Actor,
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}

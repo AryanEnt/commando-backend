@@ -178,6 +178,37 @@ describe("Feedback & performance (Phase 13)", () => {
     expect(sources).toContain("COMMANDO");
   });
 
+  it("SE can acknowledge Team Lead and Commando feedback", async ({ skip }) => {
+    if (!dbReady || !tlFeedbackId || !commandoFeedbackId) skip();
+    const se = await token("sales@commando.local");
+    const c = await token("commando@commando.local");
+
+    const blocked = await request(app)
+      .post(`/api/feedback/${tlFeedbackId}/acknowledge`)
+      .set("Authorization", `Bearer ${c}`);
+    expect(blocked.status).toBe(403);
+
+    const ackTl = await request(app)
+      .post(`/api/feedback/${tlFeedbackId}/acknowledge`)
+      .set("Authorization", `Bearer ${se}`);
+    expect(ackTl.status).toBe(200);
+    expect(ackTl.body.data.feedback.acknowledgedAt).toBeTruthy();
+
+    const ackCo = await request(app)
+      .post(`/api/feedback/${commandoFeedbackId}/acknowledge`)
+      .set("Authorization", `Bearer ${se}`);
+    expect(ackCo.status).toBe(200);
+    expect(ackCo.body.data.feedback.acknowledgedAt).toBeTruthy();
+
+    const listed = await request(app)
+      .get("/api/feedback")
+      .set("Authorization", `Bearer ${se}`);
+    const row = listed.body.data.feedback.find(
+      (f: { id: string }) => f.id === tlFeedbackId,
+    );
+    expect(row?.acknowledgedAt).toBeTruthy();
+  });
+
   it("creates performance evaluations with preserved scores and source", async ({
     skip,
   }) => {

@@ -384,6 +384,9 @@ export async function listEligibleSupportUsers(
     );
   }
 
+  let teamFilter: Prisma.TeamMembershipWhereInput | undefined;
+  let excludeUserIds: string[] = [];
+
   if (query.profileId) {
     const profile = await prisma.salesExecutiveProfile.findFirst({
       where: { id: query.profileId, archivedAt: null },
@@ -413,10 +416,14 @@ export async function listEligibleSupportUsers(
         );
       }
     }
-  }
 
-  let excludeUserIds: string[] = [];
-  if (query.profileId) {
+    // Only Sales Support members of the SE's team
+    teamFilter = {
+      teamId: query.teamId ?? profile.teamId,
+      isActive: true,
+      endedAt: null,
+    };
+
     const active = await prisma.salesSupportLink.findMany({
       where: {
         salesExecutiveProfileId: query.profileId,
@@ -425,26 +432,43 @@ export async function listEligibleSupportUsers(
       select: { salesSupportUserId: true },
     });
     excludeUserIds = active.map((l) => l.salesSupportUserId);
+  } else if (query.teamId) {
+    teamFilter = {
+      teamId: query.teamId,
+      isActive: true,
+      endedAt: null,
+    };
+  } else if (actor.roleCode === "TEAM_LEAD") {
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (teamIds.length === 0) return { users: [] };
+    teamFilter = {
+      teamId: { in: teamIds },
+      isActive: true,
+      endedAt: null,
+    };
+  } else if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    // Support users on teams where this Commando has an active intervention
+    const assignments = await prisma.commandoAssignment.findMany({
+      where: { commandoUserId: actor.id, status: "ACTIVE" },
+      select: { teamId: true },
+    });
+    const teamIds = [...new Set(assignments.map((a) => a.teamId))];
+    if (teamIds.length === 0) return { users: [] };
+    teamFilter = {
+      teamId: { in: teamIds },
+      isActive: true,
+      endedAt: null,
+    };
+  } else if (!isSuperAdmin(actor)) {
+    return { users: [] };
   }
 
   const where: Prisma.UserWhereInput = {
     isActive: true,
     deletedAt: null,
     role: { code: "SALES_SUPPORT_EXECUTIVE" },
-    ...(excludeUserIds.length
-      ? { id: { notIn: excludeUserIds } }
-      : {}),
-    ...(query.teamId
-      ? {
-          teamMemberships: {
-            some: {
-              teamId: query.teamId,
-              isActive: true,
-              endedAt: null,
-            },
-          },
-        }
-      : {}),
+    ...(excludeUserIds.length ? { id: { notIn: excludeUserIds } } : {}),
+    ...(teamFilter ? { teamMemberships: { some: teamFilter } } : {}),
     ...(query.search
       ? {
           OR: [
@@ -520,6 +544,21 @@ export async function assignSalesSupportLink(
   });
   if (!supportUser) {
     throw badRequest("Sales Support Executive is invalid or inactive");
+  }
+
+  const onTeam = await prisma.teamMembership.findFirst({
+    where: {
+      userId: supportUser.id,
+      teamId: profile.teamId,
+      isActive: true,
+      endedAt: null,
+    },
+    select: { id: true },
+  });
+  if (!onTeam) {
+    throw badRequest(
+      "Sales Support Executive must be an active member of the Sales Executive's team",
+    );
   }
 
   const existing = await prisma.salesSupportLink.findFirst({

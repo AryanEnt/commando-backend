@@ -30,6 +30,13 @@ export const createCommandoRequestSchema = z.object({
   note: z.string().trim().max(2000).optional().nullable(),
 });
 
+const swotQuadrantsSchema = z.object({
+  strength: nonEmptyText,
+  weakness: nonEmptyText,
+  opportunity: nonEmptyText,
+  threat: nonEmptyText,
+});
+
 /** Team Lead approves a Commando request and provides the SE management packet. */
 export const provideReferralInformationSchema = z.object({
   whySalesIsDown: nonEmptyText,
@@ -41,12 +48,16 @@ export const provideReferralInformationSchema = z.object({
   priority1: z.string().trim().min(1).max(240),
   priority2: z.string().trim().min(1).max(240),
   priority3: z.string().trim().min(1).max(240),
-  swot: z.object({
-    strength: nonEmptyText,
-    weakness: nonEmptyText,
-    opportunity: nonEmptyText,
-    threat: nonEmptyText,
-  }),
+  swot: swotQuadrantsSchema,
+  /** Executive SWOT for each Sales Support currently assigned to this SE. */
+  supportSwot: z
+    .array(
+      swotQuadrantsSchema.extend({
+        executiveUserId: z.string().cuid(),
+      }),
+    )
+    .optional()
+    .default([]),
 });
 
 export const listReferralsQuerySchema = z.object({

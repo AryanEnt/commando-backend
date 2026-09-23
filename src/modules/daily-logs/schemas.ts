@@ -5,11 +5,24 @@ const optionalText = z.string().trim().max(10000).optional().nullable();
 
 export const ensureDailyLogSchema = z
   .object({
-    salesExecutiveProfileId: z.string().cuid(),
+    salesExecutiveProfileId: z.string().cuid().optional(),
+    executiveUserId: z.string().cuid().optional(),
     /** YYYY-MM-DD; defaults to today (local calendar via server now). */
     logDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((v, ctx) => {
+    const hasProfile = Boolean(v.salesExecutiveProfileId);
+    const hasExecutive = Boolean(v.executiveUserId);
+    if (hasProfile === hasExecutive) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Provide exactly one of salesExecutiveProfileId or executiveUserId",
+        path: hasProfile ? ["executiveUserId"] : ["salesExecutiveProfileId"],
+      });
+    }
+  });
 
 export const createDailyLogEntrySchema = z
   .object({
@@ -47,6 +60,7 @@ export const submitDailyLogSchema = z
 export const listDailyLogsQuerySchema = z.object({
   search: z.string().trim().optional(),
   profileId: z.string().optional(),
+  executiveUserId: z.string().optional(),
   status: z.enum(["DRAFT", "SUBMITTED"]).optional(),
   dateFrom: z
     .string()
@@ -61,18 +75,31 @@ export const listDailyLogsQuerySchema = z.object({
 });
 
 /** @deprecated — prefer ensure + add entry. Kept for transitional clients. */
-export const createDailyLogSchema = z.object({
-  salesExecutiveProfileId: z.string().cuid(),
-  activityTypeId: z.string().cuid(),
-  sessionTitle: z.string().trim().min(1).max(200),
-  observation: z.string().trim().min(1).max(10000),
-  evidence: z.string().trim().max(10000).optional().nullable(),
-  seResponse: z.string().trim().max(10000).optional().nullable(),
-  coachingGiven: z.string().trim().max(10000).optional().nullable(),
-  expectedChange: z.string().trim().max(10000).optional().nullable(),
-  followUp: z.string().trim().max(10000).optional().nullable(),
-  loggedAt: z.coerce.date().optional(),
-});
+export const createDailyLogSchema = z
+  .object({
+    salesExecutiveProfileId: z.string().cuid().optional(),
+    executiveUserId: z.string().cuid().optional(),
+    activityTypeId: z.string().cuid(),
+    sessionTitle: z.string().trim().min(1).max(200),
+    observation: z.string().trim().min(1).max(10000),
+    evidence: z.string().trim().max(10000).optional().nullable(),
+    seResponse: z.string().trim().max(10000).optional().nullable(),
+    coachingGiven: z.string().trim().max(10000).optional().nullable(),
+    expectedChange: z.string().trim().max(10000).optional().nullable(),
+    followUp: z.string().trim().max(10000).optional().nullable(),
+    loggedAt: z.coerce.date().optional(),
+  })
+  .superRefine((v, ctx) => {
+    const hasProfile = Boolean(v.salesExecutiveProfileId);
+    const hasExecutive = Boolean(v.executiveUserId);
+    if (hasProfile === hasExecutive) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Provide exactly one of salesExecutiveProfileId or executiveUserId",
+      });
+    }
+  });
 
 export type EnsureDailyLogInput = z.infer<typeof ensureDailyLogSchema>;
 export type CreateDailyLogEntryInput = z.infer<typeof createDailyLogEntrySchema>;

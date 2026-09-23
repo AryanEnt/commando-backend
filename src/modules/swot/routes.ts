@@ -18,6 +18,12 @@ swotRouter.get(
   controller.listSwot,
 );
 
+swotRouter.get(
+  "/support-subjects",
+  requirePermission(PERMISSIONS.SWOT_CREATE),
+  controller.listSupportSubjects,
+);
+
 swotRouter.post(
   "/",
   requirePermission(PERMISSIONS.SWOT_CREATE),

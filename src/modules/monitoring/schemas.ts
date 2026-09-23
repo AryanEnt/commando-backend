@@ -3,6 +3,7 @@ import { z } from "zod";
 export const listMonitoringQuerySchema = z.object({
   search: z.string().trim().optional(),
   profileId: z.string().optional(),
+  executiveUserId: z.string().optional(),
   categoryId: z.string().optional(),
   dateFrom: z.coerce.date().optional(),
   dateTo: z.coerce.date().optional(),
@@ -71,19 +72,34 @@ export const checklistResponseSchema = z
     }
   });
 
-export const createMonitoringRecordSchema = z.object({
-  salesExecutiveProfileId: z.string().cuid(),
-  categoryId: z.string().cuid(),
-  observation: z.string().trim().max(10000).optional().nullable(),
-  observedAt: z.coerce.date().optional(),
-  responses: z.array(checklistResponseSchema).min(1),
-  supportInvolvement: z
-    .object({
-      none: z.boolean().optional(),
-      salesSupportUserIds: z.array(z.string().cuid()).optional(),
-    })
-    .optional(),
-});
+export const createMonitoringRecordSchema = z
+  .object({
+    salesExecutiveProfileId: z.string().cuid().optional(),
+    executiveUserId: z.string().cuid().optional(),
+    categoryId: z.string().cuid(),
+    observation: z.string().trim().max(10000).optional().nullable(),
+    observedAt: z.coerce.date().optional(),
+    responses: z.array(checklistResponseSchema).min(1),
+    supportInvolvement: z
+      .object({
+        none: z.boolean().optional(),
+        salesSupportUserIds: z.array(z.string().cuid()).optional(),
+      })
+      .optional(),
+  })
+  .strict()
+  .superRefine((v, ctx) => {
+    const hasProfile = Boolean(v.salesExecutiveProfileId);
+    const hasExecutive = Boolean(v.executiveUserId);
+    if (hasProfile === hasExecutive) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Provide exactly one of salesExecutiveProfileId or executiveUserId",
+        path: hasProfile ? ["executiveUserId"] : ["salesExecutiveProfileId"],
+      });
+    }
+  });
 
 export const createMonitoringCategorySchema = z.object({
   code: z
@@ -116,6 +132,7 @@ export const createChecklistItemSchema = z.object({
   label: z.string().trim().min(1).max(240),
   sortOrder: z.number().int().optional(),
   isActive: z.boolean().optional(),
+  defaultWeight: z.number().int().min(0).max(100).optional(),
 });
 
 export const updateChecklistItemSchema = z.object({
@@ -123,6 +140,7 @@ export const updateChecklistItemSchema = z.object({
   sortOrder: z.number().int().optional(),
   isActive: z.boolean().optional(),
   archivedAt: z.coerce.date().nullable().optional(),
+  defaultWeight: z.number().int().min(0).max(100).optional(),
 });
 
 export const addSeChecklistItemSchema = z.object({
@@ -137,6 +155,28 @@ export const addSeChecklistItemSchema = z.object({
 export const removeSeTemplateItemSchema = z.object({
   categoryId: z.string().cuid(),
   templateItemId: z.string().cuid(),
+});
+
+const seWeightItemSchema = z
+  .object({
+    checklistItemId: z.string().cuid().optional(),
+    seChecklistItemId: z.string().cuid().optional(),
+    weight: z.number().int().min(0).max(100),
+  })
+  .superRefine((val, ctx) => {
+    const hasTemplate = Boolean(val.checklistItemId);
+    const hasCustom = Boolean(val.seChecklistItemId);
+    if (hasTemplate === hasCustom) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Each weight row must reference either a template or SE custom item",
+      });
+    }
+  });
+
+export const saveSeChecklistWeightsSchema = z.object({
+  categoryId: z.string().cuid(),
+  items: z.array(seWeightItemSchema).min(1),
 });
 
 export type ListMonitoringQuery = z.infer<typeof listMonitoringQuerySchema>;
@@ -157,4 +197,7 @@ export type UpdateChecklistItemInput = z.infer<typeof updateChecklistItemSchema>
 export type AddSeChecklistItemInput = z.infer<typeof addSeChecklistItemSchema>;
 export type RemoveSeTemplateItemInput = z.infer<
   typeof removeSeTemplateItemSchema
+>;
+export type SaveSeChecklistWeightsInput = z.infer<
+  typeof saveSeChecklistWeightsSchema
 >;

@@ -12,6 +12,7 @@ import {
   createMonitoringCategorySchema,
   createMonitoringRecordSchema,
   removeSeTemplateItemSchema,
+  saveSeChecklistWeightsSchema,
   updateChecklistItemSchema,
   updateMonitoringCategorySchema,
 } from "./schemas.js";
@@ -113,6 +114,57 @@ monitoringRouter.post(
   requirePermission(PERMISSIONS.MONITORING_CREATE),
   validate(removeSeTemplateItemSchema),
   controller.restoreTemplateItemForSe,
+);
+
+monitoringRouter.put(
+  "/profiles/:profileId/checklist/weights",
+  requirePermission(PERMISSIONS.MONITORING_CREATE),
+  validate(saveSeChecklistWeightsSchema),
+  controller.saveSeChecklistWeights,
+);
+
+// Support (executive) checklist customization — before /:id catch-all
+monitoringRouter.get(
+  "/executives/:userId/checklist",
+  requireAnyPermission([
+    PERMISSIONS.MONITORING_VIEW,
+    PERMISSIONS.MONITORING_CREATE,
+  ]),
+  controller.getEffectiveChecklistForExecutive,
+);
+
+monitoringRouter.post(
+  "/executives/:userId/checklist/items",
+  requirePermission(PERMISSIONS.MONITORING_CREATE),
+  validate(addSeChecklistItemSchema),
+  controller.addSeChecklistItemForExecutive,
+);
+
+monitoringRouter.delete(
+  "/executives/:userId/checklist/items/:itemId",
+  requirePermission(PERMISSIONS.MONITORING_CREATE),
+  controller.removeSeChecklistItemForExecutive,
+);
+
+monitoringRouter.post(
+  "/executives/:userId/checklist/remove-template",
+  requirePermission(PERMISSIONS.MONITORING_CREATE),
+  validate(removeSeTemplateItemSchema),
+  controller.removeTemplateItemFromExecutive,
+);
+
+monitoringRouter.post(
+  "/executives/:userId/checklist/restore-template",
+  requirePermission(PERMISSIONS.MONITORING_CREATE),
+  validate(removeSeTemplateItemSchema),
+  controller.restoreTemplateItemForExecutive,
+);
+
+monitoringRouter.put(
+  "/executives/:userId/checklist/weights",
+  requirePermission(PERMISSIONS.MONITORING_CREATE),
+  validate(saveSeChecklistWeightsSchema),
+  controller.saveSeChecklistWeightsForExecutive,
 );
 
 monitoringRouter.get(

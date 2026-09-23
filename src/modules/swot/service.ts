@@ -1,4 +1,4 @@
-import type { Prisma, SwotSource } from "@prisma/client";
+import type { Prisma, SwotSource, SwotSubjectType } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { writeAuditLog } from "../../lib/audit.js";
 import type { Actor } from "../../lib/authorization.js";
@@ -41,6 +41,15 @@ const swotInclude = {
       teamId: true,
     },
   },
+  executiveUser: {
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+      role: { select: { code: true } },
+    },
+  },
   team: { select: { id: true, name: true } },
   createdBy: {
     select: {
@@ -63,6 +72,8 @@ function sourceForRole(roleCode: Actor["roleCode"]): SwotSource {
       return "COMMANDO";
     case "SALES_EXECUTIVE":
       return "SALES_EXECUTIVE";
+    case "SALES_SUPPORT_EXECUTIVE":
+      return "SALES_SUPPORT_EXECUTIVE";
     default:
       throw forbidden("Your role cannot create SWOT analyses");
   }
@@ -95,7 +106,6 @@ function flagsFromRow(row: {
   const visibleWeakness = Boolean(row.visibleWeakness);
   const visibleOpportunity = Boolean(row.visibleOpportunity);
   const visibleThreat = Boolean(row.visibleThreat);
-  // Legacy rows: overall share with no per-box flags yet
   if (
     row.visibleToSalesExecutive &&
     !visibleStrength &&
@@ -131,20 +141,57 @@ function presentPoints(points: SwotPoint[], redact: boolean) {
   };
 }
 
+function isSelfSource(source: SwotSource): boolean {
+  return source === "SALES_EXECUTIVE" || source === "SALES_SUPPORT_EXECUTIVE";
+}
+
+function isSubjectExecutive(actor: Actor | undefined): boolean {
+  return (
+    actor?.roleCode === "SALES_EXECUTIVE" ||
+    actor?.roleCode === "SALES_SUPPORT_EXECUTIVE"
+  );
+}
+
+function inputExecutiveId(input: CreateSwotInput): string | undefined {
+  return input.executiveUserId ?? input.subjectUserId;
+}
+
 function serialize(row: SwotRow, actor?: Actor) {
   const all = loadQuadrantPoints(row);
   const flags = flagsFromPoints(all);
-  const isSe = actor?.roleCode === "SALES_EXECUTIVE";
-  const own = row.source === "SALES_EXECUTIVE";
-  const redact = isSe && !own;
+  const own = isSelfSource(row.source);
+  const redact = isSubjectExecutive(actor) && !own;
   const strength = presentPoints(all.strength, redact);
   const weakness = presentPoints(all.weakness, redact);
   const opportunity = presentPoints(all.opportunity, redact);
   const threat = presentPoints(all.threat, redact);
+
+  const subjectName =
+    row.subjectType === "PROFILE"
+      ? (row.profile?.displayName ?? "Unknown profile")
+      : row.executiveUser
+        ? `${row.executiveUser.firstName} ${row.executiveUser.lastName}`.trim()
+        : "Unknown";
+
   return {
     id: row.id,
+    subjectType: row.subjectType as SwotSubjectType,
     salesExecutiveProfileId: row.salesExecutiveProfileId,
+    executiveUserId: row.executiveUserId,
+    /** @deprecated Alias of executiveUserId */
+    subjectUserId: row.executiveUserId,
     profile: row.profile,
+    executiveUser: row.executiveUser,
+    /** @deprecated Alias of executiveUser */
+    subjectUser: row.executiveUser,
+    subject: {
+      type: row.subjectType as "EXECUTIVE" | "PROFILE",
+      id:
+        row.subjectType === "PROFILE"
+          ? (row.salesExecutiveProfileId ?? "")
+          : (row.executiveUserId ?? ""),
+      name: subjectName,
+    },
     teamId: row.teamId,
     team: row.team,
     assignmentId: row.assignmentId,
@@ -166,50 +213,182 @@ function serialize(row: SwotRow, actor?: Actor) {
     visibleThreat: own ? true : flags.visibleThreat,
     createdById: row.createdById,
     createdBy: row.createdBy,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
   };
 }
 
-async function assertCanViewSwot(actor: Actor, row: SwotRow): Promise<void> {
-  if (isSuperAdmin(actor)) {
-    return;
+async function teamLeadProfileIds(actorId: string): Promise<string[]> {
+  const teamIds = await getActiveTeamIds(prisma, actorId);
+  if (teamIds.length === 0) return [];
+  const profiles = await prisma.salesExecutiveProfile.findMany({
+    where: { teamId: { in: teamIds }, archivedAt: null },
+    select: { id: true },
+  });
+  return profiles.map((p) => p.id);
+}
+
+async function commandoProfileIds(
+  actorId: string,
+  activeOnly = false,
+): Promise<string[]> {
+  const assignments = await prisma.commandoAssignment.findMany({
+    where: {
+      commandoUserId: actorId,
+      ...(activeOnly ? { status: "ACTIVE" as const } : {}),
+    },
+    select: { salesExecutiveProfileId: true },
+  });
+  return [
+    ...new Set(assignments.map((a) => a.salesExecutiveProfileId)),
+  ];
+}
+
+async function teamLeadSupportUserIds(actorId: string): Promise<string[]> {
+  const profileIds = await teamLeadProfileIds(actorId);
+  if (profileIds.length === 0) return [];
+  const links = await prisma.salesSupportLink.findMany({
+    where: {
+      salesExecutiveProfileId: { in: profileIds },
+      isActive: true,
+    },
+    select: { salesSupportUserId: true },
+  });
+  return [...new Set(links.map((l) => l.salesSupportUserId))];
+}
+
+async function commandoSupportUserIds(
+  actorId: string,
+  activeOnly = false,
+): Promise<string[]> {
+  const profileIds = await commandoProfileIds(actorId, activeOnly);
+  if (profileIds.length === 0) return [];
+  const links = await prisma.salesSupportLink.findMany({
+    where: {
+      salesExecutiveProfileId: { in: profileIds },
+      isActive: true,
+    },
+    select: { salesSupportUserId: true },
+  });
+  return [...new Set(links.map((l) => l.salesSupportUserId))];
+}
+
+async function assertSseInTeamLeadScope(actor: Actor, executiveUserId: string) {
+  const ids = await teamLeadSupportUserIds(actor.id);
+  if (!ids.includes(executiveUserId)) {
+    throw forbidden("Sales Support user is outside your team support scope");
   }
+}
+
+async function assertSseInCommandoScope(
+  actor: Actor,
+  executiveUserId: string,
+  activeOnly = true,
+) {
+  const ids = await commandoSupportUserIds(actor.id, activeOnly);
+  if (!ids.includes(executiveUserId)) {
+    throw forbidden(
+      "Sales Support user is outside your assignment support scope",
+    );
+  }
+}
+
+async function assertCanViewSwot(actor: Actor, row: SwotRow): Promise<void> {
+  if (isSuperAdmin(actor)) return;
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
-      throw forbidden("Record is outside your assignment scope");
+    if (row.subjectType === "PROFILE" && row.salesExecutiveProfileId) {
+      const assigned = await prisma.commandoAssignment.findFirst({
+        where: {
+          salesExecutiveProfileId: row.salesExecutiveProfileId,
+          commandoUserId: actor.id,
+        },
+        select: { id: true },
+      });
+      if (!assigned) {
+        throw forbidden("Record is outside your assignment scope");
+      }
+      return;
     }
-    // Commando sees TL, Commando, and SE SWOT for assigned profiles
-    return;
+    if (row.subjectType === "EXECUTIVE" && row.executiveUserId) {
+      // SE executive: via assignment on any profile they occupy
+      const seProfile = await prisma.salesExecutiveProfile.findFirst({
+        where: { userId: row.executiveUserId, archivedAt: null },
+        select: { id: true },
+      });
+      if (seProfile) {
+        const assigned = await prisma.commandoAssignment.findFirst({
+          where: {
+            salesExecutiveProfileId: seProfile.id,
+            commandoUserId: actor.id,
+          },
+          select: { id: true },
+        });
+        if (assigned) return;
+      }
+      // SSE executive
+      await assertSseInCommandoScope(actor, row.executiveUserId, false);
+      return;
+    }
+    throw forbidden("Record is outside your assignment scope");
   }
 
   if (actor.roleCode === "TEAM_LEAD") {
-    const teamIds = await getActiveTeamIds(prisma, actor.id);
-    if (!teamIds.includes(row.teamId)) {
-      throw forbidden("Record is outside your team scope");
+    if (row.subjectType === "PROFILE" && row.teamId) {
+      const teamIds = await getActiveTeamIds(prisma, actor.id);
+      if (!teamIds.includes(row.teamId)) {
+        throw forbidden("Record is outside your team scope");
+      }
+      return;
     }
-    // TL sees TL, Commando, and SE SWOT for team profiles
-    return;
+    if (row.subjectType === "EXECUTIVE" && row.executiveUserId) {
+      const seProfile = await prisma.salesExecutiveProfile.findFirst({
+        where: { userId: row.executiveUserId, archivedAt: null },
+        select: { teamId: true },
+      });
+      if (seProfile) {
+        const teamIds = await getActiveTeamIds(prisma, actor.id);
+        if (teamIds.includes(seProfile.teamId)) return;
+      }
+      await assertSseInTeamLeadScope(actor, row.executiveUserId);
+      return;
+    }
+    throw forbidden("Record is outside your team scope");
   }
 
   if (actor.roleCode === "SALES_EXECUTIVE") {
-    await requireRecordAccess(prisma, actor, {
-      teamId: row.teamId,
-      profileId: row.salesExecutiveProfileId,
-      profileUserId: row.profile.userId,
-    });
-    if (
-      !salesExecutiveCanViewSwot(row.source, row.visibleToSalesExecutive)
-    ) {
-      throw forbidden("This SWOT is not shared with the Sales Executive yet");
+    // Person may see own Executive SWOT (visibility gated) — not Profile SWOT unless shared
+    if (row.subjectType === "EXECUTIVE") {
+      if (row.executiveUserId !== actor.id) {
+        throw forbidden("Not allowed to access this SWOT");
+      }
+      if (!salesExecutiveCanViewSwot(row.source, row.visibleToSalesExecutive)) {
+        throw forbidden("This SWOT is not shared with the Sales Executive yet");
+      }
+      return;
+    }
+    if (row.subjectType === "PROFILE" && row.salesExecutiveProfileId) {
+      await requireRecordAccess(prisma, actor, {
+        teamId: row.teamId ?? row.profile?.teamId ?? "",
+        profileId: row.salesExecutiveProfileId,
+        profileUserId: row.profile?.userId,
+      });
+      if (!salesExecutiveCanViewSwot(row.source, row.visibleToSalesExecutive)) {
+        throw forbidden("This Profile SWOT is not shared with you yet");
+      }
+      return;
+    }
+    throw forbidden("Not allowed to access this SWOT");
+  }
+
+  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+    if (row.subjectType !== "EXECUTIVE" || row.executiveUserId !== actor.id) {
+      throw forbidden("Not allowed to access this SWOT");
+    }
+    if (!salesExecutiveCanViewSwot(row.source, row.visibleToSalesExecutive)) {
+      throw forbidden(
+        "This SWOT is not shared with the Sales Support Executive yet",
+      );
     }
     return;
   }
@@ -228,10 +407,11 @@ async function assertCanManageVisibility(
     actor.roleCode !== "TEAM_LEAD" &&
     actor.roleCode !== "COMMANDO_EXECUTIVE"
   ) {
-    throw forbidden("Only Team Leads and Commandos can change SE visibility");
+    throw forbidden(
+      "Only Team Leads and Commandos can change subject visibility",
+    );
   }
 
-  // Each role may only share their own source stream
   if (actor.roleCode === "TEAM_LEAD" && row.source !== "TEAM_LEAD") {
     throw forbidden(
       "Team Leads may only change visibility on Team Lead SWOT versions",
@@ -243,32 +423,25 @@ async function assertCanManageVisibility(
     );
   }
 
-  if (actor.roleCode === "TEAM_LEAD") {
-    const teamIds = await getActiveTeamIds(prisma, actor.id);
-    if (!teamIds.includes(row.teamId)) {
-      throw forbidden("Record is outside your team scope");
-    }
-    // Visibility on an existing TL SWOT is allowed during Commando —
-    // creation remains locked; sharing own assessment is not operational rewrite.
-    return;
-  }
+  await assertCanViewSwot(actor, row);
 
-  const assigned = await prisma.commandoAssignment.findFirst({
-    where: {
-      salesExecutiveProfileId: row.salesExecutiveProfileId,
-      commandoUserId: actor.id,
-      status: "ACTIVE",
-    },
-    select: { id: true },
-  });
-  if (!assigned) {
-    throw forbidden(
-      "Commando may only change visibility for actively assigned profiles",
-    );
+  if (actor.roleCode === "COMMANDO_EXECUTIVE" && row.subjectType === "PROFILE") {
+    const assigned = await prisma.commandoAssignment.findFirst({
+      where: {
+        salesExecutiveProfileId: row.salesExecutiveProfileId!,
+        commandoUserId: actor.id,
+        status: "ACTIVE",
+      },
+      select: { id: true },
+    });
+    if (!assigned) {
+      throw forbidden(
+        "Commando may only change visibility for actively assigned profiles",
+      );
+    }
   }
 }
 
-/** Sources TL and Commando may list (cross-visible). */
 function managerSourceFilter(
   actor: Actor,
 ): Prisma.SwotAnalysisWhereInput | undefined {
@@ -278,28 +451,133 @@ function managerSourceFilter(
     actor.roleCode === "COMMANDO_EXECUTIVE"
   ) {
     return {
-      source: { in: ["TEAM_LEAD", "COMMANDO", "SALES_EXECUTIVE"] },
+      source: {
+        in: [
+          "TEAM_LEAD",
+          "COMMANDO",
+          "SALES_EXECUTIVE",
+          "SALES_SUPPORT_EXECUTIVE",
+        ],
+      },
     };
   }
   return undefined;
 }
 
+export async function listSupportSubjectsForSwot(actor: Actor) {
+  if (isSuperAdmin(actor)) {
+    const users = await prisma.user.findMany({
+      where: {
+        deletedAt: null,
+        isActive: true,
+        role: { code: "SALES_SUPPORT_EXECUTIVE" },
+      },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+      },
+      orderBy: [{ firstName: "asc" }, { lastName: "asc" }],
+      take: 200,
+    });
+    return { subjects: users };
+  }
+
+  let userIds: string[] = [];
+  if (actor.roleCode === "TEAM_LEAD") {
+    userIds = await teamLeadSupportUserIds(actor.id);
+  } else if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    userIds = await commandoSupportUserIds(actor.id, true);
+  } else {
+    throw forbidden("Not allowed to list SWOT support subjects");
+  }
+
+  if (userIds.length === 0) return { subjects: [] };
+
+  const users = await prisma.user.findMany({
+    where: {
+      id: { in: userIds },
+      deletedAt: null,
+      isActive: true,
+    },
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+    },
+    orderBy: [{ firstName: "asc" }, { lastName: "asc" }],
+  });
+  return { subjects: users };
+}
+
+/** Expand profileId filter to PROFILE rows + EXECUTIVE rows for that profile's person. */
+async function whereForProfileFilter(
+  profileId: string,
+): Promise<Prisma.SwotAnalysisWhereInput> {
+  const profile = await prisma.salesExecutiveProfile.findFirst({
+    where: { id: profileId },
+    select: { id: true, userId: true },
+  });
+  if (!profile) {
+    return { salesExecutiveProfileId: profileId, subjectType: "PROFILE" };
+  }
+  return {
+    OR: [
+      { subjectType: "PROFILE", salesExecutiveProfileId: profile.id },
+      { subjectType: "EXECUTIVE", executiveUserId: profile.userId },
+    ],
+  };
+}
+
 export async function listSwot(actor: Actor, query: ListSwotQuery) {
   const scopeParts: Prisma.SwotAnalysisWhereInput[] = [{ archivedAt: null }];
+  const executiveFilter = query.executiveUserId ?? query.subjectUserId;
 
   if (!isSuperAdmin(actor)) {
     if (actor.roleCode === "TEAM_LEAD") {
-      const teamIds = await getActiveTeamIds(prisma, actor.id);
-      scopeParts.push({ teamId: { in: teamIds } });
-    } else if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-      const assignments = await prisma.commandoAssignment.findMany({
-        where: { commandoUserId: actor.id },
-        select: { salesExecutiveProfileId: true },
+      const [teamIds, supportUserIds, profileIds] = await Promise.all([
+        getActiveTeamIds(prisma, actor.id),
+        teamLeadSupportUserIds(actor.id),
+        teamLeadProfileIds(actor.id),
+      ]);
+      const seUsers = await prisma.salesExecutiveProfile.findMany({
+        where: { id: { in: profileIds } },
+        select: { userId: true },
       });
-      const profileIds = [
-        ...new Set(assignments.map((a) => a.salesExecutiveProfileId)),
-      ];
-      scopeParts.push({ salesExecutiveProfileId: { in: profileIds } });
+      const seUserIds = seUsers.map((p) => p.userId);
+      scopeParts.push({
+        OR: [
+          { subjectType: "PROFILE", teamId: { in: teamIds } },
+          {
+            subjectType: "EXECUTIVE",
+            executiveUserId: { in: [...seUserIds, ...supportUserIds] },
+          },
+        ],
+      });
+    } else if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+      const [profileIds, supportUserIds] = await Promise.all([
+        commandoProfileIds(actor.id, false),
+        commandoSupportUserIds(actor.id, false),
+      ]);
+      const seUsers = await prisma.salesExecutiveProfile.findMany({
+        where: { id: { in: profileIds } },
+        select: { userId: true },
+      });
+      const seUserIds = seUsers.map((p) => p.userId);
+      scopeParts.push({
+        OR: [
+          {
+            subjectType: "PROFILE",
+            salesExecutiveProfileId: { in: profileIds },
+          },
+          {
+            subjectType: "EXECUTIVE",
+            executiveUserId: { in: [...seUserIds, ...supportUserIds] },
+          },
+        ],
+      });
     } else if (actor.roleCode === "SALES_EXECUTIVE") {
       const profile = await prisma.salesExecutiveProfile.findFirst({
         where: { userId: actor.id, archivedAt: null },
@@ -313,11 +591,46 @@ export async function listSwot(actor: Actor, query: ListSwotQuery) {
           items: [],
         };
       }
-      scopeParts.push({ salesExecutiveProfileId: profile.id });
-      scopeParts.push(swotWhereVisibleToSalesExecutive());
+      scopeParts.push({
+        OR: [
+          { subjectType: "EXECUTIVE", executiveUserId: actor.id },
+          {
+            subjectType: "PROFILE",
+            salesExecutiveProfileId: profile.id,
+            ...swotWhereVisibleToSalesExecutive(),
+          },
+        ],
+      });
+      // Executive self always visible; manager Executive SWOT gated
+      scopeParts.push({
+        OR: [
+          { subjectType: "EXECUTIVE", source: "SALES_EXECUTIVE" },
+          {
+            subjectType: "EXECUTIVE",
+            ...swotWhereVisibleToSalesExecutive(),
+          },
+          { subjectType: "PROFILE" },
+        ],
+      });
       if (query.source) {
         if (query.source === "SALES_EXECUTIVE") {
           scopeParts.push({ source: "SALES_EXECUTIVE" });
+        } else {
+          scopeParts.push({
+            source: query.source,
+            visibleToSalesExecutive: true,
+          });
+        }
+      }
+    } else if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+      scopeParts.push({
+        subjectType: "EXECUTIVE",
+        executiveUserId: actor.id,
+      });
+      scopeParts.push(swotWhereVisibleToSalesExecutive());
+      if (query.source) {
+        if (query.source === "SALES_SUPPORT_EXECUTIVE") {
+          scopeParts.push({ source: "SALES_SUPPORT_EXECUTIVE" });
         } else {
           scopeParts.push({
             source: query.source,
@@ -331,15 +644,30 @@ export async function listSwot(actor: Actor, query: ListSwotQuery) {
   }
 
   const sourceVis = managerSourceFilter(actor);
-  if (sourceVis && actor.roleCode !== "SALES_EXECUTIVE") {
+  if (
+    sourceVis &&
+    actor.roleCode !== "SALES_EXECUTIVE" &&
+    actor.roleCode !== "SALES_SUPPORT_EXECUTIVE"
+  ) {
     scopeParts.push(sourceVis);
   }
 
   if (query.teamId) scopeParts.push({ teamId: query.teamId });
+  if (query.subjectType) scopeParts.push({ subjectType: query.subjectType });
   if (query.profileId) {
-    scopeParts.push({ salesExecutiveProfileId: query.profileId });
+    scopeParts.push(await whereForProfileFilter(query.profileId));
   }
-  if (query.source && actor.roleCode !== "SALES_EXECUTIVE") {
+  if (executiveFilter) {
+    scopeParts.push({
+      subjectType: "EXECUTIVE",
+      executiveUserId: executiveFilter,
+    });
+  }
+  if (
+    query.source &&
+    actor.roleCode !== "SALES_EXECUTIVE" &&
+    actor.roleCode !== "SALES_SUPPORT_EXECUTIVE"
+  ) {
     scopeParts.push({ source: query.source });
   }
   if (query.commandoUserId) {
@@ -347,10 +675,22 @@ export async function listSwot(actor: Actor, query: ListSwotQuery) {
       where: { commandoUserId: query.commandoUserId },
       select: { salesExecutiveProfileId: true },
     });
+    const ids = assignments.map((a) => a.salesExecutiveProfileId);
+    const seUsers = await prisma.salesExecutiveProfile.findMany({
+      where: { id: { in: ids } },
+      select: { userId: true },
+    });
     scopeParts.push({
-      salesExecutiveProfileId: {
-        in: assignments.map((a) => a.salesExecutiveProfileId),
-      },
+      OR: [
+        {
+          subjectType: "PROFILE",
+          salesExecutiveProfileId: { in: ids },
+        },
+        {
+          subjectType: "EXECUTIVE",
+          executiveUserId: { in: seUsers.map((p) => p.userId) },
+        },
+      ],
     });
   }
   if (query.search) {
@@ -365,6 +705,14 @@ export async function listSwot(actor: Actor, query: ListSwotQuery) {
             displayName: { contains: query.search, mode: "insensitive" },
           },
         },
+        {
+          executiveUser: {
+            OR: [
+              { firstName: { contains: query.search, mode: "insensitive" } },
+              { lastName: { contains: query.search, mode: "insensitive" } },
+            ],
+          },
+        },
       ],
     });
   }
@@ -377,7 +725,7 @@ export async function listSwot(actor: Actor, query: ListSwotQuery) {
       where,
       skip: (query.page - 1) * query.pageSize,
       take: query.pageSize,
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ createdAt: "desc" }],
       include: swotInclude,
     }),
   ]);
@@ -400,71 +748,26 @@ export async function getSwot(actor: Actor, id: string) {
   return serialize(row, actor);
 }
 
-export async function createSwot(actor: Actor, input: CreateSwotInput) {
-  if (isSuperAdmin(actor)) {
-    throw forbidden("Super Admin has read-only access to SWOT analyses");
-  }
+type PreparedPoints = {
+  strengthPoints: SwotPoint[];
+  weaknessPoints: SwotPoint[];
+  opportunityPoints: SwotPoint[];
+  threatPoints: SwotPoint[];
+  flags: QuadrantFlags;
+  visibleToSalesExecutive: boolean;
+};
 
-  const source = sourceForRole(actor.roleCode);
-  await assertProfileInScope(prisma, actor, input.salesExecutiveProfileId);
-
-  const profile = await prisma.salesExecutiveProfile.findFirstOrThrow({
-    where: { id: input.salesExecutiveProfileId, archivedAt: null },
-  });
-
-  if (actor.roleCode === "SALES_EXECUTIVE" && profile.userId !== actor.id) {
-    throw forbidden(
-      "Sales Executives may only create SWOT for their own profile",
-    );
-  }
-
-  if (actor.roleCode === "TEAM_LEAD") {
-    await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
-      action: "SWOT_CREATE",
-    });
-  }
-
-  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const assignment = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: profile.id,
-        commandoUserId: actor.id,
-        status: "ACTIVE",
-      },
-    });
-    if (!assignment) {
-      throw forbidden(
-        "Commando may only create SWOT for actively assigned profiles",
-      );
-    }
-  }
-
-  const activeAssignment = await prisma.commandoAssignment.findFirst({
-    where: {
-      salesExecutiveProfileId: profile.id,
-      status: "ACTIVE",
-    },
-    select: { id: true },
-  });
-
-  const previous = await prisma.swotAnalysis.findFirst({
-    where: {
-      salesExecutiveProfileId: profile.id,
-      source,
-      archivedAt: null,
-    },
-    orderBy: [{ versionNumber: "desc" }, { createdAt: "desc" }],
-    select: {
-      id: true,
-      versionNumber: true,
-      visibleToSalesExecutive: true,
-      visibleStrength: true,
-      visibleWeakness: true,
-      visibleOpportunity: true,
-      visibleThreat: true,
-    },
-  });
-
+function preparePoints(
+  input: CreateSwotInput,
+  previous: {
+    visibleToSalesExecutive?: boolean | null;
+    visibleStrength?: boolean | null;
+    visibleWeakness?: boolean | null;
+    visibleOpportunity?: boolean | null;
+    visibleThreat?: boolean | null;
+  } | null,
+  forceVisible: boolean,
+): PreparedPoints {
   const previousFlags = previous
     ? flagsFromRow(previous)
     : {
@@ -490,92 +793,498 @@ export async function createSwot(actor: Actor, input: CreateSwotInput) {
           visibleThreat: input.visibleThreat ?? previousFlags.visibleThreat,
         };
 
-  const seAuthor = source === "SALES_EXECUTIVE";
   const shareAll = input.visibleToSalesExecutive === true;
   const strengthPoints = normalizeSwotPoints(
     input.strengthPoints,
     input.strength,
-    seAuthor || shareAll || fromInput.visibleStrength,
+    forceVisible || shareAll || fromInput.visibleStrength,
   );
   const weaknessPoints = normalizeSwotPoints(
     input.weaknessPoints,
     input.weakness,
-    seAuthor || shareAll || fromInput.visibleWeakness,
+    forceVisible || shareAll || fromInput.visibleWeakness,
   );
   const opportunityPoints = normalizeSwotPoints(
     input.opportunityPoints,
     input.opportunity,
-    seAuthor || shareAll || fromInput.visibleOpportunity,
+    forceVisible || shareAll || fromInput.visibleOpportunity,
   );
   const threatPoints = normalizeSwotPoints(
     input.threatPoints,
     input.threat,
-    seAuthor || shareAll || fromInput.visibleThreat,
+    forceVisible || shareAll || fromInput.visibleThreat,
   );
-
   const flags = flagsFromPoints({
     strength: strengthPoints,
     weakness: weaknessPoints,
     opportunity: opportunityPoints,
     threat: threatPoints,
   });
-  const visibleToSalesExecutive = anyQuadrantShared(flags);
+  return {
+    strengthPoints,
+    weaknessPoints,
+    opportunityPoints,
+    threatPoints,
+    flags,
+    visibleToSalesExecutive: forceVisible || anyQuadrantShared(flags),
+  };
+}
+
+async function findPreviousExecutive(
+  executiveUserId: string,
+  source: SwotSource,
+) {
+  return prisma.swotAnalysis.findFirst({
+    where: {
+      subjectType: "EXECUTIVE",
+      executiveUserId,
+      source,
+      archivedAt: null,
+    },
+    orderBy: [{ versionNumber: "desc" }, { createdAt: "desc" }],
+    select: {
+      id: true,
+      versionNumber: true,
+      visibleToSalesExecutive: true,
+      visibleStrength: true,
+      visibleWeakness: true,
+      visibleOpportunity: true,
+      visibleThreat: true,
+    },
+  });
+}
+
+async function findPreviousProfile(profileId: string, source: SwotSource) {
+  return prisma.swotAnalysis.findFirst({
+    where: {
+      subjectType: "PROFILE",
+      salesExecutiveProfileId: profileId,
+      source,
+      archivedAt: null,
+    },
+    orderBy: [{ versionNumber: "desc" }, { createdAt: "desc" }],
+    select: {
+      id: true,
+      versionNumber: true,
+      visibleToSalesExecutive: true,
+      visibleStrength: true,
+      visibleWeakness: true,
+      visibleOpportunity: true,
+      visibleThreat: true,
+    },
+  });
+}
+
+async function createExecutiveSwot(opts: {
+  actor: Actor;
+  source: SwotSource;
+  executiveUserId: string;
+  teamId: string | null;
+  assignmentId: string | null;
+  input: CreateSwotInput;
+  forceVisible: boolean;
+  workspaceProfileId?: string | null;
+}) {
+  const previous = await findPreviousExecutive(opts.executiveUserId, opts.source);
+  const prepared = preparePoints(opts.input, previous, opts.forceVisible);
 
   const created = await prisma.swotAnalysis.create({
     data: {
-      salesExecutiveProfileId: profile.id,
-      teamId: profile.teamId,
-      assignmentId: activeAssignment?.id ?? null,
-      source,
-      strength: joinSwotPoints(strengthPoints),
-      weakness: joinSwotPoints(weaknessPoints),
-      opportunity: joinSwotPoints(opportunityPoints),
-      threat: joinSwotPoints(threatPoints),
-      strengthPoints: pointsToJson(strengthPoints),
-      weaknessPoints: pointsToJson(weaknessPoints),
-      opportunityPoints: pointsToJson(opportunityPoints),
-      threatPoints: pointsToJson(threatPoints),
+      subjectType: "EXECUTIVE",
+      salesExecutiveProfileId: null,
+      executiveUserId: opts.executiveUserId,
+      teamId: opts.teamId,
+      assignmentId: opts.assignmentId,
+      source: opts.source,
+      strength: joinSwotPoints(prepared.strengthPoints),
+      weakness: joinSwotPoints(prepared.weaknessPoints),
+      opportunity: joinSwotPoints(prepared.opportunityPoints),
+      threat: joinSwotPoints(prepared.threatPoints),
+      strengthPoints: pointsToJson(prepared.strengthPoints),
+      weaknessPoints: pointsToJson(prepared.weaknessPoints),
+      opportunityPoints: pointsToJson(prepared.opportunityPoints),
+      threatPoints: pointsToJson(prepared.threatPoints),
       versionNumber: (previous?.versionNumber ?? 0) + 1,
       supersedesId: previous?.id ?? null,
-      visibleToSalesExecutive,
-      visibleStrength: flags.visibleStrength,
-      visibleWeakness: flags.visibleWeakness,
-      visibleOpportunity: flags.visibleOpportunity,
-      visibleThreat: flags.visibleThreat,
-      createdById: actor.id,
+      visibleToSalesExecutive: prepared.visibleToSalesExecutive,
+      visibleStrength: prepared.flags.visibleStrength,
+      visibleWeakness: prepared.flags.visibleWeakness,
+      visibleOpportunity: prepared.flags.visibleOpportunity,
+      visibleThreat: prepared.flags.visibleThreat,
+      createdById: opts.actor.id,
     },
     include: swotInclude,
   });
 
   await writeAuditLog({
-    actorId: actor.id,
+    actorId: opts.actor.id,
     action: "SWOT_CREATED",
     entityType: "SwotAnalysis",
     entityId: created.id,
     metadata: {
-      source,
-      profileId: profile.id,
-      assignmentId: activeAssignment?.id ?? null,
+      source: opts.source,
+      subjectType: "EXECUTIVE",
+      executiveUserId: opts.executiveUserId,
       versionNumber: created.versionNumber,
       supersedesId: previous?.id ?? null,
-      visibleToSalesExecutive,
+      visibleToSalesExecutive: prepared.visibleToSalesExecutive,
+      verb: "CREATE",
+    },
+  });
+
+  if (opts.workspaceProfileId) {
+    await recordWorkspaceEvent({
+      salesExecutiveProfileId: opts.workspaceProfileId,
+      assignmentId: opts.assignmentId,
+      type: "SWOT",
+      title: `Executive SWOT updated · Version ${created.versionNumber}`,
+      notes: `Source: ${opts.source.replaceAll("_", " ")}`,
+      status: "COMPLETED",
+      sourceType: "SwotAnalysis",
+      sourceId: created.id,
+      createdById: opts.actor.id,
+    });
+  }
+
+  return serialize(created, opts.actor);
+}
+
+async function createProfileSwot(opts: {
+  actor: Actor;
+  source: SwotSource;
+  profileId: string;
+  teamId: string;
+  assignmentId: string | null;
+  input: CreateSwotInput;
+}) {
+  const previous = await findPreviousProfile(opts.profileId, opts.source);
+  const prepared = preparePoints(opts.input, previous, false);
+
+  const created = await prisma.swotAnalysis.create({
+    data: {
+      subjectType: "PROFILE",
+      salesExecutiveProfileId: opts.profileId,
+      executiveUserId: null,
+      teamId: opts.teamId,
+      assignmentId: opts.assignmentId,
+      source: opts.source,
+      strength: joinSwotPoints(prepared.strengthPoints),
+      weakness: joinSwotPoints(prepared.weaknessPoints),
+      opportunity: joinSwotPoints(prepared.opportunityPoints),
+      threat: joinSwotPoints(prepared.threatPoints),
+      strengthPoints: pointsToJson(prepared.strengthPoints),
+      weaknessPoints: pointsToJson(prepared.weaknessPoints),
+      opportunityPoints: pointsToJson(prepared.opportunityPoints),
+      threatPoints: pointsToJson(prepared.threatPoints),
+      versionNumber: (previous?.versionNumber ?? 0) + 1,
+      supersedesId: previous?.id ?? null,
+      visibleToSalesExecutive: prepared.visibleToSalesExecutive,
+      visibleStrength: prepared.flags.visibleStrength,
+      visibleWeakness: prepared.flags.visibleWeakness,
+      visibleOpportunity: prepared.flags.visibleOpportunity,
+      visibleThreat: prepared.flags.visibleThreat,
+      createdById: opts.actor.id,
+    },
+    include: swotInclude,
+  });
+
+  await writeAuditLog({
+    actorId: opts.actor.id,
+    action: "SWOT_CREATED",
+    entityType: "SwotAnalysis",
+    entityId: created.id,
+    metadata: {
+      source: opts.source,
+      subjectType: "PROFILE",
+      profileId: opts.profileId,
+      assignmentId: opts.assignmentId,
+      versionNumber: created.versionNumber,
+      supersedesId: previous?.id ?? null,
+      visibleToSalesExecutive: prepared.visibleToSalesExecutive,
       verb: "CREATE",
     },
   });
 
   await recordWorkspaceEvent({
-    salesExecutiveProfileId: profile.id,
-    assignmentId: activeAssignment?.id ?? null,
+    salesExecutiveProfileId: opts.profileId,
+    assignmentId: opts.assignmentId,
     type: "SWOT",
-    title: `SWOT updated · Version ${created.versionNumber}`,
-    notes: `Source: ${source.replaceAll("_", " ")}`,
+    title: `Profile SWOT updated · Version ${created.versionNumber}`,
+    notes: `Source: ${opts.source.replaceAll("_", " ")}`,
     status: "COMPLETED",
     sourceType: "SwotAnalysis",
     sourceId: created.id,
-    createdById: actor.id,
+    createdById: opts.actor.id,
   });
 
-  return serialize(created, actor);
+  return serialize(created, opts.actor);
+}
+
+export async function createSwot(actor: Actor, input: CreateSwotInput) {
+  if (isSuperAdmin(actor)) {
+    throw forbidden("Super Admin has read-only access to SWOT analyses");
+  }
+
+  const source = sourceForRole(actor.roleCode);
+  const executiveId = inputExecutiveId(input);
+
+  // ── Self Executive SWOT (SE / SSE) ─────────────────────────────
+  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+    if (input.subjectType === "PROFILE") {
+      throw forbidden("Sales Support cannot create Profile SWOT");
+    }
+    if (input.salesExecutiveProfileId) {
+      throw forbidden("Sales Support may only create Self Executive SWOT");
+    }
+    if (executiveId && executiveId !== actor.id) {
+      throw forbidden("Sales Support may only create Self SWOT for themselves");
+    }
+    return createExecutiveSwot({
+      actor,
+      source: "SALES_SUPPORT_EXECUTIVE",
+      executiveUserId: actor.id,
+      teamId: null,
+      assignmentId: null,
+      input,
+      forceVisible: true,
+    });
+  }
+
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    if (input.subjectType === "PROFILE") {
+      throw forbidden("Sales Executives cannot create Profile SWOT");
+    }
+    const profile = await prisma.salesExecutiveProfile.findFirst({
+      where: { userId: actor.id, archivedAt: null },
+    });
+    if (!profile) throw forbidden("No Sales Executive profile found");
+    if (
+      input.salesExecutiveProfileId &&
+      input.salesExecutiveProfileId !== profile.id
+    ) {
+      throw forbidden(
+        "Sales Executives may only create SWOT for themselves",
+      );
+    }
+    if (executiveId && executiveId !== actor.id) {
+      throw forbidden(
+        "Sales Executives may only create SWOT for themselves",
+      );
+    }
+    return createExecutiveSwot({
+      actor,
+      source: "SALES_EXECUTIVE",
+      executiveUserId: actor.id,
+      teamId: profile.teamId,
+      assignmentId: null,
+      input,
+      forceVisible: true,
+      workspaceProfileId: profile.id,
+    });
+  }
+
+  // ── Managers: PROFILE SWOT ─────────────────────────────────────
+  const wantsProfile =
+    input.subjectType === "PROFILE" ||
+    (input.subjectType === undefined &&
+      Boolean(input.salesExecutiveProfileId) &&
+      !executiveId &&
+      false); // never default managers to PROFILE without explicit subjectType
+
+  if (input.subjectType === "PROFILE" || wantsProfile) {
+    if (
+      actor.roleCode !== "TEAM_LEAD" &&
+      actor.roleCode !== "COMMANDO_EXECUTIVE"
+    ) {
+      throw forbidden("Only Team Leads and Commandos can create Profile SWOT");
+    }
+    if (!input.salesExecutiveProfileId) {
+      throw badRequest("salesExecutiveProfileId is required for Profile SWOT");
+    }
+    await assertProfileInScope(prisma, actor, input.salesExecutiveProfileId);
+    const profile = await prisma.salesExecutiveProfile.findFirstOrThrow({
+      where: { id: input.salesExecutiveProfileId, archivedAt: null },
+    });
+    if (actor.roleCode === "TEAM_LEAD") {
+      await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
+        action: "SWOT_CREATE",
+      });
+    }
+    if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+      const assignment = await prisma.commandoAssignment.findFirst({
+        where: {
+          salesExecutiveProfileId: profile.id,
+          commandoUserId: actor.id,
+          status: "ACTIVE",
+        },
+      });
+      if (!assignment) {
+        throw forbidden(
+          "Commando may only create Profile SWOT for actively assigned profiles",
+        );
+      }
+    }
+    const activeAssignment = await prisma.commandoAssignment.findFirst({
+      where: { salesExecutiveProfileId: profile.id, status: "ACTIVE" },
+      select: { id: true },
+    });
+    return createProfileSwot({
+      actor,
+      source,
+      profileId: profile.id,
+      teamId: profile.teamId,
+      assignmentId: activeAssignment?.id ?? null,
+      input,
+    });
+  }
+
+  // ── Managers: EXECUTIVE SWOT about SSE (by user id) ────────────
+  if (executiveId) {
+    if (
+      actor.roleCode !== "TEAM_LEAD" &&
+      actor.roleCode !== "COMMANDO_EXECUTIVE"
+    ) {
+      throw forbidden("Only Team Leads and Commandos can create SWOT for others");
+    }
+
+    const subjectUser = await prisma.user.findFirst({
+      where: {
+        id: executiveId,
+        deletedAt: null,
+        isActive: true,
+      },
+      select: {
+        id: true,
+        role: { select: { code: true } },
+        salesExecutiveProfile: {
+          select: { id: true, teamId: true, archivedAt: true },
+        },
+      },
+    });
+    if (!subjectUser) throw badRequest("Executive user not found");
+
+    if (subjectUser.role.code === "SALES_SUPPORT_EXECUTIVE") {
+      if (actor.roleCode === "TEAM_LEAD") {
+        await assertSseInTeamLeadScope(actor, executiveId);
+      } else {
+        await assertSseInCommandoScope(actor, executiveId, true);
+      }
+      let teamId: string | null = null;
+      const profileIds =
+        actor.roleCode === "TEAM_LEAD"
+          ? await teamLeadProfileIds(actor.id)
+          : await commandoProfileIds(actor.id, true);
+      const link = await prisma.salesSupportLink.findFirst({
+        where: {
+          salesSupportUserId: executiveId,
+          isActive: true,
+          salesExecutiveProfileId: { in: profileIds },
+        },
+        include: { profile: { select: { teamId: true } } },
+      });
+      teamId = link?.profile.teamId ?? null;
+      return createExecutiveSwot({
+        actor,
+        source,
+        executiveUserId: executiveId,
+        teamId,
+        assignmentId: null,
+        input,
+        forceVisible: false,
+      });
+    }
+
+    if (subjectUser.role.code === "SALES_EXECUTIVE") {
+      const profile = subjectUser.salesExecutiveProfile;
+      if (!profile || profile.archivedAt) {
+        throw badRequest("Sales Executive has no active profile");
+      }
+      await assertProfileInScope(prisma, actor, profile.id);
+      if (actor.roleCode === "TEAM_LEAD") {
+        await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
+          action: "SWOT_CREATE",
+        });
+      }
+      if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+        const assignment = await prisma.commandoAssignment.findFirst({
+          where: {
+            salesExecutiveProfileId: profile.id,
+            commandoUserId: actor.id,
+            status: "ACTIVE",
+          },
+        });
+        if (!assignment) {
+          throw forbidden(
+            "Commando may only create SWOT for actively assigned profiles",
+          );
+        }
+      }
+      const activeAssignment = await prisma.commandoAssignment.findFirst({
+        where: { salesExecutiveProfileId: profile.id, status: "ACTIVE" },
+        select: { id: true },
+      });
+      return createExecutiveSwot({
+        actor,
+        source,
+        executiveUserId: executiveId,
+        teamId: profile.teamId,
+        assignmentId: activeAssignment?.id ?? null,
+        input,
+        forceVisible: false,
+        workspaceProfileId: profile.id,
+      });
+    }
+
+    throw badRequest("SWOT subject must be a Sales Executive or Sales Support");
+  }
+
+  // ── Managers: EXECUTIVE SWOT via profile id (resolve person) ───
+  if (input.salesExecutiveProfileId) {
+    await assertProfileInScope(prisma, actor, input.salesExecutiveProfileId);
+    const profile = await prisma.salesExecutiveProfile.findFirstOrThrow({
+      where: { id: input.salesExecutiveProfileId, archivedAt: null },
+    });
+
+    if (actor.roleCode === "TEAM_LEAD") {
+      await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
+        action: "SWOT_CREATE",
+      });
+    }
+    if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+      const assignment = await prisma.commandoAssignment.findFirst({
+        where: {
+          salesExecutiveProfileId: profile.id,
+          commandoUserId: actor.id,
+          status: "ACTIVE",
+        },
+      });
+      if (!assignment) {
+        throw forbidden(
+          "Commando may only create SWOT for actively assigned profiles",
+        );
+      }
+    }
+
+    const activeAssignment = await prisma.commandoAssignment.findFirst({
+      where: { salesExecutiveProfileId: profile.id, status: "ACTIVE" },
+      select: { id: true },
+    });
+
+    return createExecutiveSwot({
+      actor,
+      source,
+      executiveUserId: profile.userId,
+      teamId: profile.teamId,
+      assignmentId: activeAssignment?.id ?? null,
+      input,
+      forceVisible: false,
+      workspaceProfileId: profile.id,
+    });
+  }
+
+  throw badRequest(
+    "Provide subjectType PROFILE with salesExecutiveProfileId, or Executive subject via executiveUserId / salesExecutiveProfileId",
+  );
 }
 
 export async function setSwotVisibility(
@@ -657,7 +1366,9 @@ export async function setSwotVisibility(
       visibleToSalesExecutive,
       ...flags,
       source: updated.source,
+      subjectType: updated.subjectType,
       profileId: updated.salesExecutiveProfileId,
+      executiveUserId: updated.executiveUserId,
       verb: "UPDATE",
     },
   });

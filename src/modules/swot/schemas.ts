@@ -12,7 +12,18 @@ const pointsList = z.array(swotPointInput).min(1).max(40);
 
 export const createSwotSchema = z
   .object({
-    salesExecutiveProfileId: z.string().trim().min(1).max(64),
+    /**
+     * What the SWOT is about.
+     * EXECUTIVE = person; PROFILE = sales profile/workspace.
+     * Defaults: self SWOT → EXECUTIVE; packet creates PROFILE explicitly.
+     */
+    subjectType: z.enum(["EXECUTIVE", "PROFILE"]).optional(),
+    /** PROFILE subject — sales profile id */
+    salesExecutiveProfileId: z.string().trim().min(1).max(64).optional(),
+    /** EXECUTIVE subject — person User.id */
+    executiveUserId: z.string().trim().min(1).max(64).optional(),
+    /** @deprecated Alias for executiveUserId (SSE / older clients) */
+    subjectUserId: z.string().trim().min(1).max(64).optional(),
     strength: text.optional(),
     weakness: text.optional(),
     opportunity: text.optional(),
@@ -21,7 +32,7 @@ export const createSwotSchema = z
     weaknessPoints: pointsList.optional(),
     opportunityPoints: pointsList.optional(),
     threatPoints: pointsList.optional(),
-    /** TL/Commando only — share every point with the Sales Executive. */
+    /** TL/Commando only — share every point with the subject executive. */
     visibleToSalesExecutive: z.boolean().optional(),
     visibleStrength: z.boolean().optional(),
     visibleWeakness: z.boolean().optional(),
@@ -30,6 +41,55 @@ export const createSwotSchema = z
   })
   .strict()
   .superRefine((v, ctx) => {
+    const executiveId = v.executiveUserId ?? v.subjectUserId;
+    if (v.executiveUserId && v.subjectUserId && v.executiveUserId !== v.subjectUserId) {
+      ctx.addIssue({
+        code: "custom",
+        message: "executiveUserId and subjectUserId must match when both provided",
+        path: ["subjectUserId"],
+      });
+    }
+
+    const subjectType = v.subjectType;
+    if (subjectType === "PROFILE") {
+      if (!v.salesExecutiveProfileId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "salesExecutiveProfileId is required for Profile SWOT",
+          path: ["salesExecutiveProfileId"],
+        });
+      }
+      if (executiveId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "Profile SWOT cannot include executiveUserId",
+          path: ["executiveUserId"],
+        });
+      }
+    } else if (subjectType === "EXECUTIVE") {
+      // May resolve person from salesExecutiveProfileId for SE executives
+      if (!executiveId && !v.salesExecutiveProfileId) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "Provide executiveUserId (or salesExecutiveProfileId to resolve the person) for Executive SWOT",
+          path: ["executiveUserId"],
+        });
+      }
+    } else {
+      // Unspecified: XOR between profile and executive ids (legacy clients)
+      const hasProfile = Boolean(v.salesExecutiveProfileId);
+      const hasExecutive = Boolean(executiveId);
+      if (hasProfile && hasExecutive) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "Provide either salesExecutiveProfileId or executiveUserId, not both (or set subjectType)",
+          path: ["executiveUserId"],
+        });
+      }
+    }
+
     const quadrants = [
       ["strength", v.strength, v.strengthPoints],
       ["weakness", v.weakness, v.weaknessPoints],
@@ -49,7 +109,6 @@ export const createSwotSchema = z
 
 export const setSwotVisibilitySchema = z
   .object({
-    /** Shorthand: share or hide every point. */
     visibleToSalesExecutive: z.boolean().optional(),
     visibleStrength: z.boolean().optional(),
     visibleWeakness: z.boolean().optional(),
@@ -79,8 +138,19 @@ export const listSwotQuerySchema = z.object({
   search: z.string().trim().optional(),
   teamId: z.string().optional(),
   profileId: z.string().optional(),
+  executiveUserId: z.string().optional(),
+  /** @deprecated Alias for executiveUserId */
+  subjectUserId: z.string().optional(),
+  subjectType: z.enum(["EXECUTIVE", "PROFILE"]).optional(),
   commandoUserId: z.string().optional(),
-  source: z.enum(["TEAM_LEAD", "COMMANDO", "SALES_EXECUTIVE"]).optional(),
+  source: z
+    .enum([
+      "TEAM_LEAD",
+      "COMMANDO",
+      "SALES_EXECUTIVE",
+      "SALES_SUPPORT_EXECUTIVE",
+    ])
+    .optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 });

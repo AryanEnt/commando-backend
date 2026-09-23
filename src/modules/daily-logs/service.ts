@@ -9,6 +9,11 @@ import {
   notFound,
 } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import {
+  assertCanManageSupportUser,
+  supportUserIdsOnTeams,
+  teamIdsForCommandoActive,
+} from "../../lib/supportScope.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import { recordWorkspaceEvent, eisenhowerCategoryFrom } from "../../lib/workspaceEvents.js";
 import type {
@@ -32,6 +37,15 @@ const entryInclude = {
 const logInclude = {
   profile: {
     select: { id: true, displayName: true, userId: true, teamId: true },
+  },
+  executiveUser: {
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+      role: { select: { code: true } },
+    },
   },
   createdBy: {
     select: { id: true, firstName: true, lastName: true, email: true },
@@ -99,6 +113,8 @@ function serialize(row: LogRow) {
     id: row.id,
     salesExecutiveProfileId: row.salesExecutiveProfileId,
     profile: row.profile,
+    executiveUserId: row.executiveUserId,
+    executiveUser: row.executiveUser,
     assignmentId: row.assignmentId,
     assignment: row.assignment,
     logDate: row.logDate,
@@ -127,24 +143,40 @@ async function scopeWhere(actor: Actor): Promise<Prisma.DailyLogWhereInput> {
     return { archivedAt: null };
   }
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const profileIds = await assignedProfileIds(actor.id);
+    const [profileIds, teamIds] = await Promise.all([
+      assignedProfileIds(actor.id),
+      teamIdsForCommandoActive(prisma, actor.id),
+    ]);
+    const supportIds = await supportUserIdsOnTeams(prisma, teamIds);
     return {
       archivedAt: null,
       OR: [
         { createdById: actor.id },
         { salesExecutiveProfileId: { in: profileIds } },
+        ...(supportIds.length > 0
+          ? [{ executiveUserId: { in: supportIds } }]
+          : []),
       ],
     };
   }
   if (actor.roleCode === "TEAM_LEAD") {
     const teamIds = await getActiveTeamIds(prisma, actor.id);
+    const supportIds = await supportUserIdsOnTeams(prisma, teamIds);
     return {
       archivedAt: null,
-      profile: { teamId: { in: teamIds } },
+      OR: [
+        { profile: { teamId: { in: teamIds } } },
+        ...(supportIds.length > 0
+          ? [{ executiveUserId: { in: supportIds } }]
+          : []),
+      ],
     };
   }
   if (actor.roleCode === "SALES_EXECUTIVE") {
     return { archivedAt: null, profile: { userId: actor.id } };
+  }
+  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+    return { archivedAt: null, executiveUserId: actor.id };
   }
   return { id: "__none__" };
 }
@@ -154,29 +186,43 @@ async function assertCanAccessLog(actor: Actor, row: LogRow): Promise<void> {
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
     if (row.createdById === actor.id) return;
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
-      throw forbidden("Log is outside your assignment scope");
+    if (row.salesExecutiveProfileId) {
+      const assigned = await prisma.commandoAssignment.findFirst({
+        where: {
+          salesExecutiveProfileId: row.salesExecutiveProfileId,
+          commandoUserId: actor.id,
+        },
+        select: { id: true },
+      });
+      if (assigned) return;
     }
-    return;
+    if (row.executiveUserId) {
+      const teamIds = await teamIdsForCommandoActive(prisma, actor.id);
+      const supportIds = await supportUserIdsOnTeams(prisma, teamIds);
+      if (supportIds.includes(row.executiveUserId)) return;
+    }
+    throw forbidden("Log is outside your assignment scope");
   }
 
   if (actor.roleCode === "TEAM_LEAD") {
     const teamIds = await getActiveTeamIds(prisma, actor.id);
-    if (!teamIds.includes(row.profile.teamId)) {
-      throw forbidden("Log is outside your team scope");
+    if (row.profile && teamIds.includes(row.profile.teamId)) return;
+    if (row.executiveUserId) {
+      const supportIds = await supportUserIdsOnTeams(prisma, teamIds);
+      if (supportIds.includes(row.executiveUserId)) return;
+    }
+    throw forbidden("Log is outside your team scope");
+  }
+
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    if (!row.profile || row.profile.userId !== actor.id) {
+      throw forbidden("You may only view your own daily logs");
     }
     return;
   }
 
-  if (actor.roleCode === "SALES_EXECUTIVE") {
-    if (row.profile.userId !== actor.id) {
+  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+    if (row.executiveUserId !== actor.id) {
       throw forbidden("You may only view your own daily logs");
     }
     return;
@@ -185,10 +231,10 @@ async function assertCanAccessLog(actor: Actor, row: LogRow): Promise<void> {
   throw forbidden("Not allowed to access daily logs");
 }
 
-async function assertCanWriteProfile(
+async function assertCanWriteLogSubject(
   actor: Actor,
-  profileId: string,
-): Promise<{ assignmentId: string | null; teamId: string }> {
+  subject: { profileId?: string | null; executiveUserId?: string | null },
+): Promise<{ assignmentId: string | null }> {
   if (isSuperAdmin(actor)) {
     throw forbidden("Super Admin is read-only for daily coaching logs");
   }
@@ -199,8 +245,21 @@ async function assertCanWriteProfile(
     throw forbidden("Not allowed to create daily coaching logs");
   }
 
+  const profileId = subject.profileId ?? undefined;
+  const executiveUserId = subject.executiveUserId ?? undefined;
+  if (Boolean(profileId) === Boolean(executiveUserId)) {
+    throw badRequest(
+      "Provide exactly one of salesExecutiveProfileId or executiveUserId",
+    );
+  }
+
+  if (executiveUserId) {
+    await assertCanManageSupportUser(prisma, actor, executiveUserId);
+    return { assignmentId: null };
+  }
+
   const profile = await prisma.salesExecutiveProfile.findFirst({
-    where: { id: profileId, archivedAt: null },
+    where: { id: profileId!, archivedAt: null },
     select: { id: true, teamId: true },
   });
   if (!profile) throw notFound("Sales executive profile not found");
@@ -213,7 +272,7 @@ async function assertCanWriteProfile(
     await assertTeamLeadOperationalWriteAllowed(prisma, actor, profile.id, {
       action: "DAILY_LOG_CREATE",
     });
-    return { assignmentId: null, teamId: profile.teamId };
+    return { assignmentId: null };
   }
 
   const assignment = await prisma.commandoAssignment.findFirst({
@@ -228,7 +287,7 @@ async function assertCanWriteProfile(
       "You may only create logs for profiles with an active assignment to you",
     );
   }
-  return { assignmentId: assignment.id, teamId: profile.teamId };
+  return { assignmentId: assignment.id };
 }
 
 async function loadLog(id: string): Promise<LogRow> {
@@ -247,6 +306,9 @@ export async function listDailyLogs(actor: Actor, query: ListDailyLogsQuery) {
       scope,
       ...(query.profileId
         ? [{ salesExecutiveProfileId: query.profileId }]
+        : []),
+      ...(query.executiveUserId
+        ? [{ executiveUserId: query.executiveUserId }]
         : []),
       ...(query.status ? [{ status: query.status }] : []),
       ...(query.dateFrom || query.dateTo
@@ -273,6 +335,30 @@ export async function listDailyLogs(actor: Actor, query: ListDailyLogsQuery) {
                       contains: query.search,
                       mode: "insensitive" as const,
                     },
+                  },
+                },
+                {
+                  executiveUser: {
+                    OR: [
+                      {
+                        firstName: {
+                          contains: query.search,
+                          mode: "insensitive" as const,
+                        },
+                      },
+                      {
+                        lastName: {
+                          contains: query.search,
+                          mode: "insensitive" as const,
+                        },
+                      },
+                      {
+                        email: {
+                          contains: query.search,
+                          mode: "insensitive" as const,
+                        },
+                      },
+                    ],
                   },
                 },
                 {
@@ -330,8 +416,14 @@ export async function getDailyLog(actor: Actor, id: string) {
 /** Previous-day (and older) DRAFT logs that still need submission. */
 export async function listAttentionDailyLogs(
   actor: Actor,
-  profileId: string,
+  opts: { profileId?: string; executiveUserId?: string },
 ) {
+  const hasProfile = Boolean(opts.profileId);
+  const hasExecutive = Boolean(opts.executiveUserId);
+  if (hasProfile === hasExecutive) {
+    throw badRequest("Provide exactly one of profileId or executiveUserId");
+  }
+
   const scope = await scopeWhere(actor);
   const today = calendarDateOnly();
   const rows = await prisma.dailyLog.findMany({
@@ -340,7 +432,12 @@ export async function listAttentionDailyLogs(
         scope,
         {
           archivedAt: null,
-          salesExecutiveProfileId: profileId,
+          ...(opts.profileId
+            ? { salesExecutiveProfileId: opts.profileId }
+            : {}),
+          ...(opts.executiveUserId
+            ? { executiveUserId: opts.executiveUserId }
+            : {}),
           status: "DRAFT",
           logDate: { lt: today },
         },
@@ -353,19 +450,23 @@ export async function listAttentionDailyLogs(
 }
 
 /**
- * Get or create today's (or given day's) DRAFT Daily Log for the SE.
- * Never creates a second log for the same profile + date.
+ * Get or create today's (or given day's) DRAFT Daily Log for the SE or Support subject.
+ * Never creates a second log for the same subject + date.
  */
 export async function ensureDailyLog(actor: Actor, input: EnsureDailyLogInput) {
-  const { assignmentId } = await assertCanWriteProfile(
-    actor,
-    input.salesExecutiveProfileId,
-  );
+  const { assignmentId } = await assertCanWriteLogSubject(actor, {
+    profileId: input.salesExecutiveProfileId,
+    executiveUserId: input.executiveUserId,
+  });
   const logDate = parseLogDateInput(input.logDate);
+
+  const subjectWhere = input.salesExecutiveProfileId
+    ? { salesExecutiveProfileId: input.salesExecutiveProfileId }
+    : { executiveUserId: input.executiveUserId! };
 
   const existing = await prisma.dailyLog.findFirst({
     where: {
-      salesExecutiveProfileId: input.salesExecutiveProfileId,
+      ...subjectWhere,
       logDate,
       archivedAt: null,
     },
@@ -379,7 +480,8 @@ export async function ensureDailyLog(actor: Actor, input: EnsureDailyLogInput) {
   try {
     const created = await prisma.dailyLog.create({
       data: {
-        salesExecutiveProfileId: input.salesExecutiveProfileId,
+        salesExecutiveProfileId: input.salesExecutiveProfileId ?? null,
+        executiveUserId: input.executiveUserId ?? null,
         assignmentId,
         logDate,
         status: "DRAFT",
@@ -394,7 +496,8 @@ export async function ensureDailyLog(actor: Actor, input: EnsureDailyLogInput) {
         entityType: "DailyLog",
         entityId: created.id,
         metadata: {
-          profileId: input.salesExecutiveProfileId,
+          profileId: input.salesExecutiveProfileId ?? null,
+          executiveUserId: input.executiveUserId ?? null,
           logDate: logDate.toISOString().slice(0, 10),
         },
       },
@@ -410,7 +513,7 @@ export async function ensureDailyLog(actor: Actor, input: EnsureDailyLogInput) {
     ) {
       const again = await prisma.dailyLog.findFirst({
         where: {
-          salesExecutiveProfileId: input.salesExecutiveProfileId,
+          ...subjectWhere,
           logDate,
           archivedAt: null,
         },
@@ -429,7 +532,10 @@ export async function addDailyLogEntry(
 ) {
   const log = await loadLog(logId);
   await assertCanAccessLog(actor, log);
-  await assertCanWriteProfile(actor, log.salesExecutiveProfileId);
+  await assertCanWriteLogSubject(actor, {
+    profileId: log.salesExecutiveProfileId,
+    executiveUserId: log.executiveUserId,
+  });
 
   if (log.status !== "DRAFT") {
     throw badRequest("Submitted daily logs are read-only");
@@ -485,7 +591,10 @@ export async function updateDailyLogEntry(
 ) {
   const log = await loadLog(logId);
   await assertCanAccessLog(actor, log);
-  await assertCanWriteProfile(actor, log.salesExecutiveProfileId);
+  await assertCanWriteLogSubject(actor, {
+    profileId: log.salesExecutiveProfileId,
+    executiveUserId: log.executiveUserId,
+  });
 
   if (log.status !== "DRAFT") {
     throw badRequest("Submitted daily logs are read-only");
@@ -532,7 +641,10 @@ export async function deleteDailyLogEntry(
 ) {
   const log = await loadLog(logId);
   await assertCanAccessLog(actor, log);
-  await assertCanWriteProfile(actor, log.salesExecutiveProfileId);
+  await assertCanWriteLogSubject(actor, {
+    profileId: log.salesExecutiveProfileId,
+    executiveUserId: log.executiveUserId,
+  });
 
   if (log.status !== "DRAFT") {
     throw badRequest("Submitted daily logs are read-only");
@@ -547,7 +659,8 @@ export async function deleteDailyLogEntry(
 
 /**
  * Submit Daily Log with optional Eisenhower classifications.
- * Only classified entries become Eisenhower tasks (all four quadrants).
+ * Only classified SE entries become Eisenhower tasks (all four quadrants).
+ * Support subjects store urgency/importance/category without creating tasks.
  * Unclassified entries remain in history only.
  */
 export async function submitDailyLog(
@@ -557,7 +670,10 @@ export async function submitDailyLog(
 ) {
   const log = await loadLog(logId);
   await assertCanAccessLog(actor, log);
-  await assertCanWriteProfile(actor, log.salesExecutiveProfileId);
+  await assertCanWriteLogSubject(actor, {
+    profileId: log.salesExecutiveProfileId,
+    executiveUserId: log.executiveUserId,
+  });
 
   if (log.status === "SUBMITTED") {
     throw conflict("Daily log is already submitted");
@@ -621,11 +737,25 @@ export async function submitDailyLog(
         continue;
       }
 
+      const category = eisenhowerCategoryFrom(cls.urgency, cls.importance);
+
+      // Support subjects: store classification only (no EisenhowerTask)
+      if (!locked.salesExecutiveProfileId) {
+        await tx.dailyLogEntry.update({
+          where: { id: entry.id },
+          data: {
+            urgency: cls.urgency,
+            importance: cls.importance,
+            eisenhowerCategory: category,
+          },
+        });
+        continue;
+      }
+
       const notes = [entry.observation, entry.followUp]
         .filter(Boolean)
         .join("\n\n");
 
-      const category = eisenhowerCategoryFrom(cls.urgency, cls.importance);
       const now = new Date();
       const month = new Date(
         Date.UTC(now.getFullYear(), now.getMonth(), 1),
@@ -695,21 +825,23 @@ export async function submitDailyLog(
     });
   });
 
-  // Workspace events for each entry (outside txn is OK for timeline)
+  // Workspace events for SE entries only (outside txn is OK for timeline)
   const refreshed = await loadLog(logId);
-  for (const entry of refreshed.entries) {
-    await recordWorkspaceEvent({
-      salesExecutiveProfileId: refreshed.salesExecutiveProfileId,
-      assignmentId: refreshed.assignmentId,
-      type: "DAILY_LOG",
-      title: entry.sessionTitle,
-      notes: entry.observation,
-      urgency: entry.urgency ?? undefined,
-      importance: entry.importance ?? undefined,
-      sourceType: "DailyLogEntry",
-      sourceId: entry.id,
-      createdById: actor.id,
-    });
+  if (refreshed.salesExecutiveProfileId) {
+    for (const entry of refreshed.entries) {
+      await recordWorkspaceEvent({
+        salesExecutiveProfileId: refreshed.salesExecutiveProfileId,
+        assignmentId: refreshed.assignmentId,
+        type: "DAILY_LOG",
+        title: entry.sessionTitle,
+        notes: entry.observation,
+        urgency: entry.urgency ?? undefined,
+        importance: entry.importance ?? undefined,
+        sourceType: "DailyLogEntry",
+        sourceId: entry.id,
+        createdById: actor.id,
+      });
+    }
   }
 
   return {
@@ -726,6 +858,7 @@ export async function submitDailyLog(
 export async function createDailyLog(actor: Actor, input: CreateDailyLogInput) {
   const log = await ensureDailyLog(actor, {
     salesExecutiveProfileId: input.salesExecutiveProfileId,
+    executiveUserId: input.executiveUserId,
   });
   return addDailyLogEntry(actor, log.id, {
     activityTypeId: input.activityTypeId,

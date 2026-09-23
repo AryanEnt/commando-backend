@@ -30,12 +30,19 @@ export async function listAttentionDailyLogs(
   next: NextFunction,
 ): Promise<void> {
   try {
-    const profileId = String(req.query.profileId ?? "");
-    if (!profileId) throw badRequest("profileId is required");
-    const result = await service.listAttentionDailyLogs(
-      req.user as Actor,
-      profileId,
-    );
+    const profileId =
+      typeof req.query.profileId === "string" ? req.query.profileId : "";
+    const executiveUserId =
+      typeof req.query.executiveUserId === "string"
+        ? req.query.executiveUserId
+        : "";
+    if (Boolean(profileId) === Boolean(executiveUserId)) {
+      throw badRequest("Provide exactly one of profileId or executiveUserId");
+    }
+    const result = await service.listAttentionDailyLogs(req.user as Actor, {
+      ...(profileId ? { profileId } : {}),
+      ...(executiveUserId ? { executiveUserId } : {}),
+    });
     res.status(200).json({ data: result });
   } catch (err) {
     next(err);

@@ -132,6 +132,24 @@ export async function getEffectiveChecklist(
   }
 }
 
+export async function getEffectiveChecklistForExecutive(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = effectiveChecklistQuerySchema.parse(req.query);
+    const result = await service.getEffectiveChecklistForExecutive(
+      req.user as Actor,
+      paramId(req.params.userId),
+      query.categoryId,
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function addSeChecklistItem(
   req: Request,
   res: Response,
@@ -141,6 +159,23 @@ export async function addSeChecklistItem(
     const result = await service.addSeChecklistItem(
       req.user as Actor,
       paramId(req.params.profileId),
+      req.body,
+    );
+    res.status(result.persisted ? 201 : 200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function addSeChecklistItemForExecutive(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.addSeChecklistItemForExecutive(
+      req.user as Actor,
+      paramId(req.params.userId),
       req.body,
     );
     res.status(result.persisted ? 201 : 200).json({ data: result });
@@ -166,6 +201,23 @@ export async function removeSeChecklistItem(
   }
 }
 
+export async function removeSeChecklistItemForExecutive(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const item = await service.removeSeChecklistItemForExecutive(
+      req.user as Actor,
+      paramId(req.params.userId),
+      paramId(req.params.itemId),
+    );
+    res.status(200).json({ data: { item } });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function removeTemplateItemFromSe(
   req: Request,
   res: Response,
@@ -183,6 +235,23 @@ export async function removeTemplateItemFromSe(
   }
 }
 
+export async function removeTemplateItemFromExecutive(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const item = await service.removeTemplateItemFromExecutive(
+      req.user as Actor,
+      paramId(req.params.userId),
+      req.body,
+    );
+    res.status(200).json({ data: { item } });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function restoreTemplateItemForSe(
   req: Request,
   res: Response,
@@ -192,6 +261,57 @@ export async function restoreTemplateItemForSe(
     const result = await service.restoreTemplateItemForSe(
       req.user as Actor,
       paramId(req.params.profileId),
+      req.body,
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function restoreTemplateItemForExecutive(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.restoreTemplateItemForExecutive(
+      req.user as Actor,
+      paramId(req.params.userId),
+      req.body,
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function saveSeChecklistWeights(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.saveSeChecklistWeights(
+      req.user as Actor,
+      paramId(req.params.profileId),
+      req.body,
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function saveSeChecklistWeightsForExecutive(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.saveSeChecklistWeightsForExecutive(
+      req.user as Actor,
+      paramId(req.params.userId),
       req.body,
     );
     res.status(200).json({ data: result });

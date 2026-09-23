@@ -19,7 +19,8 @@ const minutesMeta = z
 
 export const createWeeklyReviewSchema = z
   .object({
-    salesExecutiveProfileId: z.string().cuid(),
+    salesExecutiveProfileId: z.string().cuid().optional(),
+    executiveUserId: z.string().cuid().optional(),
     weekLabel: z.string().trim().min(1).max(64),
     weekStartDate: z.coerce.date(),
     meetingDate: z.coerce.date(),
@@ -47,6 +48,16 @@ export const createWeeklyReviewSchema = z
   })
   .strict()
   .superRefine((val, ctx) => {
+    const hasProfile = Boolean(val.salesExecutiveProfileId);
+    const hasExecutive = Boolean(val.executiveUserId);
+    if (hasProfile === hasExecutive) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Provide exactly one of salesExecutiveProfileId or executiveUserId",
+        path: hasProfile ? ["executiveUserId"] : ["salesExecutiveProfileId"],
+      });
+    }
     const fromList = (val.nextWeekActions ?? [])
       .map((s) => s.trim())
       .filter(Boolean);
@@ -78,6 +89,7 @@ export const listWeeklyReviewsQuerySchema = z.object({
   search: z.string().trim().optional(),
   status: z.enum(["DRAFT", "SUBMITTED"]).optional(),
   profileId: z.string().optional(),
+  executiveUserId: z.string().optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
 });

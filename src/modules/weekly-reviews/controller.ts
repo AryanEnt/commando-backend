@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import type { Actor } from "../../lib/authorization.js";
 import { badRequest } from "../../lib/errors.js";
-import { listWeeklyReviewsQuerySchema, weeklyReviewHubQuerySchema } from "./schemas.js";
+import { listWeeklyReviewsQuerySchema, weeklyReviewHubQuerySchema, createWeeklyReviewSchema } from "./schemas.js";
 import * as service from "./service.js";
 
 function paramId(value: string | string[] | undefined): string {
@@ -60,7 +60,8 @@ export async function createWeeklyReview(
   next: NextFunction,
 ): Promise<void> {
   try {
-    const review = await service.createWeeklyReview(req.user as Actor, req.body);
+    const body = createWeeklyReviewSchema.parse(req.body);
+    const review = await service.createWeeklyReview(req.user as Actor, body);
     res.status(201).json({ data: { review } });
   } catch (err) {
     next(err);

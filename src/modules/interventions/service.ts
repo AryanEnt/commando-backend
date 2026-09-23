@@ -40,6 +40,20 @@ export async function getIntervention(actor: Actor, profileId: string) {
   const seCanSeeMonitoring = lifecycle
     ? salesExecutiveCanViewMonitoring(lifecycle)
     : true;
+  const executiveUserId = profile.user?.id;
+  const swotSubjectWhere = {
+    OR: [
+      { subjectType: "PROFILE" as const, salesExecutiveProfileId: profileId },
+      ...(executiveUserId
+        ? [
+            {
+              subjectType: "EXECUTIVE" as const,
+              executiveUserId,
+            },
+          ]
+        : []),
+    ],
+  };
 
   const [
     latestReferral,
@@ -56,8 +70,8 @@ export async function getIntervention(actor: Actor, profileId: string) {
     }),
     prisma.swotAnalysis.findFirst({
       where: {
-        salesExecutiveProfileId: profileId,
         archivedAt: null,
+        ...swotSubjectWhere,
         ...(seSwotWhere ? seSwotWhere : {}),
       },
       orderBy: { createdAt: "desc" },
@@ -272,6 +286,25 @@ export async function getInterventionTimeline(actor: Actor, profileId: string) {
     ? salesExecutiveCanViewMonitoring(lifecycle)
     : true;
 
+  const profileUser = await prisma.salesExecutiveProfile.findFirst({
+    where: { id: profileId },
+    select: { userId: true },
+  });
+  const executiveUserId = profileUser?.userId;
+  const swotSubjectWhere = {
+    OR: [
+      { subjectType: "PROFILE" as const, salesExecutiveProfileId: profileId },
+      ...(executiveUserId
+        ? [
+            {
+              subjectType: "EXECUTIVE" as const,
+              executiveUserId,
+            },
+          ]
+        : []),
+    ],
+  };
+
   const [
     referrals,
     swots,
@@ -291,13 +324,13 @@ export async function getInterventionTimeline(actor: Actor, profileId: string) {
     }),
     prisma.swotAnalysis.findMany({
       where: {
-        salesExecutiveProfileId: profileId,
         archivedAt: null,
+        ...swotSubjectWhere,
         ...(seSwotWhere ? seSwotWhere : {}),
       },
       orderBy: { createdAt: "desc" },
       take: 20,
-      select: { id: true, source: true, createdAt: true },
+      select: { id: true, source: true, createdAt: true, subjectType: true },
     }),
     prisma.commandoAssignment.findMany({
       where: { salesExecutiveProfileId: profileId },

@@ -43,6 +43,10 @@ export const PERMISSIONS = {
   DAILY_LOG_VIEW: "DAILY_LOG_VIEW",
   ACTIVITY_TYPE_MANAGE: "ACTIVITY_TYPE_MANAGE",
 
+  /** Executive self-reported daily work (SE + SSE). Separate from Commando Daily Logs. */
+  DAILY_WORK_LOG_CREATE: "DAILY_WORK_LOG_CREATE",
+  DAILY_WORK_LOG_VIEW: "DAILY_WORK_LOG_VIEW",
+
   WEEKLY_REVIEW_CREATE: "WEEKLY_REVIEW_CREATE",
   WEEKLY_REVIEW_EDIT: "WEEKLY_REVIEW_EDIT",
   WEEKLY_REVIEW_SUBMIT: "WEEKLY_REVIEW_SUBMIT",
@@ -177,6 +181,14 @@ export const PERMISSION_META: Record<
     name: "Manage activity types",
     description: "Configure daily log activity types",
   },
+  DAILY_WORK_LOG_CREATE: {
+    name: "Create daily work logs",
+    description: "Record own daily work as SE or SSE",
+  },
+  DAILY_WORK_LOG_VIEW: {
+    name: "View daily work logs",
+    description: "View executive daily work logs in scope",
+  },
   WEEKLY_REVIEW_CREATE: {
     name: "Create weekly reviews",
     description: "Create weekly review meetings",
@@ -297,6 +309,7 @@ export const ROLE_PERMISSION_MAP: Record<RoleCode, PermissionCode[]> = {
     PERMISSIONS.SWOT_VIEW,
     PERMISSIONS.DAILY_LOG_CREATE,
     PERMISSIONS.DAILY_LOG_VIEW,
+    PERMISSIONS.DAILY_WORK_LOG_VIEW,
     PERMISSIONS.WEEKLY_REVIEW_CREATE,
     PERMISSIONS.WEEKLY_REVIEW_EDIT,
     PERMISSIONS.WEEKLY_REVIEW_SUBMIT,
@@ -333,6 +346,7 @@ export const ROLE_PERMISSION_MAP: Record<RoleCode, PermissionCode[]> = {
     PERMISSIONS.SWOT_VIEW,
     PERMISSIONS.DAILY_LOG_CREATE,
     PERMISSIONS.DAILY_LOG_VIEW,
+    PERMISSIONS.DAILY_WORK_LOG_VIEW,
     PERMISSIONS.WEEKLY_REVIEW_CREATE,
     PERMISSIONS.WEEKLY_REVIEW_EDIT,
     PERMISSIONS.WEEKLY_REVIEW_SUBMIT,
@@ -371,6 +385,8 @@ export const ROLE_PERMISSION_MAP: Record<RoleCode, PermissionCode[]> = {
     PERMISSIONS.ACTION_ITEM_VIEW,
     PERMISSIONS.FEEDBACK_VIEW,
     PERMISSIONS.PERFORMANCE_VIEW,
+    PERMISSIONS.DAILY_WORK_LOG_CREATE,
+    PERMISSIONS.DAILY_WORK_LOG_VIEW,
     /** Own Support Team roster (read-only; assign remains TL-only). */
     PERMISSIONS.SALES_SUPPORT_LINK_VIEW,
     /** Own profile's support tasks (read-only). */
@@ -384,6 +400,11 @@ export const ROLE_PERMISSION_MAP: Record<RoleCode, PermissionCode[]> = {
     PERMISSIONS.SALES_SUPPORT_TASK_VIEW,
     PERMISSIONS.SALES_SUPPORT_TASK_STATUS_UPDATE,
     PERMISSIONS.SALES_SUPPORT_LINK_VIEW,
+    PERMISSIONS.DAILY_WORK_LOG_CREATE,
+    PERMISSIONS.DAILY_WORK_LOG_VIEW,
+    PERMISSIONS.SWOT_CREATE,
+    PERMISSIONS.SWOT_VIEW,
+    PERMISSIONS.WEEKLY_REVIEW_VIEW,
     PERMISSIONS.DASHBOARD_VIEW,
   ],
 };

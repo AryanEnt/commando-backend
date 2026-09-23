@@ -25,6 +25,12 @@ feedbackRouter.post(
   controller.createFeedback,
 );
 
+feedbackRouter.post(
+  "/:id/acknowledge",
+  requirePermission(PERMISSIONS.FEEDBACK_VIEW),
+  controller.acknowledgeFeedback,
+);
+
 feedbackRouter.get(
   "/:id",
   requirePermission(PERMISSIONS.FEEDBACK_VIEW),

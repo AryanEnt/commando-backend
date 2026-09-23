@@ -6,6 +6,7 @@ import {
   PERMISSION_META,
   ROLE_PERMISSION_MAP,
 } from "../src/lib/permissions.js";
+import { distributeEvenWeights } from "../src/modules/monitoring/scoring.js";
 
 const prisma = new PrismaClient();
 
@@ -364,7 +365,10 @@ async function upsertActivityAndMonitoringCatalogs() {
       },
     });
 
-    for (const item of catalog.items) {
+    const weights = distributeEvenWeights(catalog.items.length);
+    for (let i = 0; i < catalog.items.length; i++) {
+      const item = catalog.items[i]!;
+      const defaultWeight = weights[i] ?? 0;
       await prisma.monitoringChecklistItem.upsert({
         where: {
           categoryId_code: {
@@ -375,6 +379,7 @@ async function upsertActivityAndMonitoringCatalogs() {
         update: {
           label: item.label,
           sortOrder: item.sortOrder,
+          defaultWeight,
           isActive: true,
           archivedAt: null,
         },
@@ -383,6 +388,7 @@ async function upsertActivityAndMonitoringCatalogs() {
           code: item.code,
           label: item.label,
           sortOrder: item.sortOrder,
+          defaultWeight,
           isActive: true,
         },
       });

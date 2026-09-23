@@ -52,7 +52,9 @@ export function salesExecutiveCanViewSwot(
   source: SwotSource,
   visibleToSalesExecutive: boolean,
 ): boolean {
-  if (source === "SALES_EXECUTIVE") return true;
+  if (source === "SALES_EXECUTIVE" || source === "SALES_SUPPORT_EXECUTIVE") {
+    return true;
+  }
   return visibleToSalesExecutive;
 }
 
@@ -70,12 +72,20 @@ export function salesExecutiveCanViewSwotSource(
   return false;
 }
 
-/** Prisma where-clause: SWOTs an SE may list (own + shared). */
+/** Prisma where-clause: SWOTs a subject executive (SE/SSE) may list (own + shared). */
 export function swotWhereVisibleToSalesExecutive(): {
-  OR: Array<{ source: "SALES_EXECUTIVE" } | { visibleToSalesExecutive: true }>;
+  OR: Array<
+    | { source: "SALES_EXECUTIVE" }
+    | { source: "SALES_SUPPORT_EXECUTIVE" }
+    | { visibleToSalesExecutive: true }
+  >;
 } {
   return {
-    OR: [{ source: "SALES_EXECUTIVE" }, { visibleToSalesExecutive: true }],
+    OR: [
+      { source: "SALES_EXECUTIVE" },
+      { source: "SALES_SUPPORT_EXECUTIVE" },
+      { visibleToSalesExecutive: true },
+    ],
   };
 }
 

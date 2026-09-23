@@ -66,12 +66,12 @@ export const env = {
   apiRateLimitMax: Number(process.env.API_RATE_LIMIT_MAX ?? 300),
   apiRateLimitWindowMs: Number(process.env.API_RATE_LIMIT_WINDOW_MS ?? 60_000),
   /** Cloudflare R2 (S3-compatible). Optional until upload is used. */
-  r2AccountId: process.env.R2_ACCOUNT_ID ?? "",
-  r2AccessKeyId: process.env.R2_ACCESS_KEY_ID ?? "",
-  r2SecretAccessKey: process.env.R2_SECRET_ACCESS_KEY ?? "",
-  r2BucketName: process.env.R2_BUCKET_NAME ?? "",
+  r2AccountId: (process.env.R2_ACCOUNT_ID ?? "").trim(),
+  r2AccessKeyId: (process.env.R2_ACCESS_KEY_ID ?? "").trim(),
+  r2SecretAccessKey: (process.env.R2_SECRET_ACCESS_KEY ?? "").trim(),
+  r2BucketName: (process.env.R2_BUCKET_NAME ?? "").trim(),
   /** Optional public/custom domain base (no trailing slash). */
-  r2PublicBaseUrl: (process.env.R2_PUBLIC_BASE_URL ?? "").replace(/\/$/, ""),
+  r2PublicBaseUrl: (process.env.R2_PUBLIC_BASE_URL ?? "").trim().replace(/\/$/, ""),
 };
 
 export { isProd };

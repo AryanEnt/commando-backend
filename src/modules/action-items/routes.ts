@@ -10,6 +10,8 @@ import {
   createActionItemSchema,
   replaceActionItemSchema,
   updateActionItemSchema,
+  updateActionItemSummarySchema,
+  addActionItemAttachmentSchema,
 } from "./schemas.js";
 import * as controller from "./controller.js";
 
@@ -43,6 +45,13 @@ actionItemsRouter.patch(
   controller.updateActionItem,
 );
 
+actionItemsRouter.patch(
+  "/:id/summary",
+  requirePermission(PERMISSIONS.ACTION_ITEM_VIEW),
+  validate(updateActionItemSummarySchema),
+  controller.updateActionItemSummary,
+);
+
 /** Named lifecycle transitions — no arbitrary status PATCH. */
 actionItemsRouter.post(
   "/:id/complete",
@@ -64,4 +73,23 @@ actionItemsRouter.post(
   requirePermission(PERMISSIONS.ACTION_ITEM_UPDATE),
   validate(replaceActionItemSchema),
   controller.replaceActionItem,
+);
+
+actionItemsRouter.post(
+  "/:id/attachments",
+  requirePermission(PERMISSIONS.ACTION_ITEM_VIEW),
+  validate(addActionItemAttachmentSchema),
+  controller.addActionItemAttachment,
+);
+
+actionItemsRouter.get(
+  "/:id/attachments/:attachmentId/url",
+  requirePermission(PERMISSIONS.ACTION_ITEM_VIEW),
+  controller.getActionItemAttachmentUrl,
+);
+
+actionItemsRouter.delete(
+  "/:id/attachments/:attachmentId",
+  requirePermission(PERMISSIONS.ACTION_ITEM_VIEW),
+  controller.removeActionItemAttachment,
 );

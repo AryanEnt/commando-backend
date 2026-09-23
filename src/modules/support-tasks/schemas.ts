@@ -55,6 +55,16 @@ export const addSupportTaskProgressNoteSchema = z
   })
   .strict();
 
+export const addSupportTaskAttachmentSchema = z
+  .object({
+    key: z.string().trim().min(1).max(512),
+    fileName: z.string().trim().min(1).max(255),
+    contentType: z.string().trim().min(1).max(128),
+    size: z.number().int().positive().max(10 * 1024 * 1024).optional(),
+    caption: z.string().trim().max(500).optional().nullable(),
+  })
+  .strict();
+
 export const listSupportTasksQuerySchema = z.object({
   search: z.string().trim().optional(),
   view: z.enum(["active", "history", "all"]).default("active"),
@@ -77,5 +87,8 @@ export type UpdateSupportTaskStatusInput = z.infer<
 >;
 export type AddSupportTaskProgressNoteInput = z.infer<
   typeof addSupportTaskProgressNoteSchema
+>;
+export type AddSupportTaskAttachmentInput = z.infer<
+  typeof addSupportTaskAttachmentSchema
 >;
 export type ListSupportTasksQuery = z.infer<typeof listSupportTasksQuerySchema>;

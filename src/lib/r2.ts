@@ -33,6 +33,10 @@ function getClient(): S3Client {
       accessKeyId: env.r2AccessKeyId,
       secretAccessKey: env.r2SecretAccessKey,
     },
+    // AWS SDK v3 defaults add CRC32 checksum query params to PutObject
+    // presigns; browsers only send Content-Type, so uploads fail CORS/signature.
+    requestChecksumCalculation: "WHEN_REQUIRED",
+    responseChecksumValidation: "WHEN_REQUIRED",
   });
 }
 
@@ -50,6 +54,22 @@ export async function createPresignedPutUrl(input: {
   return getSignedUrl(client, command, {
     expiresIn: input.expiresInSeconds ?? 600,
   });
+}
+
+export async function putObjectBytes(input: {
+  key: string;
+  contentType: string;
+  body: Buffer;
+}): Promise<void> {
+  const client = getClient();
+  await client.send(
+    new PutObjectCommand({
+      Bucket: env.r2BucketName,
+      Key: input.key,
+      ContentType: input.contentType,
+      Body: input.body,
+    }),
+  );
 }
 
 export async function createPresignedGetUrl(input: {

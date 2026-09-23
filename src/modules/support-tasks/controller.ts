@@ -106,3 +106,54 @@ export async function addSupportTaskProgressNote(
     next(err);
   }
 }
+
+export async function addSupportTaskAttachment(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const task = await service.addSupportTaskAttachment(
+      req.user as Actor,
+      paramId(req.params.id),
+      req.body,
+    );
+    res.status(201).json({ data: { task } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getSupportTaskAttachmentUrl(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const data = await service.getSupportTaskAttachmentUrl(
+      req.user as Actor,
+      paramId(req.params.id),
+      paramId(req.params.attachmentId),
+    );
+    res.status(200).json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function removeSupportTaskAttachment(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const task = await service.removeSupportTaskAttachment(
+      req.user as Actor,
+      paramId(req.params.id),
+      paramId(req.params.attachmentId),
+    );
+    res.status(200).json({ data: { task } });
+  } catch (err) {
+    next(err);
+  }
+}

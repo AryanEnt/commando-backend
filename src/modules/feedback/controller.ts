@@ -52,3 +52,19 @@ export async function createFeedback(
     next(err);
   }
 }
+
+export async function acknowledgeFeedback(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const feedback = await service.acknowledgeFeedback(
+      req.user as Actor,
+      paramId(req.params.id),
+    );
+    res.status(200).json({ data: { feedback } });
+  } catch (err) {
+    next(err);
+  }
+}

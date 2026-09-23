@@ -166,3 +166,86 @@ describe("weekly reviews", () => {
     expect(stillThere.performanceSummary).toBe(original.performanceSummary);
   });
 });
+
+describe("SSE weekly reviews", () => {
+  let dbReady = false;
+  let supportUserId: string;
+
+  beforeAll(async () => {
+    try {
+      await prisma.$connect();
+      const support = await prisma.user.findUnique({
+        where: { email: "support@commando.local" },
+      });
+      const profile = await prisma.salesExecutiveProfile.findFirst({
+        where: { displayName: "Sam Seller" },
+      });
+      if (!support || !profile) {
+        dbReady = false;
+        return;
+      }
+      supportUserId = support.id;
+      const existingMembership = await prisma.teamMembership.findFirst({
+        where: { teamId: profile.teamId, userId: support.id },
+      });
+      if (existingMembership) {
+        await prisma.teamMembership.update({
+          where: { id: existingMembership.id },
+          data: { isActive: true, endedAt: null },
+        });
+      } else {
+        await prisma.teamMembership.create({
+          data: {
+            teamId: profile.teamId,
+            userId: support.id,
+            roleInTeam: "SALES_SUPPORT_EXECUTIVE",
+            isActive: true,
+          },
+        });
+      }
+      dbReady = true;
+    } catch {
+      dbReady = false;
+    }
+  });
+
+  it("TL can create a weekly review for an in-scope SSE", async ({ skip }) => {
+    if (!dbReady) skip();
+    const tl = await token("teamlead@commando.local");
+    const weekStart = `2026-04-${String(6 + (Date.now() % 20)).padStart(2, "0")}`;
+    const res = await request(app)
+      .post("/api/weekly-reviews")
+      .set("Authorization", `Bearer ${tl}`)
+      .send({
+        executiveUserId: supportUserId,
+        weekLabel: `SSE-WR-${Date.now()}`,
+        weekStartDate: weekStart,
+        meetingDate: "2026-04-10T10:00:00.000Z",
+        roomName: "Support room",
+        meetingTime: "10:00",
+        performanceSummary: "Support coverage was steady.",
+        whatWentWell: "Fast task turnaround.",
+        improvement: "Tighter SE updates.",
+        nextWeekActions: ["Sync with assigned SE daily"],
+      });
+    expect(res.status).toBe(201);
+    expect(res.body.data.review.executiveUserId).toBe(supportUserId);
+    expect(res.body.data.review.salesExecutiveProfileId).toBeNull();
+    expect(res.body.data.review.subject.type).toBe("SALES_SUPPORT_EXECUTIVE");
+    expect(res.body.data.review.status).toBe("SUBMITTED");
+
+    const list = await request(app)
+      .get(`/api/weekly-reviews?executiveUserId=${supportUserId}`)
+      .set("Authorization", `Bearer ${tl}`);
+    expect(list.status).toBe(200);
+    expect(
+      list.body.data.reviews.some((r: { id: string }) => r.id === res.body.data.review.id),
+    ).toBe(true);
+
+    const sse = await token("support@commando.local");
+    const view = await request(app)
+      .get(`/api/weekly-reviews/${res.body.data.review.id}`)
+      .set("Authorization", `Bearer ${sse}`);
+    expect(view.status).toBe(200);
+  });
+});

@@ -31,7 +31,7 @@ function assertSuperAdmin(actor: Actor): void {
 type AssignmentRow = Prisma.CommandoAssignmentGetPayload<{
   include: {
     profile: {
-      select: { id: true; displayName: true; teamId: true };
+      select: { id: true; displayName: true; teamId: true; userId: true };
     };
     team: { select: { id: true; name: true } };
     commando: {
@@ -88,21 +88,41 @@ async function buildRow(assignment: AssignmentRow) {
     prisma.swotAnalysis.findMany({
       where: {
         archivedAt: null,
-        salesExecutiveProfileId: assignment.salesExecutiveProfileId,
         OR: [
-          { assignmentId: assignment.id },
           {
-            assignmentId: null,
-            createdAt: {
-              gte: assignment.startedAt,
-              lte: windowEnd,
-            },
+            subjectType: "PROFILE",
+            salesExecutiveProfileId: assignment.salesExecutiveProfileId,
+            OR: [
+              { assignmentId: assignment.id },
+              {
+                assignmentId: null,
+                createdAt: {
+                  gte: assignment.startedAt,
+                  lte: windowEnd,
+                },
+              },
+            ],
+          },
+          {
+            subjectType: "EXECUTIVE",
+            executiveUserId: assignment.profile.userId,
+            OR: [
+              { assignmentId: assignment.id },
+              {
+                assignmentId: null,
+                createdAt: {
+                  gte: assignment.startedAt,
+                  lte: windowEnd,
+                },
+              },
+            ],
           },
         ],
       },
       select: {
         id: true,
         source: true,
+        subjectType: true,
         assignmentId: true,
         createdAt: true,
       },
@@ -312,7 +332,7 @@ export async function listCommandoPerformanceReport(
       orderBy: [{ status: "asc" }, { startedAt: "desc" }],
       include: {
         profile: {
-          select: { id: true, displayName: true, teamId: true },
+          select: { id: true, displayName: true, teamId: true, userId: true },
         },
         team: { select: { id: true, name: true } },
         commando: {
@@ -348,7 +368,7 @@ export async function getCommandoPerformanceReportDetail(
     where: { id: assignmentId },
     include: {
       profile: {
-        select: { id: true, displayName: true, teamId: true },
+        select: { id: true, displayName: true, teamId: true, userId: true },
       },
       team: { select: { id: true, name: true } },
       commando: {

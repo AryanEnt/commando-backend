@@ -1,9 +1,10 @@
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
-import { writeAuditLog } from "../../lib/audit.js";
+import { writeAuditLog, AUDIT_ACTIONS } from "../../lib/audit.js";
 import type { Actor } from "../../lib/authorization.js";
-import { isSuperAdmin } from "../../lib/authorization.js";
+import { hasPermission, isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { PERMISSIONS } from "../../lib/permissions.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import {
@@ -11,11 +12,18 @@ import {
   salesExecutiveCanViewActionItemStatus,
 } from "../../lib/lifecycleVisibility.js";
 import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
+import { createPresignedGetUrl } from "../../lib/r2.js";
+import {
+  assertAllowedImageUpload,
+  isOwnedActionItemImageKey,
+} from "../uploads/schemas.js";
 import type {
+  AddActionItemAttachmentInput,
   CreateActionItemInput,
   ListActionItemsQuery,
   ReplaceActionItemInput,
   UpdateActionItemInput,
+  UpdateActionItemSummaryInput,
 } from "./schemas.js";
 
 const userBrief = {
@@ -90,6 +98,7 @@ type ItemRow = {
   weeklyReviewId: string | null;
   title: string;
   description: string | null;
+  summary: string | null;
   status: string;
   dueDate: Date | null;
   completedAt: Date | null;
@@ -202,6 +211,7 @@ function serialize(row: ItemRow, extras: Map<string, UserBrief>) {
     weeklyReview: row.weeklyReview,
     title: row.title,
     description: row.description,
+    summary: row.summary,
     status: row.status,
     dueDate: row.dueDate,
     completedAt: row.completedAt,
@@ -488,9 +498,36 @@ export async function getActionItem(actor: Actor, id: string) {
   const extras = await loadUsers(
     typed.assignment ? [typed.assignment.commandoUserId] : [],
   );
+
+  const attachments = await prisma.actionItemAttachment.findMany({
+    where: { actionItemId: row.id },
+    orderBy: { createdAt: "desc" },
+    take: 50,
+    include: {
+      uploadedBy: {
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          email: true,
+          role: { select: { code: true } },
+        },
+      },
+    },
+  });
+
   return {
     ...serialize(typed, extras),
     previousActions: previous,
+    attachments: attachments.map((a) => ({
+      id: a.id,
+      fileName: a.fileName,
+      contentType: a.contentType,
+      sizeBytes: a.sizeBytes,
+      caption: a.caption,
+      createdAt: a.createdAt,
+      uploadedBy: a.uploadedBy,
+    })),
   };
 }
 
@@ -609,6 +646,12 @@ export async function updateActionItem(
           : input.description?.trim()
             ? input.description.trim()
             : null,
+      summary:
+        input.summary === undefined
+          ? undefined
+          : input.summary?.trim()
+            ? input.summary.trim()
+            : null,
       dueDate: input.dueDate === undefined ? undefined : input.dueDate,
     },
     include: itemInclude,
@@ -627,6 +670,61 @@ export async function updateActionItem(
     typed.assignment ? [typed.assignment.commandoUserId] : [],
   );
   return serialize(typed, extras);
+}
+
+/** SE (own) or managers can set an optional summary without full edit rights. */
+export async function updateActionItemSummary(
+  actor: Actor,
+  id: string,
+  input: UpdateActionItemSummaryInput,
+) {
+  const existing = await prisma.actionItem.findFirst({
+    where: { id, archivedAt: null },
+    include: itemInclude,
+  });
+  if (!existing) throw notFound("Action item not found");
+  const typed = asItemRow(existing);
+  await assertCanAccess(actor, typed);
+
+  if (typed.status !== "ACTIVE") {
+    throw badRequest("Only ACTIVE assignments can update summary");
+  }
+
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    if (typed.profile.userId !== actor.id) {
+      throw forbidden("You may only update summary on your own assignments");
+    }
+  } else if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD" &&
+    !hasPermission(actor, PERMISSIONS.ACTION_ITEM_UPDATE) &&
+    !isSuperAdmin(actor)
+  ) {
+    throw forbidden("Not allowed to update assignment summary");
+  } else if (!isSuperAdmin(actor)) {
+    await assertCanManage(actor, typed);
+  }
+
+  const summary =
+    input.summary?.trim() ? input.summary.trim() : null;
+
+  const updated = await prisma.actionItem.update({
+    where: { id },
+    // Explicit cast: generated Prisma client includes `summary` (see schema +
+    // ActionItemUpdateInput). Assert so tooling with a stale client still typechecks.
+    data: { summary } as Prisma.ActionItemUpdateInput,
+    include: itemInclude,
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: "ACTION_ITEM_UPDATED",
+    entityType: "ActionItem",
+    entityId: updated.id,
+    metadata: { verb: "SUMMARY_UPDATE" },
+  });
+
+  return getActionItem(actor, updated.id);
 }
 
 export async function completeActionItem(actor: Actor, id: string) {
@@ -775,4 +873,155 @@ export async function replaceActionItem(
     typed.assignment ? [typed.assignment.commandoUserId] : [],
   );
   return serialize(typed, extras);
+}
+
+function assertCanAddScreenshot(actor: Actor, row: ItemRow): void {
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    if (row.profile.userId !== actor.id) {
+      throw forbidden("You may only add screenshots on your own assignments");
+    }
+    return;
+  }
+  if (
+    actor.roleCode === "COMMANDO_EXECUTIVE" ||
+    actor.roleCode === "TEAM_LEAD" ||
+    hasPermission(actor, PERMISSIONS.ACTION_ITEM_UPDATE)
+  ) {
+    return;
+  }
+  throw forbidden("Not allowed to add screenshots on this assignment");
+}
+
+export async function addActionItemAttachment(
+  actor: Actor,
+  id: string,
+  input: AddActionItemAttachmentInput,
+) {
+  const row = await prisma.actionItem.findFirst({
+    where: { id, archivedAt: null },
+    include: itemInclude,
+  });
+  if (!row) throw notFound("Action item not found");
+  const typed = asItemRow(row);
+  await assertCanAccess(actor, typed);
+  assertCanAddScreenshot(actor, typed);
+
+  if (typed.status !== "ACTIVE") {
+    throw badRequest("Cannot add screenshots to a completed assignment");
+  }
+
+  try {
+    assertAllowedImageUpload({
+      contentType: input.contentType,
+      contentLength: input.size ?? 1,
+    });
+  } catch (err) {
+    throw badRequest(err instanceof Error ? err.message : "Invalid image");
+  }
+
+  if (!isOwnedActionItemImageKey(input.key, actor.id)) {
+    throw badRequest("Invalid screenshot upload key");
+  }
+
+  await prisma.actionItemAttachment.create({
+    data: {
+      actionItemId: typed.id,
+      storageKey: input.key,
+      fileName: input.fileName.trim(),
+      contentType: input.contentType,
+      sizeBytes: input.size ?? null,
+      caption: input.caption?.trim() || null,
+      uploadedById: actor.id,
+    },
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: AUDIT_ACTIONS.ACTION_ITEM_ATTACHMENT_ADDED,
+    entityType: "ActionItem",
+    entityId: typed.id,
+    metadata: {
+      fileName: input.fileName.trim(),
+      contentType: input.contentType,
+    },
+  });
+
+  return getActionItem(actor, typed.id);
+}
+
+export async function getActionItemAttachmentUrl(
+  actor: Actor,
+  actionItemId: string,
+  attachmentId: string,
+) {
+  const row = await prisma.actionItem.findFirst({
+    where: { id: actionItemId, archivedAt: null },
+    include: itemInclude,
+  });
+  if (!row) throw notFound("Action item not found");
+  await assertCanAccess(actor, asItemRow(row));
+
+  const attachment = await prisma.actionItemAttachment.findFirst({
+    where: { id: attachmentId, actionItemId },
+  });
+  if (!attachment) throw notFound("Screenshot not found");
+
+  const url = await createPresignedGetUrl({
+    key: attachment.storageKey,
+    fileName: attachment.fileName,
+    expiresInSeconds: 600,
+  });
+
+  return {
+    url,
+    fileName: attachment.fileName,
+    contentType: attachment.contentType,
+    expiresInSeconds: 600,
+  };
+}
+
+export async function removeActionItemAttachment(
+  actor: Actor,
+  actionItemId: string,
+  attachmentId: string,
+) {
+  const row = await prisma.actionItem.findFirst({
+    where: { id: actionItemId, archivedAt: null },
+    include: itemInclude,
+  });
+  if (!row) throw notFound("Action item not found");
+  const typed = asItemRow(row);
+  await assertCanAccess(actor, typed);
+
+  if (typed.status !== "ACTIVE") {
+    throw badRequest("Cannot remove screenshots from a completed assignment");
+  }
+
+  const attachment = await prisma.actionItemAttachment.findFirst({
+    where: { id: attachmentId, actionItemId },
+  });
+  if (!attachment) throw notFound("Screenshot not found");
+
+  const isOwn = attachment.uploadedById === actor.id;
+  if (isOwn) {
+    // ok
+  } else if (isSuperAdmin(actor)) {
+    // ok
+  } else if (hasPermission(actor, PERMISSIONS.ACTION_ITEM_UPDATE)) {
+    await assertCanManage(actor, typed);
+  } else {
+    throw forbidden("You may only remove screenshots you uploaded");
+  }
+
+  await prisma.actionItemAttachment.delete({ where: { id: attachment.id } });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: AUDIT_ACTIONS.ACTION_ITEM_ATTACHMENT_REMOVED,
+    entityType: "ActionItem",
+    entityId: actionItemId,
+    metadata: { attachmentId: attachment.id, fileName: attachment.fileName },
+  });
+
+  return getActionItem(actor, actionItemId);
 }

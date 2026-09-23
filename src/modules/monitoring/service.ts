@@ -13,6 +13,12 @@ import {
   salesExecutiveCanViewMonitoring,
 } from "../../lib/lifecycleVisibility.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import {
+  assertCanManageSupportUser,
+  assertCanViewSupportUser,
+  supportUserIdsOnTeams,
+  teamIdsForCommandoActive,
+} from "../../lib/supportScope.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
 import type {
@@ -22,13 +28,66 @@ import type {
   CreateMonitoringRecordInput,
   ListMonitoringQuery,
   RemoveSeTemplateItemInput,
+  SaveSeChecklistWeightsInput,
   UpdateChecklistItemInput,
   UpdateMonitoringCategoryInput,
 } from "./schemas.js";
+import {
+  allocationStatus,
+  computeWeightedScore,
+  sumWeights,
+} from "./scoring.js";
+
+type ChecklistSubject =
+  | { kind: "profile"; profileId: string }
+  | { kind: "executive"; executiveUserId: string };
+
+function checklistSubjectWhere(subject: ChecklistSubject) {
+  return subject.kind === "profile"
+    ? { salesExecutiveProfileId: subject.profileId }
+    : { executiveUserId: subject.executiveUserId };
+}
+
+function checklistSubjectCreate(subject: ChecklistSubject) {
+  return subject.kind === "profile"
+    ? {
+        salesExecutiveProfileId: subject.profileId,
+        executiveUserId: null as string | null,
+      }
+    : {
+        salesExecutiveProfileId: null as string | null,
+        executiveUserId: subject.executiveUserId,
+      };
+}
+
+function checklistSubjectMeta(subject: ChecklistSubject) {
+  return subject.kind === "profile"
+    ? { profileId: subject.profileId }
+    : { executiveUserId: subject.executiveUserId };
+}
+
+function checklistSubjectEntityId(subject: ChecklistSubject) {
+  return subject.kind === "profile"
+    ? subject.profileId
+    : subject.executiveUserId;
+}
+
+function checklistSubjectEntityType(subject: ChecklistSubject) {
+  return subject.kind === "profile" ? "SalesExecutiveProfile" : "User";
+}
 
 const recordInclude = {
   profile: {
     select: { id: true, displayName: true, userId: true, teamId: true },
+  },
+  executiveUser: {
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+      role: { select: { code: true } },
+    },
   },
   category: {
     select: { id: true, code: true, name: true },
@@ -96,18 +155,23 @@ type EffectiveItem = {
   code: string | null;
   sortOrder: number;
   sourceType: "TEMPLATE" | "CUSTOM";
+  weight: number;
+  weightSource: "TEMPLATE_DEFAULT" | "SE_OVERRIDE" | "SE_CUSTOM";
 };
 
 function serialize(row: RecordRow) {
   return {
     id: row.id,
     salesExecutiveProfileId: row.salesExecutiveProfileId,
+    executiveUserId: row.executiveUserId,
     profile: row.profile,
+    executiveUser: row.executiveUser,
     assignmentId: row.assignmentId,
     assignment: row.assignment,
     categoryId: row.categoryId,
     category: row.category,
     observation: row.observation,
+    scorePercent: row.scorePercent,
     createdById: row.createdById,
     createdBy: row.createdBy,
     observedAt: row.observedAt,
@@ -121,6 +185,7 @@ function serialize(row: RecordRow) {
       descriptionSnapshot: r.descriptionSnapshot,
       codeSnapshot: r.codeSnapshot,
       sortOrderSnapshot: r.sortOrderSnapshot,
+      weightSnapshot: r.weightSnapshot,
       sourceType: r.sourceType,
       checklistItem: {
         id: r.checklistItemId ?? r.seChecklistItemId ?? r.id,
@@ -162,20 +227,31 @@ async function scopeWhere(
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
     const profileIds = await assignedProfileIds(actor.id);
+    const teamIds = await teamIdsForCommandoActive(prisma, actor.id);
+    const supportIds = await supportUserIdsOnTeams(prisma, teamIds);
     return {
       archivedAt: null,
       OR: [
         { createdById: actor.id },
         { salesExecutiveProfileId: { in: profileIds } },
+        ...(supportIds.length
+          ? [{ executiveUserId: { in: supportIds } }]
+          : []),
       ],
     };
   }
 
   if (actor.roleCode === "TEAM_LEAD") {
     const teamIds = await getActiveTeamIds(prisma, actor.id);
+    const supportIds = await supportUserIdsOnTeams(prisma, teamIds);
     return {
       archivedAt: null,
-      profile: { teamId: { in: teamIds } },
+      OR: [
+        { profile: { teamId: { in: teamIds } } },
+        ...(supportIds.length
+          ? [{ executiveUserId: { in: supportIds } }]
+          : []),
+      ],
     };
   }
 
@@ -197,6 +273,13 @@ async function scopeWhere(
     };
   }
 
+  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+    return {
+      archivedAt: null,
+      executiveUserId: actor.id,
+    };
+  }
+
   return { id: "__none__" };
 }
 
@@ -205,6 +288,27 @@ async function assertCanAccessRecord(
   row: RecordRow,
 ): Promise<void> {
   if (isSuperAdmin(actor)) return;
+
+  if (row.executiveUserId) {
+    if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+      if (row.executiveUserId !== actor.id) {
+        throw forbidden("You may only view your own monitoring history");
+      }
+      return;
+    }
+    if (
+      actor.roleCode === "TEAM_LEAD" ||
+      actor.roleCode === "COMMANDO_EXECUTIVE"
+    ) {
+      await assertCanViewSupportUser(prisma, actor, row.executiveUserId);
+      return;
+    }
+    throw forbidden("Not allowed to access monitoring records");
+  }
+
+  if (!row.salesExecutiveProfileId || !row.profile) {
+    throw forbidden("Not allowed to access monitoring records");
+  }
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
     if (row.createdById === actor.id) return;
@@ -304,6 +408,26 @@ export async function assertCanCustomizeSeChecklist(
   return profile;
 }
 
+async function assertCanCustomizeSupportChecklist(
+  actor: Actor,
+  executiveUserId: string,
+) {
+  if (isSuperAdmin(actor)) {
+    throw forbidden(
+      "Super Admin manages global checklists only; Support customization is not allowed",
+    );
+  }
+  if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD"
+  ) {
+    throw forbidden(
+      "Only Commandos and Team Leads can customize Support monitoring checklists",
+    );
+  }
+  return assertCanManageSupportUser(prisma, actor, executiveUserId);
+}
+
 async function actorCanCustomizeSeChecklist(
   actor: Actor,
   profile: { id: string; teamId: string },
@@ -333,6 +457,25 @@ async function actorCanCustomizeSeChecklist(
     }
   }
   return false;
+}
+
+async function actorCanCustomizeSupportChecklist(
+  actor: Actor,
+  executiveUserId: string,
+): Promise<boolean> {
+  if (isSuperAdmin(actor)) return false;
+  if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD"
+  ) {
+    return false;
+  }
+  try {
+    await assertCanManageSupportUser(prisma, actor, executiveUserId);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function assertCanViewSeChecklist(actor: Actor, profileId: string) {
@@ -378,8 +521,16 @@ async function assertCanViewSeChecklist(actor: Actor, profileId: string) {
   throw forbidden("Not allowed to view SE monitoring checklist");
 }
 
+async function assertCanViewSupportChecklist(
+  actor: Actor,
+  executiveUserId: string,
+) {
+  await assertCanViewSupportUser(prisma, actor, executiveUserId);
+  return executiveUserId;
+}
+
 async function buildEffectiveChecklist(
-  profileId: string,
+  subject: ChecklistSubject,
   categoryId: string,
 ): Promise<{
   category: {
@@ -390,6 +541,8 @@ async function buildEffectiveChecklist(
     sortOrder: number;
   };
   items: EffectiveItem[];
+  weightsConfigured: boolean;
+  weightAllocation: ReturnType<typeof allocationStatus>;
 }> {
   const category = await prisma.monitoringCategory.findFirst({
     where: {
@@ -409,7 +562,9 @@ async function buildEffectiveChecklist(
     throw badRequest("Monitoring category is invalid or inactive");
   }
 
-  const [templateItems, seItems] = await Promise.all([
+  const subjectFilter = checklistSubjectWhere(subject);
+
+  const [templateItems, seItems, weightOverrides] = await Promise.all([
     prisma.monitoringChecklistItem.findMany({
       where: {
         categoryId: category.id,
@@ -420,12 +575,18 @@ async function buildEffectiveChecklist(
     }),
     prisma.seMonitoringChecklistItem.findMany({
       where: {
-        salesExecutiveProfileId: profileId,
+        ...subjectFilter,
         categoryId: category.id,
         isActive: true,
         kind: { in: ["CUSTOM", "TEMPLATE_REMOVED"] },
       },
       orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }],
+    }),
+    prisma.seMonitoringChecklistWeight.findMany({
+      where: {
+        ...subjectFilter,
+        categoryId: category.id,
+      },
     }),
   ]);
 
@@ -437,18 +598,33 @@ async function buildEffectiveChecklist(
       .map((i) => i.sourceTemplateItemId as string),
   );
 
+  const overrideByTemplateId = new Map(
+    weightOverrides.map((w) => [w.sourceTemplateItemId, w.weight]),
+  );
+  const weightsConfigured = weightOverrides.length > 0;
+
   const templateEffective: EffectiveItem[] = templateItems
     .filter((t) => !removedIds.has(t.id))
-    .map((t) => ({
-      id: t.id,
-      checklistItemId: t.id,
-      seChecklistItemId: null,
-      label: t.label,
-      description: null,
-      code: t.code,
-      sortOrder: t.sortOrder,
-      sourceType: "TEMPLATE",
-    }));
+    .map((t) => {
+      const hasOverride = overrideByTemplateId.has(t.id);
+      const weight = hasOverride
+        ? (overrideByTemplateId.get(t.id) as number)
+        : t.defaultWeight;
+      return {
+        id: t.id,
+        checklistItemId: t.id,
+        seChecklistItemId: null,
+        label: t.label,
+        description: null,
+        code: t.code,
+        sortOrder: t.sortOrder,
+        sourceType: "TEMPLATE" as const,
+        weight,
+        weightSource: hasOverride
+          ? ("SE_OVERRIDE" as const)
+          : ("TEMPLATE_DEFAULT" as const),
+      };
+    });
 
   const customEffective: EffectiveItem[] = seItems
     .filter((i) => i.kind === "CUSTOM")
@@ -460,12 +636,21 @@ async function buildEffectiveChecklist(
       description: c.description,
       code: null,
       sortOrder: c.sortOrder,
-      sourceType: "CUSTOM",
+      sourceType: "CUSTOM" as const,
+      weight: c.weight,
+      weightSource: "SE_CUSTOM" as const,
     }));
+
+  const items = [...templateEffective, ...customEffective];
+  const weightAllocation = allocationStatus(
+    sumWeights(items.map((i) => i.weight)),
+  );
 
   return {
     category,
-    items: [...templateEffective, ...customEffective],
+    items,
+    weightsConfigured,
+    weightAllocation,
   };
 }
 
@@ -475,21 +660,93 @@ export async function getEffectiveChecklist(
   categoryId: string,
 ) {
   const profile = await assertCanViewSeChecklist(actor, profileId);
-  const { category, items } = await buildEffectiveChecklist(
-    profile.id,
-    categoryId,
-  );
+  const subject: ChecklistSubject = { kind: "profile", profileId: profile.id };
+  const { category, items, weightsConfigured, weightAllocation } =
+    await buildEffectiveChecklist(subject, categoryId);
   const canCustomize = await actorCanCustomizeSeChecklist(actor, profile);
-  return { category, items, canCustomize };
+  return {
+    category,
+    items,
+    canCustomize,
+    weightsConfigured,
+    weightAllocation,
+  };
 }
 
-export async function addSeChecklistItem(
+export async function getEffectiveChecklistForExecutive(
   actor: Actor,
-  profileId: string,
+  executiveUserId: string,
+  categoryId: string,
+) {
+  await assertCanViewSupportChecklist(actor, executiveUserId);
+  const subject: ChecklistSubject = {
+    kind: "executive",
+    executiveUserId,
+  };
+  const { category, items, weightsConfigured, weightAllocation } =
+    await buildEffectiveChecklist(subject, categoryId);
+  const canCustomize = await actorCanCustomizeSupportChecklist(
+    actor,
+    executiveUserId,
+  );
+  return {
+    category,
+    items,
+    canCustomize,
+    weightsConfigured,
+    weightAllocation,
+  };
+}
+
+async function ensureSeWeightSnapshot(
+  subject: ChecklistSubject,
+  categoryId: string,
+  actorId: string,
+) {
+  const existing = await prisma.seMonitoringChecklistWeight.count({
+    where: { ...checklistSubjectWhere(subject), categoryId },
+  });
+  if (existing > 0) return;
+
+  const { items } = await buildEffectiveChecklist(subject, categoryId);
+  const templateItems = items.filter(
+    (i) => i.sourceType === "TEMPLATE" && i.checklistItemId,
+  );
+  if (templateItems.length === 0) return;
+
+  await prisma.$transaction(async (tx) => {
+    for (const item of templateItems) {
+      await tx.seMonitoringChecklistWeight.create({
+        data: {
+          ...checklistSubjectCreate(subject),
+          categoryId,
+          sourceTemplateItemId: item.checklistItemId as string,
+          weight: item.weight,
+        },
+      });
+    }
+    await tx.auditLog.create({
+      data: {
+        actorId,
+        action: "SE_MONITORING_CHECKLIST_WEIGHTS_SNAPSHOTTED",
+        entityType: checklistSubjectEntityType(subject),
+        entityId: checklistSubjectEntityId(subject),
+        metadata: {
+          ...checklistSubjectMeta(subject),
+          categoryId,
+          note: "Copied admin template default weights into subject-specific config",
+          itemCount: templateItems.length,
+        },
+      },
+    });
+  });
+}
+
+async function addChecklistItemForSubject(
+  actor: Actor,
+  subject: ChecklistSubject,
   input: AddSeChecklistItemInput,
 ) {
-  await assertCanCustomizeSeChecklist(actor, profileId);
-
   const category = await prisma.monitoringCategory.findFirst({
     where: {
       id: input.categoryId,
@@ -514,19 +771,24 @@ export async function addSeChecklistItem(
         code: null,
         sortOrder,
         sourceType: "SESSION" as const,
+        weight: 0,
+        weightSource: "SE_CUSTOM" as const,
       },
       persisted: false as const,
     };
   }
 
+  await ensureSeWeightSnapshot(subject, category.id, actor.id);
+
   const created = await prisma.seMonitoringChecklistItem.create({
     data: {
-      salesExecutiveProfileId: profileId,
+      ...checklistSubjectCreate(subject),
       categoryId: category.id,
       kind: "CUSTOM",
       label: input.label,
       description: input.description ?? null,
       sortOrder: input.sortOrder ?? 0,
+      weight: 0,
       isActive: true,
       createdById: actor.id,
     },
@@ -539,10 +801,11 @@ export async function addSeChecklistItem(
       entityType: "SeMonitoringChecklistItem",
       entityId: created.id,
       metadata: {
-        profileId,
+        ...checklistSubjectMeta(subject),
         categoryId: category.id,
         label: created.label,
         kind: created.kind,
+        weight: 0,
       },
     },
   });
@@ -557,29 +820,292 @@ export async function addSeChecklistItem(
       code: null,
       sortOrder: created.sortOrder,
       sourceType: "CUSTOM" as const,
+      weight: created.weight,
+      weightSource: "SE_CUSTOM" as const,
     },
     persisted: true as const,
   };
 }
 
-export async function removeSeChecklistItem(
+export async function addSeChecklistItem(
   actor: Actor,
   profileId: string,
-  itemId: string,
+  input: AddSeChecklistItemInput,
 ) {
   await assertCanCustomizeSeChecklist(actor, profileId);
+  return addChecklistItemForSubject(
+    actor,
+    { kind: "profile", profileId },
+    input,
+  );
+}
 
+export async function addSeChecklistItemForExecutive(
+  actor: Actor,
+  executiveUserId: string,
+  input: AddSeChecklistItemInput,
+) {
+  await assertCanCustomizeSupportChecklist(actor, executiveUserId);
+  return addChecklistItemForSubject(
+    actor,
+    { kind: "executive", executiveUserId },
+    input,
+  );
+}
+
+async function upsertWeightRow(
+  tx: Prisma.TransactionClient,
+  subject: ChecklistSubject,
+  categoryId: string,
+  checklistItemId: string,
+  weight: number,
+) {
+  if (subject.kind === "profile") {
+    await tx.seMonitoringChecklistWeight.upsert({
+      where: {
+        salesExecutiveProfileId_categoryId_sourceTemplateItemId: {
+          salesExecutiveProfileId: subject.profileId,
+          categoryId,
+          sourceTemplateItemId: checklistItemId,
+        },
+      },
+      create: {
+        salesExecutiveProfileId: subject.profileId,
+        executiveUserId: null,
+        categoryId,
+        sourceTemplateItemId: checklistItemId,
+        weight,
+      },
+      update: { weight },
+    });
+    return;
+  }
+  await tx.seMonitoringChecklistWeight.upsert({
+    where: {
+      executiveUserId_categoryId_sourceTemplateItemId: {
+        executiveUserId: subject.executiveUserId,
+        categoryId,
+        sourceTemplateItemId: checklistItemId,
+      },
+    },
+    create: {
+      salesExecutiveProfileId: null,
+      executiveUserId: subject.executiveUserId,
+      categoryId,
+      sourceTemplateItemId: checklistItemId,
+      weight,
+    },
+    update: { weight },
+  });
+}
+
+async function saveChecklistWeightsForSubject(
+  actor: Actor,
+  subject: ChecklistSubject,
+  input: SaveSeChecklistWeightsInput,
+) {
+  const category = await prisma.monitoringCategory.findFirst({
+    where: {
+      id: input.categoryId,
+      isActive: true,
+      archivedAt: null,
+    },
+    select: { id: true, name: true },
+  });
+  if (!category) {
+    throw badRequest("Monitoring category is invalid or inactive");
+  }
+
+  await ensureSeWeightSnapshot(subject, category.id, actor.id);
+
+  const { items: effectiveItems } = await buildEffectiveChecklist(
+    subject,
+    category.id,
+  );
+
+  const templateById = new Map(
+    effectiveItems
+      .filter((i) => i.sourceType === "TEMPLATE" && i.checklistItemId)
+      .map((i) => [i.checklistItemId as string, i]),
+  );
+  const customById = new Map(
+    effectiveItems
+      .filter((i) => i.sourceType === "CUSTOM" && i.seChecklistItemId)
+      .map((i) => [i.seChecklistItemId as string, i]),
+  );
+
+  if (input.items.length !== effectiveItems.length) {
+    throw badRequest(
+      "Weight update must include every active checklist item for this category",
+    );
+  }
+
+  const seen = new Set<string>();
+  const changes: Array<{
+    label: string;
+    from: number;
+    to: number;
+  }> = [];
+
+  for (const row of input.items) {
+    if (row.checklistItemId) {
+      const key = `t:${row.checklistItemId}`;
+      if (seen.has(key)) {
+        throw badRequest("Duplicate template item in weight update");
+      }
+      seen.add(key);
+      const item = templateById.get(row.checklistItemId);
+      if (!item) {
+        throw badRequest(
+          "Weight update references a template item that is not on this checklist",
+        );
+      }
+      if (item.weight !== row.weight) {
+        changes.push({ label: item.label, from: item.weight, to: row.weight });
+      }
+    } else if (row.seChecklistItemId) {
+      const key = `c:${row.seChecklistItemId}`;
+      if (seen.has(key)) {
+        throw badRequest("Duplicate custom item in weight update");
+      }
+      seen.add(key);
+      const item = customById.get(row.seChecklistItemId);
+      if (!item) {
+        throw badRequest(
+          "Weight update references a custom item that is not on this checklist",
+        );
+      }
+      if (item.weight !== row.weight) {
+        changes.push({ label: item.label, from: item.weight, to: row.weight });
+      }
+    }
+  }
+
+  for (const item of effectiveItems) {
+    const key =
+      item.sourceType === "TEMPLATE"
+        ? `t:${item.checklistItemId}`
+        : `c:${item.seChecklistItemId}`;
+    if (!seen.has(key)) {
+      throw badRequest(
+        `Missing weight for checklist item "${item.label}". Include every active item.`,
+      );
+    }
+  }
+
+  const total = sumWeights(input.items.map((i) => i.weight));
+  const allocation = allocationStatus(total);
+  if (!allocation.isComplete) {
+    if (allocation.remaining > 0) {
+      throw badRequest(
+        `Active checklist weights must total 100%. Currently ${allocation.total}% — ${allocation.remaining}% remaining.`,
+      );
+    }
+    throw badRequest(
+      `Active checklist weights must total 100%. Currently ${allocation.total}% — ${allocation.over}% over allocation.`,
+    );
+  }
+
+  await prisma.$transaction(async (tx) => {
+    for (const row of input.items) {
+      if (row.checklistItemId) {
+        await upsertWeightRow(
+          tx,
+          subject,
+          category.id,
+          row.checklistItemId,
+          row.weight,
+        );
+      } else if (row.seChecklistItemId) {
+        await tx.seMonitoringChecklistItem.update({
+          where: { id: row.seChecklistItemId },
+          data: { weight: row.weight },
+        });
+      }
+    }
+
+    const activeTemplateIds = effectiveItems
+      .filter((i) => i.checklistItemId)
+      .map((i) => i.checklistItemId as string);
+    await tx.seMonitoringChecklistWeight.deleteMany({
+      where: {
+        ...checklistSubjectWhere(subject),
+        categoryId: category.id,
+        sourceTemplateItemId: { notIn: activeTemplateIds },
+      },
+    });
+
+    await tx.auditLog.create({
+      data: {
+        actorId: actor.id,
+        action: "SE_MONITORING_CHECKLIST_WEIGHTS_UPDATED",
+        entityType: checklistSubjectEntityType(subject),
+        entityId: checklistSubjectEntityId(subject),
+        metadata: {
+          ...checklistSubjectMeta(subject),
+          categoryId: category.id,
+          categoryName: category.name,
+          totalWeight: allocation.total,
+          changes,
+        },
+      },
+    });
+  });
+
+  if (subject.kind === "profile") {
+    return getEffectiveChecklist(actor, subject.profileId, category.id);
+  }
+  return getEffectiveChecklistForExecutive(
+    actor,
+    subject.executiveUserId,
+    category.id,
+  );
+}
+
+export async function saveSeChecklistWeights(
+  actor: Actor,
+  profileId: string,
+  input: SaveSeChecklistWeightsInput,
+) {
+  await assertCanCustomizeSeChecklist(actor, profileId);
+  return saveChecklistWeightsForSubject(
+    actor,
+    { kind: "profile", profileId },
+    input,
+  );
+}
+
+export async function saveSeChecklistWeightsForExecutive(
+  actor: Actor,
+  executiveUserId: string,
+  input: SaveSeChecklistWeightsInput,
+) {
+  await assertCanCustomizeSupportChecklist(actor, executiveUserId);
+  return saveChecklistWeightsForSubject(
+    actor,
+    { kind: "executive", executiveUserId },
+    input,
+  );
+}
+
+async function removeChecklistItemForSubject(
+  actor: Actor,
+  subject: ChecklistSubject,
+  itemId: string,
+) {
   const item = await prisma.seMonitoringChecklistItem.findFirst({
     where: {
       id: itemId,
-      salesExecutiveProfileId: profileId,
+      ...checklistSubjectWhere(subject),
       kind: "CUSTOM",
       isActive: true,
     },
   });
   if (!item) {
-    throw notFound("SE custom checklist item not found");
+    throw notFound("Custom checklist item not found");
   }
+
+  await ensureSeWeightSnapshot(subject, item.categoryId, actor.id);
 
   const updated = await prisma.seMonitoringChecklistItem.update({
     where: { id: item.id },
@@ -593,7 +1119,7 @@ export async function removeSeChecklistItem(
       entityType: "SeMonitoringChecklistItem",
       entityId: updated.id,
       metadata: {
-        profileId,
+        ...checklistSubjectMeta(subject),
         categoryId: updated.categoryId,
         label: updated.label,
       },
@@ -603,13 +1129,37 @@ export async function removeSeChecklistItem(
   return updated;
 }
 
-export async function removeTemplateItemFromSe(
+export async function removeSeChecklistItem(
   actor: Actor,
   profileId: string,
-  input: RemoveSeTemplateItemInput,
+  itemId: string,
 ) {
   await assertCanCustomizeSeChecklist(actor, profileId);
+  return removeChecklistItemForSubject(
+    actor,
+    { kind: "profile", profileId },
+    itemId,
+  );
+}
 
+export async function removeSeChecklistItemForExecutive(
+  actor: Actor,
+  executiveUserId: string,
+  itemId: string,
+) {
+  await assertCanCustomizeSupportChecklist(actor, executiveUserId);
+  return removeChecklistItemForSubject(
+    actor,
+    { kind: "executive", executiveUserId },
+    itemId,
+  );
+}
+
+async function removeTemplateItemForSubject(
+  actor: Actor,
+  subject: ChecklistSubject,
+  input: RemoveSeTemplateItemInput,
+) {
   const templateItem = await prisma.monitoringChecklistItem.findFirst({
     where: {
       id: input.templateItemId,
@@ -624,9 +1174,13 @@ export async function removeTemplateItemFromSe(
     );
   }
 
+  await ensureSeWeightSnapshot(subject, input.categoryId, actor.id);
+
+  const subjectFilter = checklistSubjectWhere(subject);
+
   const activeRemoval = await prisma.seMonitoringChecklistItem.findFirst({
     where: {
-      salesExecutiveProfileId: profileId,
+      ...subjectFilter,
       categoryId: input.categoryId,
       kind: "TEMPLATE_REMOVED",
       sourceTemplateItemId: input.templateItemId,
@@ -639,7 +1193,7 @@ export async function removeTemplateItemFromSe(
 
   const inactiveRemoval = await prisma.seMonitoringChecklistItem.findFirst({
     where: {
-      salesExecutiveProfileId: profileId,
+      ...subjectFilter,
       categoryId: input.categoryId,
       kind: "TEMPLATE_REMOVED",
       sourceTemplateItemId: input.templateItemId,
@@ -654,7 +1208,7 @@ export async function removeTemplateItemFromSe(
       })
     : await prisma.seMonitoringChecklistItem.create({
         data: {
-          salesExecutiveProfileId: profileId,
+          ...checklistSubjectCreate(subject),
           categoryId: input.categoryId,
           kind: "TEMPLATE_REMOVED",
           sourceTemplateItemId: input.templateItemId,
@@ -666,6 +1220,14 @@ export async function removeTemplateItemFromSe(
         },
       });
 
+  await prisma.seMonitoringChecklistWeight.deleteMany({
+    where: {
+      ...subjectFilter,
+      categoryId: input.categoryId,
+      sourceTemplateItemId: input.templateItemId,
+    },
+  });
+
   await prisma.auditLog.create({
     data: {
       actorId: actor.id,
@@ -673,10 +1235,10 @@ export async function removeTemplateItemFromSe(
       entityType: "SeMonitoringChecklistItem",
       entityId: row.id,
       metadata: {
-        profileId,
+        ...checklistSubjectMeta(subject),
         categoryId: input.categoryId,
         templateItemId: input.templateItemId,
-        note: "Removed from SE checklist config; global template unchanged",
+        note: "Removed from subject checklist config; global template unchanged",
       },
     },
   });
@@ -684,13 +1246,37 @@ export async function removeTemplateItemFromSe(
   return row;
 }
 
-export async function restoreTemplateItemForSe(
+export async function removeTemplateItemFromSe(
   actor: Actor,
   profileId: string,
   input: RemoveSeTemplateItemInput,
 ) {
   await assertCanCustomizeSeChecklist(actor, profileId);
+  return removeTemplateItemForSubject(
+    actor,
+    { kind: "profile", profileId },
+    input,
+  );
+}
 
+export async function removeTemplateItemFromExecutive(
+  actor: Actor,
+  executiveUserId: string,
+  input: RemoveSeTemplateItemInput,
+) {
+  await assertCanCustomizeSupportChecklist(actor, executiveUserId);
+  return removeTemplateItemForSubject(
+    actor,
+    { kind: "executive", executiveUserId },
+    input,
+  );
+}
+
+async function restoreTemplateItemForSubject(
+  actor: Actor,
+  subject: ChecklistSubject,
+  input: RemoveSeTemplateItemInput,
+) {
   const templateItem = await prisma.monitoringChecklistItem.findFirst({
     where: {
       id: input.templateItemId,
@@ -706,7 +1292,7 @@ export async function restoreTemplateItemForSe(
 
   const result = await prisma.seMonitoringChecklistItem.updateMany({
     where: {
-      salesExecutiveProfileId: profileId,
+      ...checklistSubjectWhere(subject),
       categoryId: input.categoryId,
       kind: "TEMPLATE_REMOVED",
       sourceTemplateItemId: input.templateItemId,
@@ -722,7 +1308,7 @@ export async function restoreTemplateItemForSe(
       entityType: "MonitoringChecklistItem",
       entityId: input.templateItemId,
       metadata: {
-        profileId,
+        ...checklistSubjectMeta(subject),
         categoryId: input.categoryId,
         templateItemId: input.templateItemId,
         deactivatedRemovals: result.count,
@@ -731,6 +1317,32 @@ export async function restoreTemplateItemForSe(
   });
 
   return { restored: result.count > 0, count: result.count };
+}
+
+export async function restoreTemplateItemForSe(
+  actor: Actor,
+  profileId: string,
+  input: RemoveSeTemplateItemInput,
+) {
+  await assertCanCustomizeSeChecklist(actor, profileId);
+  return restoreTemplateItemForSubject(
+    actor,
+    { kind: "profile", profileId },
+    input,
+  );
+}
+
+export async function restoreTemplateItemForExecutive(
+  actor: Actor,
+  executiveUserId: string,
+  input: RemoveSeTemplateItemInput,
+) {
+  await assertCanCustomizeSupportChecklist(actor, executiveUserId);
+  return restoreTemplateItemForSubject(
+    actor,
+    { kind: "executive", executiveUserId },
+    input,
+  );
 }
 
 export async function listMonitoringCategories(
@@ -922,6 +1534,9 @@ export async function deleteMonitoringCategory(actor: Actor, id: string) {
   }
 
   await prisma.$transaction(async (tx) => {
+    await tx.seMonitoringChecklistWeight.deleteMany({
+      where: { categoryId: id },
+    });
     await tx.seMonitoringChecklistItem.deleteMany({
       where: { categoryId: id },
     });
@@ -976,6 +1591,7 @@ export async function createChecklistItem(
       code: input.code,
       label: input.label,
       sortOrder: input.sortOrder ?? 0,
+      defaultWeight: input.defaultWeight ?? 0,
       isActive: input.isActive ?? true,
     },
   });
@@ -986,7 +1602,11 @@ export async function createChecklistItem(
       action: "MONITORING_CHECKLIST_ITEM_CREATED",
       entityType: "MonitoringChecklistItem",
       entityId: created.id,
-      metadata: { categoryId, code: created.code },
+      metadata: {
+        categoryId,
+        code: created.code,
+        defaultWeight: created.defaultWeight,
+      },
     },
   });
 
@@ -1013,6 +1633,7 @@ export async function updateChecklistItem(
       label: input.label,
       sortOrder: input.sortOrder,
       isActive: input.isActive,
+      defaultWeight: input.defaultWeight,
       archivedAt:
         input.archivedAt === undefined ? undefined : input.archivedAt,
     },
@@ -1027,6 +1648,8 @@ export async function updateChecklistItem(
       metadata: {
         isActive: updated.isActive,
         archivedAt: updated.archivedAt,
+        defaultWeight: updated.defaultWeight,
+        previousDefaultWeight: existing.defaultWeight,
       },
     },
   });
@@ -1054,6 +1677,9 @@ export async function listMonitoringRecords(
       ...(query.profileId
         ? [{ salesExecutiveProfileId: query.profileId }]
         : []),
+      ...(query.executiveUserId
+        ? [{ executiveUserId: query.executiveUserId }]
+        : []),
       ...(query.categoryId ? [{ categoryId: query.categoryId }] : []),
       ...(Object.keys(dateFilter).length ? [dateFilter] : []),
       ...(query.search
@@ -1072,6 +1698,30 @@ export async function listMonitoringRecords(
                       contains: query.search,
                       mode: "insensitive" as const,
                     },
+                  },
+                },
+                {
+                  executiveUser: {
+                    OR: [
+                      {
+                        firstName: {
+                          contains: query.search,
+                          mode: "insensitive" as const,
+                        },
+                      },
+                      {
+                        lastName: {
+                          contains: query.search,
+                          mode: "insensitive" as const,
+                        },
+                      },
+                      {
+                        email: {
+                          contains: query.search,
+                          mode: "insensitive" as const,
+                        },
+                      },
+                    ],
                   },
                 },
                 {
@@ -1132,7 +1782,98 @@ export async function createMonitoringRecord(
     throw forbidden("Only Commandos and Team Leads can create live monitoring records");
   }
 
+  if (input.executiveUserId) {
+    await assertCanManageSupportUser(prisma, actor, input.executiveUserId);
+    const subject: ChecklistSubject = {
+      kind: "executive",
+      executiveUserId: input.executiveUserId,
+    };
+
+    if (!input.responses.length) {
+      throw badRequest("At least one checklist response is required");
+    }
+
+    const {
+      category,
+      items: effectiveItems,
+      weightAllocation,
+    } = await buildEffectiveChecklist(subject, input.categoryId);
+
+    if (!weightAllocation.isComplete) {
+      if (weightAllocation.remaining > 0) {
+        throw badRequest(
+          `This Support checklist weights must total 100% before monitoring. Currently ${weightAllocation.total}% — ${weightAllocation.remaining}% remaining. Open Customize Checklist to allocate weights.`,
+        );
+      }
+      throw badRequest(
+        `This Support checklist weights must total 100% before monitoring. Currently ${weightAllocation.total}% — ${weightAllocation.over}% over allocation. Open Customize Checklist to fix weights.`,
+      );
+    }
+
+    const responseCreates = buildResponseCreates(input, effectiveItems);
+
+    const scored = computeWeightedScore(
+      responseCreates.map((r) => ({
+        value: r.value as string,
+        weight: (r.weightSnapshot as number) ?? 0,
+      })),
+    );
+
+    const created = await prisma.$transaction(async (tx) => {
+      const record = await tx.liveMonitoringRecord.create({
+        data: {
+          salesExecutiveProfileId: null,
+          executiveUserId: input.executiveUserId,
+          assignmentId: null,
+          categoryId: category.id,
+          observation: input.observation?.trim()
+            ? input.observation.trim()
+            : null,
+          scorePercent: scored.scorePercent,
+          createdById: actor.id,
+          observedAt: input.observedAt ?? new Date(),
+          responses: {
+            create: responseCreates,
+          },
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          actorId: actor.id,
+          action: "MONITORING_RECORD_CREATED",
+          entityType: "LiveMonitoringRecord",
+          entityId: record.id,
+          metadata: {
+            executiveUserId: input.executiveUserId,
+            categoryId: category.id,
+            assignmentId: null,
+            responseCount: input.responses.length,
+            supportInvolvementCount: 0,
+            scorePercent: scored.scorePercent,
+          },
+        },
+      });
+
+      return tx.liveMonitoringRecord.findUniqueOrThrow({
+        where: { id: record.id },
+        include: recordInclude,
+      });
+    });
+
+    // Support subjects have no SE profile — skip workspace dual-write.
+    return serialize(created);
+  }
+
+  if (!input.salesExecutiveProfileId) {
+    throw badRequest("Missing monitoring subject");
+  }
+
   const profile = await loadProfileOrThrow(input.salesExecutiveProfileId);
+  const subject: ChecklistSubject = {
+    kind: "profile",
+    profileId: profile.id,
+  };
 
   let assignmentId: string | null = null;
 
@@ -1164,113 +1905,43 @@ export async function createMonitoringRecord(
     throw badRequest("At least one checklist response is required");
   }
 
-  const { category, items: effectiveItems } = await buildEffectiveChecklist(
-    profile.id,
-    input.categoryId,
+  const {
+    category,
+    items: effectiveItems,
+    weightAllocation,
+  } = await buildEffectiveChecklist(subject, input.categoryId);
+
+  if (!weightAllocation.isComplete) {
+    if (weightAllocation.remaining > 0) {
+      throw badRequest(
+        `This SE's checklist weights must total 100% before monitoring. Currently ${weightAllocation.total}% — ${weightAllocation.remaining}% remaining. Open Customize Checklist to allocate weights.`,
+      );
+    }
+    throw badRequest(
+      `This SE's checklist weights must total 100% before monitoring. Currently ${weightAllocation.total}% — ${weightAllocation.over}% over allocation. Open Customize Checklist to fix weights.`,
+    );
+  }
+
+  const responseCreates = buildResponseCreates(input, effectiveItems);
+
+  const scored = computeWeightedScore(
+    responseCreates.map((r) => ({
+      value: r.value as string,
+      weight: (r.weightSnapshot as number) ?? 0,
+    })),
   );
-
-  const templateById = new Map(
-    effectiveItems
-      .filter((i) => i.sourceType === "TEMPLATE" && i.checklistItemId)
-      .map((i) => [i.checklistItemId as string, i]),
-  );
-  const customById = new Map(
-    effectiveItems
-      .filter((i) => i.sourceType === "CUSTOM" && i.seChecklistItemId)
-      .map((i) => [i.seChecklistItemId as string, i]),
-  );
-
-  const seenTemplate = new Set<string>();
-  const seenCustom = new Set<string>();
-
-  const responseCreates: Prisma.MonitoringChecklistResponseCreateWithoutRecordInput[] =
-    input.responses.map((r, index) => {
-      const inferred: "TEMPLATE" | "CUSTOM" | "SESSION" =
-        r.sourceType ??
-        (r.seChecklistItemId
-          ? "CUSTOM"
-          : r.checklistItemId
-            ? "TEMPLATE"
-            : "SESSION");
-
-      if (inferred === "TEMPLATE") {
-        if (!r.checklistItemId) {
-          throw badRequest("Template responses require checklistItemId");
-        }
-        if (seenTemplate.has(r.checklistItemId)) {
-          throw badRequest("Duplicate checklist item responses are not allowed");
-        }
-        seenTemplate.add(r.checklistItemId);
-        const item = templateById.get(r.checklistItemId);
-        if (!item) {
-          throw badRequest(
-            "Checklist response references a template item that is inactive, removed for this SE, or not in the category",
-          );
-        }
-        return {
-          checklistItemId: item.checklistItemId,
-          seChecklistItemId: null,
-          labelSnapshot: item.label,
-          descriptionSnapshot: item.description,
-          codeSnapshot: item.code,
-          sortOrderSnapshot: item.sortOrder,
-          sourceType: "TEMPLATE",
-          value: r.value,
-        };
-      }
-
-      if (inferred === "CUSTOM") {
-        if (!r.seChecklistItemId) {
-          throw badRequest("Custom responses require seChecklistItemId");
-        }
-        if (seenCustom.has(r.seChecklistItemId)) {
-          throw badRequest("Duplicate checklist item responses are not allowed");
-        }
-        seenCustom.add(r.seChecklistItemId);
-        const item = customById.get(r.seChecklistItemId);
-        if (!item) {
-          throw badRequest(
-            "Checklist response references an inactive or unknown SE custom item for this category",
-          );
-        }
-        return {
-          checklistItemId: null,
-          seChecklistItemId: item.seChecklistItemId,
-          labelSnapshot: item.label,
-          descriptionSnapshot: item.description,
-          codeSnapshot: null,
-          sortOrderSnapshot: item.sortOrder,
-          sourceType: "CUSTOM",
-          value: r.value,
-        };
-      }
-
-      if (!r.label?.trim()) {
-        throw badRequest("Session-only items require a label");
-      }
-      return {
-        checklistItemId: null,
-        seChecklistItemId: null,
-        labelSnapshot: r.label.trim(),
-        descriptionSnapshot: r.description?.trim()
-          ? r.description.trim()
-          : null,
-        codeSnapshot: null,
-        sortOrderSnapshot: r.sortOrder ?? index,
-        sourceType: "SESSION",
-        value: r.value,
-      };
-    });
 
   const created = await prisma.$transaction(async (tx) => {
     const record = await tx.liveMonitoringRecord.create({
       data: {
         salesExecutiveProfileId: profile.id,
+        executiveUserId: null,
         assignmentId,
         categoryId: category.id,
         observation: input.observation?.trim()
           ? input.observation.trim()
           : null,
+        scorePercent: scored.scorePercent,
         createdById: actor.id,
         observedAt: input.observedAt ?? new Date(),
         responses: {
@@ -1334,6 +2005,7 @@ export async function createMonitoringRecord(
           assignmentId,
           responseCount: input.responses.length,
           supportInvolvementCount: supportIds.length,
+          scorePercent: scored.scorePercent,
         },
       },
     });
@@ -1344,18 +2016,120 @@ export async function createMonitoringRecord(
     });
   });
 
-  await recordWorkspaceEvent({
-    salesExecutiveProfileId: created.salesExecutiveProfileId,
-    assignmentId: created.assignmentId,
-    type: "MONITORING",
-    title: `Monitoring · ${created.category?.name ?? "Session"}`,
-    notes: created.observation,
-    status: "COMPLETED",
-    occurredAt: created.observedAt,
-    sourceType: "LiveMonitoringRecord",
-    sourceId: created.id,
-    createdById: actor.id,
-  });
+  if (created.salesExecutiveProfileId) {
+    await recordWorkspaceEvent({
+      salesExecutiveProfileId: created.salesExecutiveProfileId,
+      assignmentId: created.assignmentId,
+      type: "MONITORING",
+      title: `Monitoring · ${created.category?.name ?? "Session"}`,
+      notes: created.observation,
+      status: "COMPLETED",
+      occurredAt: created.observedAt,
+      sourceType: "LiveMonitoringRecord",
+      sourceId: created.id,
+      createdById: actor.id,
+    });
+  }
 
   return serialize(created);
+}
+
+function buildResponseCreates(
+  input: CreateMonitoringRecordInput,
+  effectiveItems: EffectiveItem[],
+): Prisma.MonitoringChecklistResponseCreateWithoutRecordInput[] {
+  const templateById = new Map(
+    effectiveItems
+      .filter((i) => i.sourceType === "TEMPLATE" && i.checklistItemId)
+      .map((i) => [i.checklistItemId as string, i]),
+  );
+  const customById = new Map(
+    effectiveItems
+      .filter((i) => i.sourceType === "CUSTOM" && i.seChecklistItemId)
+      .map((i) => [i.seChecklistItemId as string, i]),
+  );
+
+  const seenTemplate = new Set<string>();
+  const seenCustom = new Set<string>();
+
+  return input.responses.map((r, index) => {
+    const inferred: "TEMPLATE" | "CUSTOM" | "SESSION" =
+      r.sourceType ??
+      (r.seChecklistItemId
+        ? "CUSTOM"
+        : r.checklistItemId
+          ? "TEMPLATE"
+          : "SESSION");
+
+    if (inferred === "TEMPLATE") {
+      if (!r.checklistItemId) {
+        throw badRequest("Template responses require checklistItemId");
+      }
+      if (seenTemplate.has(r.checklistItemId)) {
+        throw badRequest("Duplicate checklist item responses are not allowed");
+      }
+      seenTemplate.add(r.checklistItemId);
+      const item = templateById.get(r.checklistItemId);
+      if (!item) {
+        throw badRequest(
+          "Checklist response references a template item that is inactive, removed for this subject, or not in the category",
+        );
+      }
+      return {
+        checklistItemId: item.checklistItemId,
+        seChecklistItemId: null,
+        labelSnapshot: item.label,
+        descriptionSnapshot: item.description,
+        codeSnapshot: item.code,
+        sortOrderSnapshot: item.sortOrder,
+        weightSnapshot: item.weight,
+        sourceType: "TEMPLATE",
+        value: r.value,
+      };
+    }
+
+    if (inferred === "CUSTOM") {
+      if (!r.seChecklistItemId) {
+        throw badRequest("Custom responses require seChecklistItemId");
+      }
+      if (seenCustom.has(r.seChecklistItemId)) {
+        throw badRequest("Duplicate checklist item responses are not allowed");
+      }
+      seenCustom.add(r.seChecklistItemId);
+      const item = customById.get(r.seChecklistItemId);
+      if (!item) {
+        throw badRequest(
+          "Checklist response references an inactive or unknown custom item for this category",
+        );
+      }
+      return {
+        checklistItemId: null,
+        seChecklistItemId: item.seChecklistItemId,
+        labelSnapshot: item.label,
+        descriptionSnapshot: item.description,
+        codeSnapshot: null,
+        sortOrderSnapshot: item.sortOrder,
+        weightSnapshot: item.weight,
+        sourceType: "CUSTOM",
+        value: r.value,
+      };
+    }
+
+    if (!r.label?.trim()) {
+      throw badRequest("Session-only items require a label");
+    }
+    return {
+      checklistItemId: null,
+      seChecklistItemId: null,
+      labelSnapshot: r.label.trim(),
+      descriptionSnapshot: r.description?.trim()
+        ? r.description.trim()
+        : null,
+      codeSnapshot: null,
+      sortOrderSnapshot: r.sortOrder ?? index,
+      weightSnapshot: 0,
+      sourceType: "SESSION",
+      value: r.value,
+    };
+  });
 }

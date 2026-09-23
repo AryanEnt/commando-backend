@@ -7,7 +7,13 @@ import { PERMISSIONS } from "../../lib/permissions.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
+import { createPresignedGetUrl } from "../../lib/r2.js";
+import {
+  assertAllowedSupportTaskImageUpload,
+  isOwnedSupportTaskImageKey,
+} from "../uploads/schemas.js";
 import type {
+  AddSupportTaskAttachmentInput,
   AddSupportTaskProgressNoteInput,
   CreateSupportTaskInput,
   ListSupportTasksQuery,
@@ -58,6 +64,11 @@ const taskInclude = {
     orderBy: { createdAt: "desc" as const },
     take: 50,
     include: { createdBy: userBrief },
+  },
+  attachments: {
+    orderBy: { createdAt: "desc" as const },
+    take: 50,
+    include: { uploadedBy: userBrief },
   },
   assignmentEvents: {
     orderBy: { createdAt: "desc" as const },
@@ -125,6 +136,15 @@ function serialize(row: TaskRow) {
       body: n.body,
       createdAt: n.createdAt,
       createdBy: n.createdBy,
+    })),
+    attachments: row.attachments.map((a) => ({
+      id: a.id,
+      fileName: a.fileName,
+      contentType: a.contentType,
+      sizeBytes: a.sizeBytes,
+      caption: a.caption,
+      createdAt: a.createdAt,
+      uploadedBy: a.uploadedBy,
     })),
     assignmentHistory: row.assignmentEvents.map((e) => ({
       id: e.id,
@@ -803,6 +823,10 @@ export async function addSupportTaskProgressNote(
     if (row.salesSupportUserId !== actor.id) {
       throw forbidden("You may only add notes on tasks assigned to you");
     }
+  } else if (actor.roleCode === "SALES_EXECUTIVE") {
+    if (row.profile.userId !== actor.id) {
+      throw forbidden("You may only add notes on your own support tasks");
+    }
   } else if (
     actor.roleCode !== "COMMANDO_EXECUTIVE" &&
     actor.roleCode !== "TEAM_LEAD" &&
@@ -829,6 +853,159 @@ export async function addSupportTaskProgressNote(
     entityType: "SupportTask",
     entityId: row.id,
     metadata: { preview: input.body.trim().slice(0, 120) },
+  });
+
+  const refreshed = await prisma.supportTask.findFirst({
+    where: { id: row.id },
+    include: taskInclude,
+  });
+  if (!refreshed) throw notFound("Support task not found");
+  return serialize(refreshed);
+}
+
+function assertCanAddScreenshot(actor: Actor, row: TaskRow): void {
+  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+    if (row.salesSupportUserId !== actor.id) {
+      throw forbidden("You may only add screenshots on tasks assigned to you");
+    }
+    return;
+  }
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    if (row.profile.userId !== actor.id) {
+      throw forbidden("You may only add screenshots on your own support tasks");
+    }
+    return;
+  }
+  throw forbidden(
+    "Only Sales Executives and Sales Support may add screenshots",
+  );
+}
+
+export async function addSupportTaskAttachment(
+  actor: Actor,
+  id: string,
+  input: AddSupportTaskAttachmentInput,
+) {
+  const row = await prisma.supportTask.findFirst({
+    where: { id, archivedAt: null },
+    include: taskInclude,
+  });
+  if (!row) throw notFound("Support task not found");
+  await assertCanAccess(actor, row);
+  assertCanAddScreenshot(actor, row);
+
+  if (row.status === "COMPLETED") {
+    throw badRequest("Cannot add screenshots to a completed task");
+  }
+
+  try {
+    assertAllowedSupportTaskImageUpload({
+      contentType: input.contentType,
+      contentLength: input.size ?? 1,
+    });
+  } catch (err) {
+    throw badRequest(err instanceof Error ? err.message : "Invalid image");
+  }
+
+  if (!isOwnedSupportTaskImageKey(input.key, actor.id)) {
+    throw badRequest("Invalid screenshot upload key");
+  }
+
+  await prisma.supportTaskAttachment.create({
+    data: {
+      supportTaskId: row.id,
+      storageKey: input.key,
+      fileName: input.fileName.trim(),
+      contentType: input.contentType,
+      sizeBytes: input.size ?? null,
+      caption: input.caption?.trim() || null,
+      uploadedById: actor.id,
+    },
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: AUDIT_ACTIONS.SUPPORT_TASK_ATTACHMENT_ADDED,
+    entityType: "SupportTask",
+    entityId: row.id,
+    metadata: {
+      fileName: input.fileName.trim(),
+      contentType: input.contentType,
+    },
+  });
+
+  const refreshed = await prisma.supportTask.findFirst({
+    where: { id: row.id },
+    include: taskInclude,
+  });
+  if (!refreshed) throw notFound("Support task not found");
+  return serialize(refreshed);
+}
+
+export async function getSupportTaskAttachmentUrl(
+  actor: Actor,
+  taskId: string,
+  attachmentId: string,
+) {
+  const row = await prisma.supportTask.findFirst({
+    where: { id: taskId, archivedAt: null },
+    include: taskInclude,
+  });
+  if (!row) throw notFound("Support task not found");
+  await assertCanAccess(actor, row);
+
+  const attachment = await prisma.supportTaskAttachment.findFirst({
+    where: { id: attachmentId, supportTaskId: taskId },
+  });
+  if (!attachment) throw notFound("Screenshot not found");
+
+  const url = await createPresignedGetUrl({
+    key: attachment.storageKey,
+    fileName: attachment.fileName,
+    expiresInSeconds: 600,
+  });
+
+  return {
+    url,
+    fileName: attachment.fileName,
+    contentType: attachment.contentType,
+    expiresInSeconds: 600,
+  };
+}
+
+export async function removeSupportTaskAttachment(
+  actor: Actor,
+  taskId: string,
+  attachmentId: string,
+) {
+  const row = await prisma.supportTask.findFirst({
+    where: { id: taskId, archivedAt: null },
+    include: taskInclude,
+  });
+  if (!row) throw notFound("Support task not found");
+  await assertCanAccess(actor, row);
+
+  const attachment = await prisma.supportTaskAttachment.findFirst({
+    where: { id: attachmentId, supportTaskId: taskId },
+  });
+  if (!attachment) throw notFound("Screenshot not found");
+
+  const canRemoveOwn =
+    (actor.roleCode === "SALES_EXECUTIVE" ||
+      actor.roleCode === "SALES_SUPPORT_EXECUTIVE") &&
+    attachment.uploadedById === actor.id;
+  if (!canRemoveOwn && !isSuperAdmin(actor)) {
+    throw forbidden("You may only remove screenshots you uploaded");
+  }
+
+  await prisma.supportTaskAttachment.delete({ where: { id: attachment.id } });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: AUDIT_ACTIONS.SUPPORT_TASK_ATTACHMENT_REMOVED,
+    entityType: "SupportTask",
+    entityId: row.id,
+    metadata: { attachmentId: attachment.id, fileName: attachment.fileName },
   });
 
   const refreshed = await prisma.supportTask.findFirst({

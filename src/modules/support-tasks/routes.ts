@@ -10,6 +10,7 @@ import {
   updateSupportTaskSchema,
   updateSupportTaskStatusSchema,
   addSupportTaskProgressNoteSchema,
+  addSupportTaskAttachmentSchema,
 } from "./schemas.js";
 import * as controller from "./controller.js";
 
@@ -55,4 +56,23 @@ supportTasksRouter.post(
   requirePermission(PERMISSIONS.SALES_SUPPORT_TASK_VIEW),
   validate(addSupportTaskProgressNoteSchema),
   controller.addSupportTaskProgressNote,
+);
+
+supportTasksRouter.post(
+  "/:id/attachments",
+  requirePermission(PERMISSIONS.SALES_SUPPORT_TASK_VIEW),
+  validate(addSupportTaskAttachmentSchema),
+  controller.addSupportTaskAttachment,
+);
+
+supportTasksRouter.get(
+  "/:id/attachments/:attachmentId/url",
+  requirePermission(PERMISSIONS.SALES_SUPPORT_TASK_VIEW),
+  controller.getSupportTaskAttachmentUrl,
+);
+
+supportTasksRouter.delete(
+  "/:id/attachments/:attachmentId",
+  requirePermission(PERMISSIONS.SALES_SUPPORT_TASK_VIEW),
+  controller.removeSupportTaskAttachment,
 );

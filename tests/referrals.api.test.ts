@@ -50,6 +50,10 @@ describe("referral lifecycle", () => {
         where: { salesExecutiveProfileId: profileId, status: "ACTIVE" },
         data: { status: "COMPLETED", endedAt: new Date() },
       });
+      await prisma.salesSupportLink.updateMany({
+        where: { salesExecutiveProfileId: profileId, isActive: true },
+        data: { isActive: false, endedAt: new Date() },
+      });
 
       dbReady = true;
     } catch {
@@ -373,6 +377,11 @@ describe("commando request → TL provide information → lock", () => {
   }) => {
     if (!dbReady) skip();
 
+    await prisma.salesSupportLink.updateMany({
+      where: { salesExecutiveProfileId: profileId, isActive: true },
+      data: { isActive: false, endedAt: new Date() },
+    });
+
     const c = await token("commando@commando.local");
     const options = await request(app)
       .get("/api/referrals/options/requestable-profiles")
@@ -474,5 +483,97 @@ describe("commando request → TL provide information → lock", () => {
         threat: "Resumed ownership threat",
       });
     expect(unlocked.status).toBe(201);
+  });
+
+  it("requires Team Lead SWOT for assigned Sales Support", async ({ skip }) => {
+    if (!dbReady) skip();
+
+    const support = await prisma.user.findUnique({
+      where: { email: "support@commando.local" },
+    });
+    if (!support) skip();
+
+    await prisma.commandoAssignment.updateMany({
+      where: { salesExecutiveProfileId: profileId, status: "ACTIVE" },
+      data: { status: "COMPLETED", endedAt: new Date() },
+    });
+    await prisma.salesSupportLink.updateMany({
+      where: { salesExecutiveProfileId: profileId, isActive: true },
+      data: { isActive: false, endedAt: new Date() },
+    });
+    await prisma.salesSupportLink.create({
+      data: {
+        salesExecutiveProfileId: profileId,
+        salesSupportUserId: support.id,
+        isActive: true,
+      },
+    });
+
+    const c = await token("commando@commando.local");
+    const created = await request(app)
+      .post("/api/referrals/request")
+      .set("Authorization", `Bearer ${c}`)
+      .send({
+        salesExecutiveProfileId: profileId,
+        requestReason: "Need support-side SWOT on the packet",
+      });
+    expect(created.status).toBe(201);
+    const id = created.body.data.referral.id as string;
+
+    const pending = await request(app)
+      .get(`/api/referrals/${id}`)
+      .set("Authorization", `Bearer ${c}`);
+    expect(pending.status).toBe(200);
+    expect(pending.body.data.referral.assignedSupport).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ userId: support.id }),
+      ]),
+    );
+
+    const packet = {
+      ...fields,
+      priority1: "Discovery quality",
+      priority2: "Qualification discipline",
+      priority3: "Talk-track consistency",
+      swot: {
+        strength: "Strong product knowledge",
+        weakness: "Shallow discovery",
+        opportunity: "Rebuild qualification habit",
+        threat: "Continued pipeline leakage",
+      },
+    };
+
+    const tl = await token("teamlead@commando.local");
+    const missing = await request(app)
+      .post(`/api/referrals/${id}/provide-information`)
+      .set("Authorization", `Bearer ${tl}`)
+      .send(packet);
+    expect(missing.status).toBe(400);
+
+    const provided = await request(app)
+      .post(`/api/referrals/${id}/provide-information`)
+      .set("Authorization", `Bearer ${tl}`)
+      .send({
+        ...packet,
+        supportSwot: [
+          {
+            executiveUserId: support.id,
+            strength: "Reliable follow-through",
+            weakness: "Slow proposal turnaround",
+            opportunity: "Own pricing playbook",
+            threat: "SE wait time grows",
+          },
+        ],
+      });
+    expect(provided.status).toBe(200);
+    expect(provided.body.data.referral.teamLeadSupportSwot).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          executiveUserId: support.id,
+          strength: "Reliable follow-through",
+          weakness: "Slow proposal turnaround",
+        }),
+      ]),
+    );
   });
 });

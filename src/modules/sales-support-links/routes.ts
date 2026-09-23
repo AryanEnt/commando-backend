@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   requireAuthentication,
+  requireAnyPermission,
   requirePermission,
 } from "../../middleware/auth.js";
 import { validate } from "../../middleware/validate.js";
@@ -20,7 +21,10 @@ salesSupportLinksRouter.get(
 
 salesSupportLinksRouter.get(
   "/options/support-users",
-  requirePermission(PERMISSIONS.SALES_SUPPORT_LINK_ASSIGN),
+  requireAnyPermission([
+    PERMISSIONS.SALES_SUPPORT_LINK_VIEW,
+    PERMISSIONS.SALES_SUPPORT_LINK_ASSIGN,
+  ]),
   controller.listEligibleSupportUsers,
 );
 

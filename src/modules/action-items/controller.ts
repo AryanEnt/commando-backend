@@ -73,6 +73,23 @@ export async function updateActionItem(
   }
 }
 
+export async function updateActionItemSummary(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const actionItem = await service.updateActionItemSummary(
+      req.user as Actor,
+      paramId(req.params.id),
+      req.body,
+    );
+    res.status(200).json({ data: { actionItem } });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function completeActionItem(
   req: Request,
   res: Response,
@@ -117,6 +134,57 @@ export async function replaceActionItem(
       req.body,
     );
     res.status(201).json({ data: { actionItem } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function addActionItemAttachment(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const actionItem = await service.addActionItemAttachment(
+      req.user as Actor,
+      paramId(req.params.id),
+      req.body,
+    );
+    res.status(201).json({ data: { actionItem } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getActionItemAttachmentUrl(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const data = await service.getActionItemAttachmentUrl(
+      req.user as Actor,
+      paramId(req.params.id),
+      paramId(req.params.attachmentId),
+    );
+    res.status(200).json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function removeActionItemAttachment(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const actionItem = await service.removeActionItemAttachment(
+      req.user as Actor,
+      paramId(req.params.id),
+      paramId(req.params.attachmentId),
+    );
+    res.status(200).json({ data: { actionItem } });
   } catch (err) {
     next(err);
   }

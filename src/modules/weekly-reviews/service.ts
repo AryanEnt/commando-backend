@@ -6,6 +6,12 @@ import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
+import {
+  assertCanManageSupportUser,
+  assertCanViewSupportUser,
+  supportUserIdsOnTeams,
+  teamIdsForCommandoActive,
+} from "../../lib/supportScope.js";
 import { createPresignedGetUrl } from "../../lib/r2.js";
 import { isOwnedWeeklyReviewMinutesKey } from "../uploads/schemas.js";
 import type {
@@ -27,6 +33,15 @@ const reviewInclude = {
       displayName: true,
       userId: true,
       teamId: true,
+    },
+  },
+  executiveUser: {
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      email: true,
+      role: { select: { code: true } },
     },
   },
   createdBy: {
@@ -69,18 +84,40 @@ async function loadUsers(ids: string[]): Promise<Map<string, UserBrief>> {
   return new Map(users.map((u) => [u.id, u]));
 }
 
+function subjectUserId(row: ReviewRow): string | null {
+  return row.executiveUserId ?? row.profile?.userId ?? null;
+}
+
+function subjectName(row: ReviewRow): string {
+  if (row.profile?.displayName) return row.profile.displayName;
+  if (row.executiveUser) {
+    return `${row.executiveUser.firstName} ${row.executiveUser.lastName}`.trim();
+  }
+  return "Unknown";
+}
+
 function serialize(row: ReviewRow, users: Map<string, UserBrief>, viewerId?: string) {
   const myAttendee = viewerId
     ? row.attendees.find((a) => a.userId === viewerId)
     : undefined;
-  const salesExecutiveAttendee = row.attendees.find(
-    (a) => a.userId === row.profile.userId,
-  );
+  const ownerId = subjectUserId(row);
+  const salesExecutiveAttendee = ownerId
+    ? row.attendees.find((a) => a.userId === ownerId)
+    : undefined;
 
   return {
     id: row.id,
     salesExecutiveProfileId: row.salesExecutiveProfileId,
+    executiveUserId: row.executiveUserId,
     profile: row.profile,
+    executiveUser: row.executiveUser,
+    subject: {
+      type: row.executiveUserId
+        ? ("SALES_SUPPORT_EXECUTIVE" as const)
+        : ("SALES_EXECUTIVE" as const),
+      id: ownerId ?? "",
+      name: subjectName(row),
+    },
     assignmentId: row.assignmentId,
     assignment: row.assignment,
     commandoUserId: row.commandoUserId,
@@ -165,16 +202,92 @@ function normalizeMeetingMinutes(
   return minutes;
 }
 
+async function assignedProfileIds(commandoUserId: string): Promise<string[]> {
+  const assignments = await prisma.commandoAssignment.findMany({
+    where: { commandoUserId },
+    select: { salesExecutiveProfileId: true },
+  });
+  return [...new Set(assignments.map((a) => a.salesExecutiveProfileId))];
+}
+
+async function resolveTeamLeadForSupportUser(
+  supportUserId: string,
+  commandoUserId?: string,
+): Promise<string> {
+  if (commandoUserId) {
+    const links = await prisma.salesSupportLink.findMany({
+      where: { salesSupportUserId: supportUserId, isActive: true },
+      select: { salesExecutiveProfileId: true },
+    });
+    const profileIds = links.map((l) => l.salesExecutiveProfileId);
+    if (profileIds.length > 0) {
+      const assignment = await prisma.commandoAssignment.findFirst({
+        where: {
+          commandoUserId,
+          status: "ACTIVE",
+          salesExecutiveProfileId: { in: profileIds },
+        },
+        select: { teamLeadUserId: true },
+      });
+      if (assignment) return assignment.teamLeadUserId;
+    }
+  }
+
+  const teamIds = (
+    await prisma.teamMembership.findMany({
+      where: {
+        userId: supportUserId,
+        isActive: true,
+        endedAt: null,
+      },
+      select: { teamId: true },
+    })
+  ).map((m) => m.teamId);
+  if (teamIds.length > 0) {
+    const lead = await prisma.teamMembership.findFirst({
+      where: {
+        teamId: { in: teamIds },
+        isActive: true,
+        endedAt: null,
+        user: { role: { code: "TEAM_LEAD" }, deletedAt: null },
+      },
+      select: { userId: true },
+    });
+    if (lead) return lead.userId;
+  }
+
+  throw badRequest(
+    "Could not resolve a Team Lead for this Sales Support review",
+  );
+}
+
 async function scopeWhere(actor: Actor): Promise<Prisma.WeeklyReviewWhereInput> {
   if (isSuperAdmin(actor)) {
     return { archivedAt: null };
   }
 
   switch (actor.roleCode) {
-    case "COMMANDO_EXECUTIVE":
-      return { archivedAt: null, commandoUserId: actor.id };
+    case "COMMANDO_EXECUTIVE": {
+      const [profileIds, teamIds] = await Promise.all([
+        assignedProfileIds(actor.id),
+        teamIdsForCommandoActive(prisma, actor.id),
+      ]);
+      const supportIds = await supportUserIdsOnTeams(prisma, teamIds);
+      return {
+        archivedAt: null,
+        OR: [
+          { commandoUserId: actor.id },
+          { createdById: actor.id },
+          { salesExecutiveProfileId: { in: profileIds } },
+          ...(supportIds.length > 0
+            ? [{ executiveUserId: { in: supportIds } }]
+            : []),
+        ],
+      };
+    }
     case "TEAM_LEAD": {
       const teamIds = await getActiveTeamIds(prisma, actor.id);
+      const supportIds = await supportUserIdsOnTeams(prisma, teamIds);
       return {
         archivedAt: null,
         OR: [
@@ -184,6 +297,9 @@ async function scopeWhere(actor: Actor): Promise<Prisma.WeeklyReviewWhereInput> 
             OR: [
               { teamLeadUserId: actor.id },
               { profile: { teamId: { in: teamIds } } },
+              ...(supportIds.length > 0
+                ? [{ executiveUserId: { in: supportIds } }]
+                : []),
             ],
           },
         ],
@@ -195,13 +311,18 @@ async function scopeWhere(actor: Actor): Promise<Prisma.WeeklyReviewWhereInput> 
         select: { id: true },
       });
       if (!profile) return { id: "__none__" };
-      // SE sees submitted reviews on their own profile (TL and Commando).
       return {
         archivedAt: null,
         salesExecutiveProfileId: profile.id,
         status: "SUBMITTED",
       };
     }
+    case "SALES_SUPPORT_EXECUTIVE":
+      return {
+        archivedAt: null,
+        executiveUserId: actor.id,
+        status: "SUBMITTED",
+      };
     default:
       return { id: "__none__" };
   }
@@ -211,10 +332,24 @@ async function assertCanAccess(actor: Actor, row: ReviewRow): Promise<void> {
   if (isSuperAdmin(actor)) return;
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    if (row.commandoUserId !== actor.id) {
-      throw forbidden("Review is outside your assignment scope");
+    if (row.commandoUserId === actor.id || row.createdById === actor.id) {
+      return;
     }
-    return;
+    if (row.executiveUserId) {
+      await assertCanViewSupportUser(prisma, actor, row.executiveUserId);
+      return;
+    }
+    if (row.salesExecutiveProfileId) {
+      const assigned = await prisma.commandoAssignment.findFirst({
+        where: {
+          salesExecutiveProfileId: row.salesExecutiveProfileId,
+          commandoUserId: actor.id,
+        },
+        select: { id: true },
+      });
+      if (assigned) return;
+    }
+    throw forbidden("Review is outside your assignment scope");
   }
 
   if (actor.roleCode === "TEAM_LEAD") {
@@ -222,18 +357,28 @@ async function assertCanAccess(actor: Actor, row: ReviewRow): Promise<void> {
     if (row.status !== "SUBMITTED") {
       throw forbidden("Draft reviews are not visible to Team Leads");
     }
+    if (row.teamLeadUserId === actor.id) return;
+    if (row.executiveUserId) {
+      await assertCanViewSupportUser(prisma, actor, row.executiveUserId);
+      return;
+    }
     const teamIds = await getActiveTeamIds(prisma, actor.id);
-    if (
-      row.teamLeadUserId !== actor.id &&
-      !teamIds.includes(row.profile.teamId)
-    ) {
-      throw forbidden("Review is outside your team scope");
+    if (row.profile && teamIds.includes(row.profile.teamId)) return;
+    throw forbidden("Review is outside your team scope");
+  }
+
+  if (actor.roleCode === "SALES_EXECUTIVE") {
+    if (!row.profile || row.profile.userId !== actor.id) {
+      throw forbidden("You may only view your own weekly reviews");
+    }
+    if (row.status !== "SUBMITTED") {
+      throw forbidden("This weekly review is not available yet");
     }
     return;
   }
 
-  if (actor.roleCode === "SALES_EXECUTIVE") {
-    if (row.profile.userId !== actor.id) {
+  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+    if (row.executiveUserId !== actor.id) {
       throw forbidden("You may only view your own weekly reviews");
     }
     if (row.status !== "SUBMITTED") {
@@ -264,6 +409,9 @@ export async function listWeeklyReviews(
       ...(query.profileId
         ? [{ salesExecutiveProfileId: query.profileId }]
         : []),
+      ...(query.executiveUserId
+        ? [{ executiveUserId: query.executiveUserId }]
+        : []),
       ...(query.search
         ? [
             {
@@ -286,6 +434,24 @@ export async function listWeeklyReviews(
                       contains: query.search,
                       mode: "insensitive" as const,
                     },
+                  },
+                },
+                {
+                  executiveUser: {
+                    OR: [
+                      {
+                        firstName: {
+                          contains: query.search,
+                          mode: "insensitive" as const,
+                        },
+                      },
+                      {
+                        lastName: {
+                          contains: query.search,
+                          mode: "insensitive" as const,
+                        },
+                      },
+                    ],
                   },
                 },
               ],
@@ -345,6 +511,135 @@ export async function getWeeklyReview(actor: Actor, id: string) {
   return serialize(row, users, actor.id);
 }
 
+function parseNextWeekActions(input: CreateWeeklyReviewInput): string[] {
+  const nextWeekActions = [
+    ...(input.nextWeekActions ?? []).map((s) => s.trim()).filter(Boolean),
+  ];
+  if (nextWeekActions.length === 0 && input.nextWeekAction?.trim()) {
+    nextWeekActions.push(
+      ...input.nextWeekAction
+        .split(/\n+/)
+        .map((s) => s.replace(/^[-•*\d.)\s]+/, "").trim())
+        .filter(Boolean),
+    );
+  }
+  return nextWeekActions;
+}
+
+async function createSupportWeeklyReview(
+  actor: Actor,
+  input: CreateWeeklyReviewInput,
+) {
+  const executiveUserId = input.executiveUserId!;
+  const supportUser = await assertCanManageSupportUser(
+    prisma,
+    actor,
+    executiveUserId,
+  );
+
+  let teamLeadUserId: string;
+  let commandoUserId: string | null = null;
+  if (actor.roleCode === "TEAM_LEAD") {
+    teamLeadUserId = actor.id;
+  } else {
+    commandoUserId = actor.id;
+    teamLeadUserId = await resolveTeamLeadForSupportUser(
+      executiveUserId,
+      actor.id,
+    );
+  }
+
+  const nextWeekActions = parseNextWeekActions(input);
+  if (nextWeekActions.length === 0) {
+    throw badRequest("Add at least one next-week action");
+  }
+
+  const weekBounds = resolveWeekBounds(toYmd(input.weekStartDate));
+  const existingForWeek = await prisma.weeklyReview.findFirst({
+    where: {
+      executiveUserId,
+      archivedAt: null,
+      weekStartDate: {
+        gte: weekBounds.start,
+        lt: nextMonday(weekBounds.start),
+      },
+    },
+    select: { id: true, weekLabel: true },
+  });
+  if (existingForWeek) {
+    throw badRequest(
+      `A weekly review already exists for this week (${existingForWeek.weekLabel}). Open the existing review instead of creating another.`,
+    );
+  }
+
+  const minutes = normalizeMeetingMinutes(actor.id, input.meetingMinutes);
+  const attendeeIds = new Set<string>([
+    teamLeadUserId,
+    supportUser.id,
+    ...(commandoUserId ? [commandoUserId] : []),
+    ...(input.attendeeUserIds ?? []),
+  ]);
+
+  const created = await prisma.weeklyReview.create({
+    data: {
+      salesExecutiveProfileId: null,
+      executiveUserId,
+      assignmentId: null,
+      commandoUserId,
+      teamLeadUserId,
+      weekLabel: input.weekLabel,
+      weekStartDate: weekBounds.start,
+      meetingDate: input.meetingDate,
+      roomName: input.roomName,
+      meetingTime: input.meetingTime,
+      meetingMinutesKey: minutes?.key ?? null,
+      meetingMinutesFileName: minutes?.fileName ?? null,
+      meetingMinutesContentType: minutes?.contentType ?? null,
+      meetingMinutesSize: minutes?.size ?? null,
+      meetingMinutesUploadedAt: minutes ? new Date() : null,
+      performanceSummary: input.performanceSummary,
+      whatWentWell: input.whatWentWell,
+      improvement: input.improvement,
+      nextWeekAction: nextWeekActions.join("\n"),
+      status: "SUBMITTED",
+      submittedAt: new Date(),
+      createdById: actor.id,
+      attendees: {
+        create: [...attendeeIds].map((userId) => ({ userId })),
+      },
+    },
+    include: reviewInclude,
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      actorId: actor.id,
+      action: "WEEKLY_REVIEW_CREATED",
+      entityType: "WeeklyReview",
+      entityId: created.id,
+      metadata: {
+        executiveUserId,
+        status: "SUBMITTED",
+        verb: "CREATE",
+      },
+    },
+  });
+  await prisma.auditLog.create({
+    data: {
+      actorId: actor.id,
+      action: "WEEKLY_REVIEW_SUBMITTED",
+      entityType: "WeeklyReview",
+      entityId: created.id,
+      metadata: { from: "CREATE", to: "SUBMITTED" },
+    },
+  });
+
+  const users = await loadUsers(
+    [created.commandoUserId, created.teamLeadUserId].filter(Boolean) as string[],
+  );
+  return serialize(created, users, actor.id);
+}
+
 export async function createWeeklyReview(
   actor: Actor,
   input: CreateWeeklyReviewInput,
@@ -357,6 +652,16 @@ export async function createWeeklyReview(
     actor.roleCode !== "TEAM_LEAD"
   ) {
     throw forbidden("Only Commandos and Team Leads can create weekly reviews");
+  }
+
+  if (input.executiveUserId) {
+    return createSupportWeeklyReview(actor, input);
+  }
+
+  if (!input.salesExecutiveProfileId) {
+    throw badRequest(
+      "Provide salesExecutiveProfileId for a Sales Executive, or executiveUserId for Sales Support",
+    );
   }
 
   const profile = await prisma.salesExecutiveProfile.findFirst({
@@ -611,7 +916,7 @@ export async function updateWeeklyReview(
   if (!canEditAsCommando && !canEditAsTl) {
     throw forbidden("Only the review owner can edit this draft");
   }
-  if (canEditAsTl) {
+  if (canEditAsTl && existing.salesExecutiveProfileId) {
     await assertTeamLeadOperationalWriteAllowed(
       prisma,
       actor,
@@ -625,7 +930,8 @@ export async function updateWeeklyReview(
       const nextIds = new Set(input.attendeeUserIds);
       if (existing.commandoUserId) nextIds.add(existing.commandoUserId);
       nextIds.add(existing.teamLeadUserId);
-      nextIds.add(existing.profile.userId);
+      const ownerId = existing.executiveUserId ?? existing.profile?.userId;
+      if (ownerId) nextIds.add(ownerId);
 
       await tx.weeklyReviewAttendee.deleteMany({
         where: {
@@ -725,7 +1031,7 @@ export async function submitWeeklyReview(actor: Actor, id: string) {
   if (!canSubmitAsCommando && !canSubmitAsTl) {
     throw forbidden("Only the review owner can submit this review");
   }
-  if (canSubmitAsTl) {
+  if (canSubmitAsTl && existing.salesExecutiveProfileId) {
     await assertTeamLeadOperationalWriteAllowed(
       prisma,
       actor,
@@ -773,7 +1079,11 @@ export async function acknowledgeWeeklyReview(actor: Actor, id: string) {
 
   // Prefer attendee row; if missing for the SE owner, create it so they can sign.
   let attendee = existing.attendees.find((a) => a.userId === actor.id);
-  if (!attendee && existing.profile.userId === actor.id) {
+  if (
+    !attendee &&
+    (existing.profile?.userId === actor.id ||
+      existing.executiveUserId === actor.id)
+  ) {
     attendee = await prisma.weeklyReviewAttendee.upsert({
       where: {
         weeklyReviewId_userId: {
@@ -1051,11 +1361,20 @@ export async function getWeeklyReviewHub(
     }),
     prisma.swotAnalysis.findMany({
       where: {
-        salesExecutiveProfileId: profile.id,
         archivedAt: null,
+        OR: [
+          {
+            subjectType: "PROFILE",
+            salesExecutiveProfileId: profile.id,
+          },
+          {
+            subjectType: "EXECUTIVE",
+            executiveUserId: profile.userId,
+          },
+        ],
       },
       orderBy: [{ versionNumber: "desc" }, { createdAt: "desc" }],
-      take: 3,
+      take: 6,
       include: {
         createdBy: {
           select: {
