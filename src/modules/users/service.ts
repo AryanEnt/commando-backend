@@ -420,6 +420,17 @@ export async function createUser(actor: Actor, input: CreateUserInput) {
     await assertTeamActive(teamId);
   }
 
+  if (input.roleCode === "SUPER_ADMIN") {
+    throw badRequest(
+      "Super Admin accounts cannot be created from user create",
+    );
+  }
+  if (input.roleCode === "SALES_EXECUTIVE") {
+    throw badRequest(
+      "Sales Executives must be created with a sales profile. Use the Sales Executive create endpoint.",
+    );
+  }
+
   const passwordHash = await hashPassword(input.password);
 
   const user = await prisma.$transaction(async (tx) => {

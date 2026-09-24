@@ -466,30 +466,6 @@ async function main() {
       lastName: "Admin",
       roleCode: "SUPER_ADMIN" as const,
     },
-    {
-      email: "teamlead@commando.local",
-      firstName: "Tina",
-      lastName: "Lead",
-      roleCode: "TEAM_LEAD" as const,
-    },
-    {
-      email: "commando@commando.local",
-      firstName: "Chris",
-      lastName: "Commando",
-      roleCode: "COMMANDO_EXECUTIVE" as const,
-    },
-    {
-      email: "sales@commando.local",
-      firstName: "Sam",
-      lastName: "Seller",
-      roleCode: "SALES_EXECUTIVE" as const,
-    },
-    {
-      email: "support@commando.local",
-      firstName: "Sara",
-      lastName: "Support",
-      roleCode: "SALES_SUPPORT_EXECUTIVE" as const,
-    },
   ];
 
   const created: Record<string, string> = {};
@@ -502,7 +478,7 @@ async function main() {
   console.log(
     `Activity types: ${ACTIVITY_TYPES.length}. Monitoring categories: ${MONITORING_CATALOGS.length}.`,
   );
-  console.log(`Dev password for all demo users: ${DEV_PASSWORD}`);
+  console.log(`Dev password for admin: ${DEV_PASSWORD}`);
   console.log(created);
 }
 
