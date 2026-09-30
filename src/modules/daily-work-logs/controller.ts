@@ -1,7 +1,10 @@
 import type { NextFunction, Request, Response } from "express";
 import type { Actor } from "../../lib/authorization.js";
 import { badRequest } from "../../lib/errors.js";
-import { listDailyWorkLogsQuerySchema } from "./schemas.js";
+import {
+  listDailyWorkCommitmentsQuerySchema,
+  listDailyWorkLogsQuerySchema,
+} from "./schemas.js";
 import * as service from "./service.js";
 
 function paramId(value: string | string[] | undefined): string {
@@ -68,6 +71,39 @@ export async function update(
       req.body,
     );
     res.status(200).json({ data: { log } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function listCommitments(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const query = listDailyWorkCommitmentsQuerySchema.parse(req.query);
+    const result = await service.listDailyWorkCommitments(
+      req.user as Actor,
+      query,
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function saveCommitment(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const commitment = await service.saveDailyWorkCommitment(
+      req.user as Actor,
+      req.body,
+    );
+    res.status(200).json({ data: { commitment } });
   } catch (err) {
     next(err);
   }

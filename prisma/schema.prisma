@@ -249,6 +249,7 @@ model User {
   actionItemsCreated     ActionItem[]            @relation("ActionItemCreator")
   actionItemsCompleted   ActionItem[]            @relation("ActionItemCompleter")
   actionItemAttachments  ActionItemAttachment[]  @relation("ActionItemAttachmentUploader")
+  dailyLogEntryAttachments DailyLogEntryAttachment[] @relation("DailyLogEntryAttachmentUploader")
   feedbackCreated        Feedback[]              @relation("FeedbackCreator")
   feedbackAsExecutive    Feedback[]              @relation("FeedbackExecutiveSubject")
   performanceCreated     PerformanceEvaluation[] @relation("PerformanceCreator")
@@ -268,6 +269,7 @@ model User {
   monitoringSupportInvolvements MonitoringSupportInvolvement[]
   workspaceEventsCreated WorkspaceEvent[]        @relation("WorkspaceEventCreator")
   dailyWorkLogs          DailyWorkLog[]          @relation("DailyWorkLogAuthor")
+  dailyWorkCommitments   DailyWorkCommitment[]   @relation("DailyWorkCommitmentAuthor")
   refreshTokens          RefreshToken[]
 
   @@index([roleId])
@@ -354,6 +356,7 @@ model SalesExecutiveProfile {
   seMonitoringChecklistItems SeMonitoringChecklistItem[]
   seMonitoringChecklistWeights SeMonitoringChecklistWeight[]
   dailyWorkLogs     DailyWorkLog[]
+  dailyWorkCommitments DailyWorkCommitment[]
   actionItems       ActionItem[]
   feedback          Feedback[]
   performanceEvals  PerformanceEvaluation[]
@@ -637,11 +640,33 @@ model DailyLogEntry {
   dailyLog     DailyLog     @relation(fields: [dailyLogId], references: [id], onDelete: Cascade)
   activityType ActivityType @relation(fields: [activityTypeId], references: [id], onDelete: Restrict)
   createdBy    User         @relation("DailyLogEntryCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  attachments  DailyLogEntryAttachment[]
 
   @@index([dailyLogId])
   @@index([activityTypeId])
   @@index([createdById])
   @@index([loggedAt])
+}
+
+/// Optional screenshot evidence on a Daily Log activity (Cloudflare R2).
+model DailyLogEntryAttachment {
+  id           String   @id @default(cuid())
+  entryId      String
+  /// Cloudflare R2 object key
+  storageKey   String
+  fileName     String
+  contentType  String
+  sizeBytes    Int?
+  caption      String?
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  entry      DailyLogEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  uploadedBy User          @relation("DailyLogEntryAttachmentUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  @@index([entryId, createdAt])
+  @@index([uploadedById])
+  @@index([storageKey])
 }
 
 /// Executive self-reported daily work (SE or SSE). Multiple per day allowed.
@@ -666,6 +691,25 @@ model DailyWorkLog {
   @@index([authorUserId, loggedAt])
   @@index([salesExecutiveProfileId, loggedAt])
   @@index([loggedAt])
+}
+
+/// Start-of-day plan written by an SE / SSE before their first Daily Work Log entry.
+model DailyWorkCommitment {
+  id                      String   @id @default(cuid())
+  authorUserId            String
+  /// Set when author is a Sales Executive (scope for TL/Commando)
+  salesExecutiveProfileId String?
+  /// Author's local calendar day
+  commitDate              DateTime @db.Date
+  commitment              String
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  author  User                   @relation("DailyWorkCommitmentAuthor", fields: [authorUserId], references: [id], onDelete: Restrict)
+  profile SalesExecutiveProfile? @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+
+  @@unique([authorUserId, commitDate])
+  @@index([salesExecutiveProfileId, commitDate])
 }
 
 // ─────────────────────────────────────────────

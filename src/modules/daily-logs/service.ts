@@ -16,13 +16,20 @@ import {
 } from "../../lib/supportScope.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import { recordWorkspaceEvent, eisenhowerCategoryFrom } from "../../lib/workspaceEvents.js";
-import type {
-  CreateDailyLogEntryInput,
-  CreateDailyLogInput,
-  EnsureDailyLogInput,
-  ListDailyLogsQuery,
-  SubmitDailyLogInput,
-  UpdateDailyLogEntryInput,
+import { createPresignedGetUrl } from "../../lib/r2.js";
+import {
+  assertAllowedImageUpload,
+  isOwnedDailyLogImageKey,
+} from "../uploads/schemas.js";
+import {
+  MAX_DAILY_LOG_ENTRY_ATTACHMENTS,
+  type CreateDailyLogEntryInput,
+  type CreateDailyLogInput,
+  type DailyLogEntryAttachmentInput,
+  type EnsureDailyLogInput,
+  type ListDailyLogsQuery,
+  type SubmitDailyLogInput,
+  type UpdateDailyLogEntryInput,
 } from "./schemas.js";
 
 const entryInclude = {
@@ -31,6 +38,12 @@ const entryInclude = {
   },
   createdBy: {
     select: { id: true, firstName: true, lastName: true, email: true },
+  },
+  attachments: {
+    orderBy: { createdAt: "asc" as const },
+    include: {
+      uploadedBy: { select: { id: true, firstName: true, lastName: true } },
+    },
   },
 } satisfies Prisma.DailyLogEntryInclude;
 
@@ -103,9 +116,45 @@ function serializeEntry(row: EntryRow) {
     loggedAt: row.loggedAt,
     createdById: row.createdById,
     createdBy: row.createdBy,
+    attachments: row.attachments.map((a) => ({
+      id: a.id,
+      fileName: a.fileName,
+      contentType: a.contentType,
+      sizeBytes: a.sizeBytes,
+      caption: a.caption,
+      createdAt: a.createdAt,
+      uploadedBy: a.uploadedBy,
+    })),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+function toAttachmentRows(
+  actor: Actor,
+  attachments: DailyLogEntryAttachmentInput[] | undefined,
+) {
+  return (attachments ?? []).map((a) => {
+    try {
+      assertAllowedImageUpload({
+        contentType: a.contentType,
+        contentLength: a.size ?? 1,
+      });
+    } catch (err) {
+      throw badRequest(err instanceof Error ? err.message : "Invalid image");
+    }
+    if (!isOwnedDailyLogImageKey(a.key, actor.id)) {
+      throw badRequest("Invalid screenshot upload key");
+    }
+    return {
+      storageKey: a.key,
+      fileName: a.fileName.trim(),
+      contentType: a.contentType,
+      sizeBytes: a.size ?? null,
+      caption: a.caption?.trim() || null,
+      uploadedById: actor.id,
+    };
+  });
 }
 
 function serialize(row: LogRow) {
@@ -552,6 +601,8 @@ export async function addDailyLogEntry(
     throw badRequest("Activity type is invalid or inactive");
   }
 
+  const attachmentRows = toAttachmentRows(actor, input.attachments);
+
   const sortOrder = log.entries.length;
   await prisma.dailyLogEntry.create({
     data: {
@@ -567,6 +618,9 @@ export async function addDailyLogEntry(
       sortOrder,
       loggedAt: input.loggedAt ?? new Date(),
       createdById: actor.id,
+      ...(attachmentRows.length > 0
+        ? { attachments: { create: attachmentRows } }
+        : {}),
     },
   });
 
@@ -616,6 +670,16 @@ export async function updateDailyLogEntry(
     }
   }
 
+  const attachmentRows = toAttachmentRows(actor, input.attachments);
+  if (
+    entry.attachments.length + attachmentRows.length >
+    MAX_DAILY_LOG_ENTRY_ATTACHMENTS
+  ) {
+    throw badRequest(
+      `An activity can have at most ${MAX_DAILY_LOG_ENTRY_ATTACHMENTS} screenshots`,
+    );
+  }
+
   await prisma.dailyLogEntry.update({
     where: { id: entryId },
     data: {
@@ -628,9 +692,67 @@ export async function updateDailyLogEntry(
       expectedChange: input.expectedChange,
       followUp: input.followUp,
       loggedAt: input.loggedAt,
+      ...(attachmentRows.length > 0
+        ? { attachments: { create: attachmentRows } }
+        : {}),
     },
   });
 
+  return serialize(await loadLog(logId));
+}
+
+export async function getDailyLogAttachmentUrl(
+  actor: Actor,
+  logId: string,
+  entryId: string,
+  attachmentId: string,
+) {
+  const log = await loadLog(logId);
+  await assertCanAccessLog(actor, log);
+
+  const entry = log.entries.find((e) => e.id === entryId);
+  const attachment = entry?.attachments.find((a) => a.id === attachmentId);
+  if (!attachment) throw notFound("Screenshot not found");
+
+  const url = await createPresignedGetUrl({
+    key: attachment.storageKey,
+    fileName: attachment.fileName,
+    expiresInSeconds: 600,
+  });
+
+  return {
+    url,
+    fileName: attachment.fileName,
+    contentType: attachment.contentType,
+    expiresInSeconds: 600,
+  };
+}
+
+export async function removeDailyLogAttachment(
+  actor: Actor,
+  logId: string,
+  entryId: string,
+  attachmentId: string,
+) {
+  const log = await loadLog(logId);
+  await assertCanAccessLog(actor, log);
+  await assertCanWriteLogSubject(actor, {
+    profileId: log.salesExecutiveProfileId,
+    executiveUserId: log.executiveUserId,
+  });
+
+  if (log.status !== "DRAFT") {
+    throw badRequest("Submitted daily logs are read-only");
+  }
+
+  const entry = log.entries.find((e) => e.id === entryId);
+  const attachment = entry?.attachments.find((a) => a.id === attachmentId);
+  if (!attachment) throw notFound("Screenshot not found");
+  if (attachment.uploadedById !== actor.id) {
+    throw forbidden("You may only remove screenshots you uploaded");
+  }
+
+  await prisma.dailyLogEntryAttachment.delete({ where: { id: attachment.id } });
   return serialize(await loadLog(logId));
 }
 

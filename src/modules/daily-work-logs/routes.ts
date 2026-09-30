@@ -7,6 +7,7 @@ import { validate } from "../../middleware/validate.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
 import {
   createDailyWorkLogSchema,
+  saveDailyWorkCommitmentSchema,
   updateDailyWorkLogSchema,
 } from "./schemas.js";
 import * as controller from "./controller.js";
@@ -26,6 +27,19 @@ dailyWorkLogsRouter.post(
   requirePermission(PERMISSIONS.DAILY_WORK_LOG_CREATE),
   validate(createDailyWorkLogSchema),
   controller.create,
+);
+
+dailyWorkLogsRouter.get(
+  "/commitments",
+  requirePermission(PERMISSIONS.DAILY_WORK_LOG_VIEW),
+  controller.listCommitments,
+);
+
+dailyWorkLogsRouter.put(
+  "/commitments/today",
+  requirePermission(PERMISSIONS.DAILY_WORK_LOG_CREATE),
+  validate(saveDailyWorkCommitmentSchema),
+  controller.saveCommitment,
 );
 
 dailyWorkLogsRouter.get(

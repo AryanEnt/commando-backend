@@ -15,6 +15,7 @@ import {
   saveSeChecklistWeightsSchema,
   updateChecklistItemSchema,
   updateMonitoringCategorySchema,
+  updateMonitoringRecordSchema,
 } from "./schemas.js";
 import * as controller from "./controller.js";
 
@@ -171,4 +172,11 @@ monitoringRouter.get(
   "/:id",
   requirePermission(PERMISSIONS.MONITORING_VIEW),
   controller.getRecord,
+);
+
+monitoringRouter.patch(
+  "/:id",
+  requirePermission(PERMISSIONS.MONITORING_CREATE),
+  validate(updateMonitoringRecordSchema),
+  controller.updateRecord,
 );

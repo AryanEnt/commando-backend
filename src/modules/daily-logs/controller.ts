@@ -144,6 +144,42 @@ export async function deleteDailyLogEntry(
   }
 }
 
+export async function getDailyLogAttachmentUrl(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const data = await service.getDailyLogAttachmentUrl(
+      req.user as Actor,
+      paramId(req.params.id),
+      paramId(req.params.entryId),
+      paramId(req.params.attachmentId),
+    );
+    res.status(200).json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function removeDailyLogAttachment(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const log = await service.removeDailyLogAttachment(
+      req.user as Actor,
+      paramId(req.params.id),
+      paramId(req.params.entryId),
+      paramId(req.params.attachmentId),
+    );
+    res.status(200).json({ data: { log } });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function submitDailyLog(
   req: Request,
   res: Response,

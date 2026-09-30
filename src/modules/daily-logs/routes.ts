@@ -70,6 +70,18 @@ dailyLogsRouter.delete(
   controller.deleteDailyLogEntry,
 );
 
+dailyLogsRouter.get(
+  "/:id/entries/:entryId/attachments/:attachmentId/url",
+  requirePermission(PERMISSIONS.DAILY_LOG_VIEW),
+  controller.getDailyLogAttachmentUrl,
+);
+
+dailyLogsRouter.delete(
+  "/:id/entries/:entryId/attachments/:attachmentId",
+  requirePermission(PERMISSIONS.DAILY_LOG_CREATE),
+  controller.removeDailyLogAttachment,
+);
+
 dailyLogsRouter.post(
   "/:id/submit",
   requirePermission(PERMISSIONS.DAILY_LOG_CREATE),

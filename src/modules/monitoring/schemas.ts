@@ -101,6 +101,28 @@ export const createMonitoringRecordSchema = z
     }
   });
 
+/** Edit a saved session: answers, observation, time, and support involved. Checklist items and weights stay as recorded. */
+export const updateMonitoringRecordSchema = z
+  .object({
+    observation: z.string().trim().max(10000).optional().nullable(),
+    observedAt: z.coerce.date().optional(),
+    responses: z
+      .array(
+        z.object({
+          id: z.string().min(1),
+          value: responseValueSchema,
+        }),
+      )
+      .optional(),
+    supportInvolvement: z
+      .object({
+        none: z.boolean().optional(),
+        salesSupportUserIds: z.array(z.string().cuid()).optional(),
+      })
+      .optional(),
+  })
+  .strict();
+
 export const createMonitoringCategorySchema = z.object({
   code: z
     .string()
@@ -185,6 +207,9 @@ export type ListMonitoringCategoriesQuery = z.infer<
 >;
 export type CreateMonitoringRecordInput = z.infer<
   typeof createMonitoringRecordSchema
+>;
+export type UpdateMonitoringRecordInput = z.infer<
+  typeof updateMonitoringRecordSchema
 >;
 export type CreateMonitoringCategoryInput = z.infer<
   typeof createMonitoringCategorySchema

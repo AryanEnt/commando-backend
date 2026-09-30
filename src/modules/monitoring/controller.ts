@@ -353,6 +353,23 @@ export async function getRecord(
   }
 }
 
+export async function updateRecord(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const record = await service.updateMonitoringRecord(
+      req.user as Actor,
+      paramId(req.params.id),
+      req.body,
+    );
+    res.status(200).json({ data: { record } });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function createRecord(
   req: Request,
   res: Response,

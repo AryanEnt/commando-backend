@@ -25,6 +25,7 @@ export const UPLOAD_PURPOSES = [
   "weekly-review-minutes",
   "support-task-image",
   "action-item-image",
+  "daily-log-image",
 ] as const;
 
 export type UploadPurpose = (typeof UPLOAD_PURPOSES)[number];
@@ -119,6 +120,21 @@ export function isOwnedActionItemImageKey(
   userId: string,
 ): boolean {
   return key.startsWith(`action-items/images/${userId}/`);
+}
+
+export function buildDailyLogImageKey(
+  userId: string,
+  fileName: string,
+): string {
+  const safe = sanitizeFileName(fileName);
+  return `daily-logs/images/${userId}/${randomUUID()}-${safe || "screenshot"}`;
+}
+
+export function isOwnedDailyLogImageKey(
+  key: string,
+  userId: string,
+): boolean {
+  return key.startsWith(`daily-logs/images/${userId}/`);
 }
 
 export const MAX_MINUTES_BYTES_EXPORT = MAX_MINUTES_BYTES;

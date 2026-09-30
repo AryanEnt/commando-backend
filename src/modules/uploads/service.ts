@@ -7,6 +7,7 @@ import {
   assertAllowedImageUpload,
   assertAllowedMinutesUpload,
   buildActionItemImageKey,
+  buildDailyLogImageKey,
   buildSupportTaskImageKey,
   buildWeeklyReviewMinutesKey,
   UPLOAD_PURPOSES,
@@ -52,6 +53,17 @@ function assertCanUpload(actor: Actor, purpose: UploadPurpose) {
     return;
   }
 
+  if (purpose === "daily-log-image") {
+    if (
+      !hasPermission(actor, PERMISSIONS.DAILY_LOG_CREATE) ||
+      (actor.roleCode !== "TEAM_LEAD" &&
+        actor.roleCode !== "COMMANDO_EXECUTIVE")
+    ) {
+      throw forbidden("Not allowed to upload daily log screenshots");
+    }
+    return;
+  }
+
   throw badRequest("Unsupported upload purpose");
 }
 
@@ -61,6 +73,9 @@ function buildKey(purpose: UploadPurpose, actorId: string, fileName: string) {
   }
   if (purpose === "support-task-image") {
     return buildSupportTaskImageKey(actorId, fileName);
+  }
+  if (purpose === "daily-log-image") {
+    return buildDailyLogImageKey(actorId, fileName);
   }
   return buildActionItemImageKey(actorId, fileName);
 }

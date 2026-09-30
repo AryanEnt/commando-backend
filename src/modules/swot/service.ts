@@ -14,6 +14,10 @@ import {
   swotWhereVisibleToSalesExecutive,
 } from "../../lib/lifecycleVisibility.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
+import {
+  supportUserIdsOnTeams,
+  teamIdsForCommandoActive,
+} from "../../lib/supportScope.js";
 import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
 import {
   flagsFromPoints,
@@ -244,33 +248,51 @@ async function commandoProfileIds(
   ];
 }
 
+/** Linked to an in-scope SE, or an active member of one of the manager's teams. */
 async function teamLeadSupportUserIds(actorId: string): Promise<string[]> {
-  const profileIds = await teamLeadProfileIds(actorId);
-  if (profileIds.length === 0) return [];
-  const links = await prisma.salesSupportLink.findMany({
-    where: {
-      salesExecutiveProfileId: { in: profileIds },
-      isActive: true,
-    },
-    select: { salesSupportUserId: true },
-  });
-  return [...new Set(links.map((l) => l.salesSupportUserId))];
+  const teamIds = await getActiveTeamIds(prisma, actorId);
+  const [profileIds, teamMemberIds] = await Promise.all([
+    teamLeadProfileIds(actorId),
+    supportUserIdsOnTeams(prisma, teamIds),
+  ]);
+  const links =
+    profileIds.length === 0
+      ? []
+      : await prisma.salesSupportLink.findMany({
+          where: {
+            salesExecutiveProfileId: { in: profileIds },
+            isActive: true,
+          },
+          select: { salesSupportUserId: true },
+        });
+  return [
+    ...new Set([...links.map((l) => l.salesSupportUserId), ...teamMemberIds]),
+  ];
 }
 
 async function commandoSupportUserIds(
   actorId: string,
   activeOnly = false,
 ): Promise<string[]> {
-  const profileIds = await commandoProfileIds(actorId, activeOnly);
-  if (profileIds.length === 0) return [];
-  const links = await prisma.salesSupportLink.findMany({
-    where: {
-      salesExecutiveProfileId: { in: profileIds },
-      isActive: true,
-    },
-    select: { salesSupportUserId: true },
-  });
-  return [...new Set(links.map((l) => l.salesSupportUserId))];
+  const [profileIds, activeTeamIds] = await Promise.all([
+    commandoProfileIds(actorId, activeOnly),
+    teamIdsForCommandoActive(prisma, actorId),
+  ]);
+  const [links, teamMemberIds] = await Promise.all([
+    profileIds.length === 0
+      ? Promise.resolve([] as Array<{ salesSupportUserId: string }>)
+      : prisma.salesSupportLink.findMany({
+          where: {
+            salesExecutiveProfileId: { in: profileIds },
+            isActive: true,
+          },
+          select: { salesSupportUserId: true },
+        }),
+    supportUserIdsOnTeams(prisma, activeTeamIds),
+  ]);
+  return [
+    ...new Set([...links.map((l) => l.salesSupportUserId), ...teamMemberIds]),
+  ];
 }
 
 async function assertSseInTeamLeadScope(actor: Actor, executiveUserId: string) {
@@ -1043,6 +1065,22 @@ export async function createSwot(actor: Actor, input: CreateSwotInput) {
         include: { profile: { select: { teamId: true } } },
       });
       teamId = link?.profile.teamId ?? null;
+      if (!teamId) {
+        const managerTeamIds =
+          actor.roleCode === "TEAM_LEAD"
+            ? await getActiveTeamIds(prisma, actor.id)
+            : await teamIdsForCommandoActive(prisma, actor.id);
+        const membership = await prisma.teamMembership.findFirst({
+          where: {
+            userId: executiveId,
+            teamId: { in: managerTeamIds },
+            isActive: true,
+            endedAt: null,
+          },
+          select: { teamId: true },
+        });
+        teamId = membership?.teamId ?? null;
+      }
       return createExecutiveSwot({
         actor,
         source,

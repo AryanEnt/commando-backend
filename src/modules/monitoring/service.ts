@@ -31,6 +31,7 @@ import type {
   SaveSeChecklistWeightsInput,
   UpdateChecklistItemInput,
   UpdateMonitoringCategoryInput,
+  UpdateMonitoringRecordInput,
 } from "./schemas.js";
 import {
   allocationStatus,
@@ -2032,6 +2033,217 @@ export async function createMonitoringRecord(
   }
 
   return serialize(created);
+}
+
+async function assertCanEditRecord(actor: Actor, row: RecordRow) {
+  if (isSuperAdmin(actor)) {
+    throw forbidden("Super Admin is read-only for live monitoring");
+  }
+  if (
+    actor.roleCode !== "COMMANDO_EXECUTIVE" &&
+    actor.roleCode !== "TEAM_LEAD"
+  ) {
+    throw forbidden("Only Commandos and Team Leads can edit live monitoring records");
+  }
+
+  if (row.executiveUserId) {
+    await assertCanManageSupportUser(prisma, actor, row.executiveUserId);
+    return;
+  }
+
+  if (!row.salesExecutiveProfileId || !row.profile) {
+    throw forbidden("Not allowed to edit this monitoring record");
+  }
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    const teamIds = await getActiveTeamIds(prisma, actor.id);
+    if (!teamIds.includes(row.profile.teamId)) {
+      throw forbidden("Profile is outside your team scope");
+    }
+    await assertTeamLeadOperationalWriteAllowed(
+      prisma,
+      actor,
+      row.salesExecutiveProfileId,
+      { action: "MONITORING_UPDATE" },
+    );
+    return;
+  }
+
+  const assignment = await prisma.commandoAssignment.findFirst({
+    where: {
+      salesExecutiveProfileId: row.salesExecutiveProfileId,
+      commandoUserId: actor.id,
+      status: "ACTIVE",
+    },
+    select: { id: true },
+  });
+  if (!assignment) {
+    throw forbidden(
+      "You may only edit monitoring for profiles with an active assignment to you",
+    );
+  }
+}
+
+export async function updateMonitoringRecord(
+  actor: Actor,
+  id: string,
+  input: UpdateMonitoringRecordInput,
+) {
+  const row = await prisma.liveMonitoringRecord.findFirst({
+    where: { id, archivedAt: null },
+    include: recordInclude,
+  });
+  if (!row) throw notFound("Monitoring record not found");
+  await assertCanEditRecord(actor, row);
+
+  const nextValueById = new Map<string, string>();
+  if (input.responses) {
+    const known = new Set(row.responses.map((r) => r.id));
+    for (const r of input.responses) {
+      if (!known.has(r.id)) {
+        throw badRequest("Response does not belong to this monitoring record");
+      }
+      nextValueById.set(r.id, r.value);
+    }
+  }
+
+  const scored = computeWeightedScore(
+    row.responses.map((r) => ({
+      value: nextValueById.get(r.id) ?? r.value,
+      weight: r.weightSnapshot ?? 0,
+    })),
+  );
+
+  const supportIds =
+    input.supportInvolvement === undefined
+      ? null
+      : input.supportInvolvement.none === true
+        ? []
+        : [...new Set(input.supportInvolvement.salesSupportUserIds ?? [])];
+
+  if (supportIds && supportIds.length > 0 && !row.salesExecutiveProfileId) {
+    throw badRequest("Support involvement applies only to Sales Executive sessions");
+  }
+
+  const changedResponses = row.responses.filter(
+    (r) => nextValueById.has(r.id) && nextValueById.get(r.id) !== r.value,
+  );
+
+  const updated = await prisma.$transaction(async (tx) => {
+    for (const r of changedResponses) {
+      await tx.monitoringChecklistResponse.update({
+        where: { id: r.id },
+        data: { value: nextValueById.get(r.id) as string },
+      });
+    }
+
+    if (supportIds && row.salesExecutiveProfileId) {
+      const existingIds = new Set(
+        row.supportInvolvements.map((s) => s.salesSupportUserId),
+      );
+      const toRemove = row.supportInvolvements.filter(
+        (s) => !supportIds.includes(s.salesSupportUserId),
+      );
+      const toAdd = supportIds.filter((uid) => !existingIds.has(uid));
+
+      if (toRemove.length > 0) {
+        await tx.monitoringSupportInvolvement.deleteMany({
+          where: { id: { in: toRemove.map((s) => s.id) } },
+        });
+      }
+
+      if (toAdd.length > 0) {
+        const activeLinks = await tx.salesSupportLink.findMany({
+          where: {
+            salesExecutiveProfileId: row.salesExecutiveProfileId,
+            salesSupportUserId: { in: toAdd },
+            isActive: true,
+          },
+          include: {
+            supportUser: {
+              select: { id: true, firstName: true, lastName: true },
+            },
+          },
+        });
+        const linkByUser = new Map(
+          activeLinks.map((l) => [l.salesSupportUserId, l]),
+        );
+        for (const userId of toAdd) {
+          const link = linkByUser.get(userId);
+          if (!link) {
+            throw badRequest(
+              "Support involvement must reference a Sales Support user with an active link to this Sales Executive",
+            );
+          }
+          await tx.monitoringSupportInvolvement.create({
+            data: {
+              recordId: row.id,
+              salesSupportUserId: link.salesSupportUserId,
+              salesSupportLinkId: link.id,
+              displayNameSnapshot: `${link.supportUser.firstName} ${link.supportUser.lastName}`.trim(),
+              responsibilityTypeSnapshot: link.responsibilityType,
+            },
+          });
+        }
+      }
+    }
+
+    await tx.liveMonitoringRecord.update({
+      where: { id: row.id },
+      data: {
+        ...(input.observation !== undefined
+          ? {
+              observation: input.observation?.trim()
+                ? input.observation.trim()
+                : null,
+            }
+          : {}),
+        ...(input.observedAt ? { observedAt: input.observedAt } : {}),
+        scorePercent: scored.scorePercent,
+      },
+    });
+
+    await tx.auditLog.create({
+      data: {
+        actorId: actor.id,
+        action: "MONITORING_RECORD_UPDATED",
+        entityType: "LiveMonitoringRecord",
+        entityId: row.id,
+        metadata: {
+          profileId: row.salesExecutiveProfileId,
+          executiveUserId: row.executiveUserId,
+          changedResponseCount: changedResponses.length,
+          previousScorePercent: row.scorePercent,
+          scorePercent: scored.scorePercent,
+          observationChanged: input.observation !== undefined,
+          observedAtChanged: Boolean(input.observedAt),
+          supportInvolvementChanged: supportIds !== null,
+        },
+      },
+    });
+
+    return tx.liveMonitoringRecord.findUniqueOrThrow({
+      where: { id: row.id },
+      include: recordInclude,
+    });
+  });
+
+  if (updated.salesExecutiveProfileId) {
+    await prisma.workspaceEvent
+      .updateMany({
+        where: {
+          sourceType: "LiveMonitoringRecord",
+          sourceId: updated.id,
+        },
+        data: {
+          notes: updated.observation,
+          occurredAt: updated.observedAt,
+        },
+      })
+      .catch(() => undefined);
+  }
+
+  return serialize(updated);
 }
 
 function buildResponseCreates(

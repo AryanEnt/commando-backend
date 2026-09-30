@@ -1,4 +1,4 @@
-import type { Prisma } from "@prisma/client";
+import type { DailyWorkCommitment, Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { writeAuditLog, AUDIT_ACTIONS } from "../../lib/audit.js";
 import type { Actor } from "../../lib/authorization.js";
@@ -9,9 +9,15 @@ import {
 import { PERMISSIONS } from "../../lib/permissions.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import {
+  supportUserIdsOnTeams,
+  teamIdsForCommandoActive,
+} from "../../lib/supportScope.js";
 import type {
   CreateDailyWorkLogInput,
+  ListDailyWorkCommitmentsQuery,
   ListDailyWorkLogsQuery,
+  SaveDailyWorkCommitmentInput,
   UpdateDailyWorkLogInput,
 } from "./schemas.js";
 
@@ -72,6 +78,60 @@ function parseDateOnly(date: string): Date {
   return new Date(Date.UTC(y!, m! - 1, day!, 0, 0, 0, 0));
 }
 
+const MINUTE_MS = 60_000;
+const DAY_MS = 24 * 60 * MINUTE_MS;
+
+/** YYYY-MM-DD of `at` in the author's timezone (`tzOffsetMinutes` = getTimezoneOffset()). */
+function localDayKey(at: Date, tzOffsetMinutes: number): string {
+  return new Date(at.getTime() - tzOffsetMinutes * MINUTE_MS)
+    .toISOString()
+    .slice(0, 10);
+}
+
+function localDayBounds(dayKey: string, tzOffsetMinutes: number) {
+  const start = new Date(
+    parseDateOnly(dayKey).getTime() + tzOffsetMinutes * MINUTE_MS,
+  );
+  return { start, end: new Date(start.getTime() + DAY_MS - 1) };
+}
+
+async function authorProfileId(actor: Actor): Promise<string | null> {
+  if (actor.roleCode !== "SALES_EXECUTIVE") return null;
+  const profile = await prisma.salesExecutiveProfile.findFirst({
+    where: { userId: actor.id, archivedAt: null },
+    select: { id: true },
+  });
+  if (!profile) {
+    throw badRequest("Sales Executive profile not found for your account");
+  }
+  return profile.id;
+}
+
+function findCommitment(authorUserId: string, dayKey: string) {
+  return prisma.dailyWorkCommitment.findUnique({
+    where: {
+      authorUserId_commitDate: {
+        authorUserId,
+        commitDate: parseDateOnly(dayKey),
+      },
+    },
+  });
+}
+
+/** Entries dated today (author's local day) require today's commitment first. */
+async function assertCommitmentIfToday(
+  authorUserId: string,
+  loggedAt: Date,
+  tzOffsetMinutes: number,
+) {
+  const today = localDayKey(new Date(), tzOffsetMinutes);
+  if (localDayKey(loggedAt, tzOffsetMinutes) !== today) return;
+  const commitment = await findCommitment(authorUserId, today);
+  if (!commitment) {
+    throw badRequest("Add today's commitment before logging your work");
+  }
+}
+
 /** SE profiles a Team Lead can see work logs for. */
 async function teamLeadProfileIds(actorId: string): Promise<string[]> {
   const teamIds = await getActiveTeamIds(prisma, actorId);
@@ -83,9 +143,7 @@ async function teamLeadProfileIds(actorId: string): Promise<string[]> {
   return profiles.map((p) => p.id);
 }
 
-/** SSE user IDs linked to profiles on the Team Lead's teams. */
-async function teamLeadSupportUserIds(actorId: string): Promise<string[]> {
-  const profileIds = await teamLeadProfileIds(actorId);
+async function linkedSupportUserIds(profileIds: string[]): Promise<string[]> {
   if (profileIds.length === 0) return [];
   const links = await prisma.salesSupportLink.findMany({
     where: {
@@ -94,7 +152,20 @@ async function teamLeadSupportUserIds(actorId: string): Promise<string[]> {
     },
     select: { salesSupportUserId: true },
   });
-  return [...new Set(links.map((l) => l.salesSupportUserId))];
+  return links.map((l) => l.salesSupportUserId);
+}
+
+/** SSE user IDs on the Team Lead's teams or linked to their SEs. */
+async function teamLeadSupportUserIds(actorId: string): Promise<string[]> {
+  const [teamIds, profileIds] = await Promise.all([
+    getActiveTeamIds(prisma, actorId),
+    teamLeadProfileIds(actorId),
+  ]);
+  const [onTeams, linked] = await Promise.all([
+    supportUserIdsOnTeams(prisma, teamIds),
+    linkedSupportUserIds(profileIds),
+  ]);
+  return [...new Set([...onTeams, ...linked])];
 }
 
 async function commandoProfileIds(actorId: string): Promise<string[]> {
@@ -105,59 +176,64 @@ async function commandoProfileIds(actorId: string): Promise<string[]> {
   return assignments.map((a) => a.salesExecutiveProfileId);
 }
 
+/** SSE user IDs on the Commando's active teams or linked to their assigned SEs. */
 async function commandoSupportUserIds(actorId: string): Promise<string[]> {
-  const profileIds = await commandoProfileIds(actorId);
-  if (profileIds.length === 0) return [];
-  const links = await prisma.salesSupportLink.findMany({
-    where: {
-      salesExecutiveProfileId: { in: profileIds },
-      isActive: true,
-    },
-    select: { salesSupportUserId: true },
-  });
-  return [...new Set(links.map((l) => l.salesSupportUserId))];
+  const [teamIds, profileIds] = await Promise.all([
+    teamIdsForCommandoActive(prisma, actorId),
+    commandoProfileIds(actorId),
+  ]);
+  const [onTeams, linked] = await Promise.all([
+    supportUserIdsOnTeams(prisma, teamIds),
+    linkedSupportUserIds(profileIds),
+  ]);
+  return [...new Set([...onTeams, ...linked])];
+}
+
+/** `null` = unrestricted (Super Admin). Otherwise records must match one list. */
+type AuthorScope = { profileIds: string[]; authorUserIds: string[] } | null;
+
+async function authorScope(actor: Actor): Promise<AuthorScope> {
+  if (isSuperAdmin(actor)) return null;
+
+  if (
+    actor.roleCode === "SALES_EXECUTIVE" ||
+    actor.roleCode === "SALES_SUPPORT_EXECUTIVE"
+  ) {
+    return { profileIds: [], authorUserIds: [actor.id] };
+  }
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    const [profileIds, authorUserIds] = await Promise.all([
+      teamLeadProfileIds(actor.id),
+      teamLeadSupportUserIds(actor.id),
+    ]);
+    return { profileIds, authorUserIds };
+  }
+
+  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    const [profileIds, authorUserIds] = await Promise.all([
+      commandoProfileIds(actor.id),
+      commandoSupportUserIds(actor.id),
+    ]);
+    return { profileIds, authorUserIds };
+  }
+
+  return { profileIds: [], authorUserIds: [] };
+}
+
+function scopeOr(scope: NonNullable<AuthorScope>) {
+  return [
+    { salesExecutiveProfileId: { in: scope.profileIds } },
+    { authorUserId: { in: scope.authorUserIds } },
+  ];
 }
 
 async function scopeWhere(
   actor: Actor,
 ): Promise<Prisma.DailyWorkLogWhereInput> {
-  if (isSuperAdmin(actor)) {
-    return { archivedAt: null };
-  }
-
-  if (actor.roleCode === "SALES_EXECUTIVE" || actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
-    return { archivedAt: null, authorUserId: actor.id };
-  }
-
-  if (actor.roleCode === "TEAM_LEAD") {
-    const [profileIds, supportUserIds] = await Promise.all([
-      teamLeadProfileIds(actor.id),
-      teamLeadSupportUserIds(actor.id),
-    ]);
-    return {
-      archivedAt: null,
-      OR: [
-        { salesExecutiveProfileId: { in: profileIds } },
-        { authorUserId: { in: supportUserIds } },
-      ],
-    };
-  }
-
-  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const [profileIds, supportUserIds] = await Promise.all([
-      commandoProfileIds(actor.id),
-      commandoSupportUserIds(actor.id),
-    ]);
-    return {
-      archivedAt: null,
-      OR: [
-        { salesExecutiveProfileId: { in: profileIds } },
-        { authorUserId: { in: supportUserIds } },
-      ],
-    };
-  }
-
-  return { id: "__none__" };
+  const scope = await authorScope(actor);
+  if (!scope) return { archivedAt: null };
+  return { archivedAt: null, OR: scopeOr(scope) };
 }
 
 async function assertCanViewRow(actor: Actor, row: Row) {
@@ -286,17 +362,8 @@ export async function createDailyWorkLog(
   const activity = input.activity.trim();
   if (!activity) throw badRequest("Activity is required");
 
-  let salesExecutiveProfileId: string | null = null;
-  if (actor.roleCode === "SALES_EXECUTIVE") {
-    const profile = await prisma.salesExecutiveProfile.findFirst({
-      where: { userId: actor.id, archivedAt: null },
-      select: { id: true },
-    });
-    if (!profile) {
-      throw badRequest("Sales Executive profile not found for your account");
-    }
-    salesExecutiveProfileId = profile.id;
-  }
+  await assertCommitmentIfToday(actor.id, input.loggedAt, input.tzOffsetMinutes);
+  const salesExecutiveProfileId = await authorProfileId(actor);
 
   const created = await prisma.dailyWorkLog.create({
     data: {
@@ -340,6 +407,9 @@ export async function updateDailyWorkLog(
   }
   if (!hasPermission(actor, PERMISSIONS.DAILY_WORK_LOG_CREATE)) {
     throw forbidden("Not allowed to update daily work logs");
+  }
+  if (input.loggedAt) {
+    await assertCommitmentIfToday(actor.id, input.loggedAt, input.tzOffsetMinutes);
   }
 
   const updated = await prisma.dailyWorkLog.update({
@@ -402,4 +472,96 @@ export async function deleteDailyWorkLog(actor: Actor, id: string) {
   });
 
   return { id: updated.id, archived: true };
+}
+
+function serializeCommitment(row: DailyWorkCommitment) {
+  return {
+    id: row.id,
+    authorUserId: row.authorUserId,
+    salesExecutiveProfileId: row.salesExecutiveProfileId,
+    commitDate: row.commitDate.toISOString().slice(0, 10),
+    commitment: row.commitment,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+export async function listDailyWorkCommitments(
+  actor: Actor,
+  query: ListDailyWorkCommitmentsQuery,
+) {
+  if (!hasPermission(actor, PERMISSIONS.DAILY_WORK_LOG_VIEW)) {
+    throw forbidden("Not allowed to view daily work logs");
+  }
+
+  const scope = await authorScope(actor);
+  const and: Prisma.DailyWorkCommitmentWhereInput[] = [
+    {
+      commitDate: {
+        gte: parseDateOnly(query.dateFrom),
+        lte: parseDateOnly(query.dateTo),
+      },
+    },
+  ];
+  if (scope) and.push({ OR: scopeOr(scope) });
+  if (query.authorUserId) and.push({ authorUserId: query.authorUserId });
+  if (query.profileId) and.push({ salesExecutiveProfileId: query.profileId });
+
+  const rows = await prisma.dailyWorkCommitment.findMany({
+    where: { AND: and },
+    orderBy: { commitDate: "desc" },
+  });
+  return { commitments: rows.map(serializeCommitment) };
+}
+
+/** Create or edit today's commitment; editable only until today's first entry. */
+export async function saveDailyWorkCommitment(
+  actor: Actor,
+  input: SaveDailyWorkCommitmentInput,
+) {
+  assertCanAuthor(actor);
+
+  const commitment = input.commitment.trim();
+  if (!commitment) throw badRequest("Commitment is required");
+
+  const today = localDayKey(new Date(), input.tzOffsetMinutes);
+  const existing = await findCommitment(actor.id, today);
+  if (existing) {
+    const { start, end } = localDayBounds(today, input.tzOffsetMinutes);
+    const entriesToday = await prisma.dailyWorkLog.count({
+      where: {
+        authorUserId: actor.id,
+        archivedAt: null,
+        loggedAt: { gte: start, lte: end },
+      },
+    });
+    if (entriesToday > 0) {
+      throw badRequest(
+        "Today's commitment is locked once you have logged work for the day",
+      );
+    }
+  }
+
+  const salesExecutiveProfileId = await authorProfileId(actor);
+  const commitDate = parseDateOnly(today);
+  const saved = await prisma.dailyWorkCommitment.upsert({
+    where: { authorUserId_commitDate: { authorUserId: actor.id, commitDate } },
+    create: {
+      authorUserId: actor.id,
+      salesExecutiveProfileId,
+      commitDate,
+      commitment,
+    },
+    update: { commitment },
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: AUDIT_ACTIONS.DAILY_WORK_COMMITMENT_SAVED,
+    entityType: "DailyWorkCommitment",
+    entityId: saved.id,
+    metadata: { commitDate: today, edited: Boolean(existing) },
+  });
+
+  return serializeCommitment(saved);
 }

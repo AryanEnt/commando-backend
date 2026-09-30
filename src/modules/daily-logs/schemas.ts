@@ -24,6 +24,18 @@ export const ensureDailyLogSchema = z
     }
   });
 
+export const MAX_DAILY_LOG_ENTRY_ATTACHMENTS = 5;
+
+export const dailyLogEntryAttachmentSchema = z
+  .object({
+    key: z.string().trim().min(1).max(512),
+    fileName: z.string().trim().min(1).max(255),
+    contentType: z.string().trim().min(1).max(128),
+    size: z.number().int().positive().max(10 * 1024 * 1024).optional(),
+    caption: z.string().trim().max(500).optional().nullable(),
+  })
+  .strict();
+
 export const createDailyLogEntrySchema = z
   .object({
     activityTypeId: z.string().cuid(),
@@ -35,6 +47,11 @@ export const createDailyLogEntrySchema = z
     expectedChange: optionalText,
     followUp: optionalText,
     loggedAt: z.coerce.date().optional(),
+    /** New screenshots to attach (already uploaded to R2). */
+    attachments: z
+      .array(dailyLogEntryAttachmentSchema)
+      .max(MAX_DAILY_LOG_ENTRY_ATTACHMENTS)
+      .optional(),
   })
   .strict();
 
@@ -103,6 +120,9 @@ export const createDailyLogSchema = z
 
 export type EnsureDailyLogInput = z.infer<typeof ensureDailyLogSchema>;
 export type CreateDailyLogEntryInput = z.infer<typeof createDailyLogEntrySchema>;
+export type DailyLogEntryAttachmentInput = z.infer<
+  typeof dailyLogEntryAttachmentSchema
+>;
 export type UpdateDailyLogEntryInput = z.infer<typeof updateDailyLogEntrySchema>;
 export type SubmitDailyLogInput = z.infer<typeof submitDailyLogSchema>;
 export type ListDailyLogsQuery = z.infer<typeof listDailyLogsQuerySchema>;
