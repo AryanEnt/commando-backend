@@ -6,6 +6,7 @@ import {
 import { validate } from "../../middleware/validate.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
 import {
+  createCommitmentPlanSchema,
   createDailyWorkLogSchema,
   saveDailyWorkCommitmentSchema,
   updateDailyWorkLogSchema,
@@ -30,9 +31,22 @@ dailyWorkLogsRouter.post(
 );
 
 dailyWorkLogsRouter.get(
+  "/activity-options",
+  requirePermission(PERMISSIONS.DAILY_WORK_LOG_VIEW),
+  controller.activityOptions,
+);
+
+dailyWorkLogsRouter.get(
   "/commitments",
   requirePermission(PERMISSIONS.DAILY_WORK_LOG_VIEW),
   controller.listCommitments,
+);
+
+dailyWorkLogsRouter.post(
+  "/commitments/plan",
+  requirePermission(PERMISSIONS.DAILY_WORK_LOG_CREATE),
+  validate(createCommitmentPlanSchema),
+  controller.createCommitmentPlan,
 );
 
 dailyWorkLogsRouter.put(
@@ -60,3 +74,4 @@ dailyWorkLogsRouter.delete(
   requirePermission(PERMISSIONS.DAILY_WORK_LOG_CREATE),
   controller.remove,
 );
+

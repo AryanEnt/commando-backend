@@ -7,6 +7,8 @@ export type AccessTokenPayload = {
   sub: string;
   email: string;
   roleCode: RoleCode;
+  /** User.tokenVersion at sign time; absent on tokens issued before single-session. */
+  ver?: number;
 };
 
 export function signAccessToken(payload: AccessTokenPayload): string {

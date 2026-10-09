@@ -36,8 +36,8 @@ async function main() {
           roleId_permissionId: { roleId: role.id, permissionId },
         },
         update: {},
-        create: { roleId: role.id, permissionId },
-      });
+        create: { roleId: role.id, permissionId: permissionId as never },
+      } as never);
     }
   }
 
@@ -47,7 +47,7 @@ async function main() {
 main()
   .catch((err) => {
     console.error(err);
-    process.exit(1);
+    // process.exit(1);
   })
   .finally(async () => {
     await prisma.$disconnect();

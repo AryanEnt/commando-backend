@@ -14,19 +14,27 @@ import { hashPassword } from "../../lib/password.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
-import type {
-  createSalesExecutiveSchema,
-  createUserSchema,
-  listUsersQuerySchema,
-  updateUserRoleSchema,
-  updateUserSchema,
-  updateUserStatusSchema,
+import {
+  DESIGNATION_ROLE_CODES,
+  type createSalesExecutiveSchema,
+  type createUserSchema,
+  type listUsersQuerySchema,
+  type updateUserDesignationSchema,
+  type updateUserRoleSchema,
+  type updateUserSchema,
+  type updateUserStatusSchema,
 } from "./schemas.js";
 
 type CreateUserInput = z.infer<typeof createUserSchema>;
 type UpdateUserInput = z.infer<typeof updateUserSchema>;
 type UpdateStatusInput = z.infer<typeof updateUserStatusSchema>;
 type UpdateRoleInput = z.infer<typeof updateUserRoleSchema>;
+type UpdateDesignationInput = z.infer<typeof updateUserDesignationSchema>;
+type DesignationRole = (typeof DESIGNATION_ROLE_CODES)[number];
+
+function isDesignationRole(code: RoleCode): code is DesignationRole {
+  return (DESIGNATION_ROLE_CODES as readonly RoleCode[]).includes(code);
+}
 type CreateSalesExecutiveInput = z.infer<typeof createSalesExecutiveSchema>;
 type ListQuery = z.infer<typeof listUsersQuerySchema>;
 
@@ -667,6 +675,14 @@ export async function changeUserRole(
   });
   if (!existing) throw notFound("User not found");
 
+  if (
+    existing.role.code !== input.roleCode &&
+    isDesignationRole(existing.role.code) &&
+    isDesignationRole(input.roleCode)
+  ) {
+    return changeDesignation(actor, userId, { roleCode: input.roleCode });
+  }
+
   await assertRoleChangeAllowed(
     userId,
     existing.role.code,
@@ -696,6 +712,287 @@ export async function changeUserRole(
         metadata: {
           fromRole: existing.role.code,
           toRole: input.roleCode,
+        },
+      },
+      tx,
+    );
+  });
+
+  return getUser(actor, userId);
+}
+
+export type DesignationBlocker =
+  | {
+      code: "COMMANDO_INTERVENTION";
+      message: string;
+      commando: { id: string; firstName: string; lastName: string };
+      startedAt: Date;
+    }
+  | { code: "SUPPORT_LINKS"; message: string; count: number };
+
+async function findDesignationBlocker(
+  userId: string,
+  fromRole: DesignationRole,
+  profileId: string | null,
+): Promise<DesignationBlocker | null> {
+  if (fromRole === "SALES_EXECUTIVE" && profileId) {
+    const activeAssignment = await prisma.commandoAssignment.findFirst({
+      where: { salesExecutiveProfileId: profileId, status: "ACTIVE" },
+      orderBy: { startedAt: "desc" },
+      select: {
+        startedAt: true,
+        commando: { select: { id: true, firstName: true, lastName: true } },
+      },
+    });
+    if (activeAssignment) {
+      return {
+        code: "COMMANDO_INTERVENTION",
+        message:
+          "This Sales Executive is under an active Commando intervention. Their designation can be changed once the intervention ends.",
+        commando: activeAssignment.commando,
+        startedAt: activeAssignment.startedAt,
+      };
+    }
+
+    const count = await prisma.salesSupportLink.count({
+      where: {
+        salesExecutiveProfileId: profileId,
+        isActive: true,
+        endedAt: null,
+      },
+    });
+    if (count > 0) {
+      return {
+        code: "SUPPORT_LINKS",
+        count,
+        message: `This Sales Executive still has ${count} active Sales Support link${count === 1 ? "" : "s"}. End the support link${count === 1 ? "" : "s"} before changing their designation.`,
+      };
+    }
+  }
+
+  if (fromRole === "SALES_SUPPORT_EXECUTIVE") {
+    const count = await prisma.salesSupportLink.count({
+      where: { salesSupportUserId: userId, isActive: true, endedAt: null },
+    });
+    if (count > 0) {
+      return {
+        code: "SUPPORT_LINKS",
+        count,
+        message: `This Sales Support Executive is still linked to ${count} Sales Executive${count === 1 ? "" : "s"}. End the support link${count === 1 ? "" : "s"} before changing their designation.`,
+      };
+    }
+  }
+
+  return null;
+}
+
+async function loadDesignationSubject(actor: Actor, userId: string) {
+  if (!isSuperAdmin(actor) && actor.roleCode !== "TEAM_LEAD") {
+    throw forbidden(
+      "Only Super Admin or Team Lead can change an employee's designation",
+    );
+  }
+  if (actor.id === userId) {
+    throw badRequest("You cannot change your own designation.");
+  }
+
+  const existing = await prisma.user.findFirst({
+    where: { id: userId, deletedAt: null },
+    select: {
+      id: true,
+      firstName: true,
+      lastName: true,
+      role: { select: { code: true } },
+      teamMemberships: {
+        where: { isActive: true, endedAt: null },
+        orderBy: { startedAt: "desc" },
+        select: { id: true, teamId: true, roleInTeam: true },
+      },
+      salesExecutiveProfile: {
+        select: { id: true, teamId: true, archivedAt: true },
+      },
+    },
+  });
+  if (!existing) throw notFound("User not found");
+
+  const fromRole = existing.role.code;
+  if (!isDesignationRole(fromRole)) {
+    throw badRequest(
+      "Designation can only be changed between Sales Executive and Sales Support Executive.",
+    );
+  }
+
+  if (actor.roleCode === "TEAM_LEAD") {
+    const actorTeamIds = await getActiveTeamIds(prisma, actor.id);
+    const inScope = existing.teamMemberships.some((m) =>
+      actorTeamIds.includes(m.teamId),
+    );
+    if (!inScope) {
+      throw forbidden(
+        "You can only change the designation of employees on teams you lead",
+      );
+    }
+  }
+
+  return { existing, fromRole };
+}
+
+export async function getDesignationEligibility(actor: Actor, userId: string) {
+  const { existing, fromRole } = await loadDesignationSubject(actor, userId);
+  const blocker = await findDesignationBlocker(
+    userId,
+    fromRole,
+    existing.salesExecutiveProfile?.id ?? null,
+  );
+  return { currentRole: fromRole, canChange: !blocker, blocker };
+}
+
+/**
+ * Switch an employee between Sales Executive and Sales Support Executive.
+ * Only the role, the team-membership role, and the profile's archived flag
+ * change; every historical record stays attached to the same user/profile.
+ * Switching back to Sales Executive restores the original profile.
+ */
+export async function changeDesignation(
+  actor: Actor,
+  userId: string,
+  input: UpdateDesignationInput,
+) {
+  const { existing, fromRole } = await loadDesignationSubject(actor, userId);
+
+  if (fromRole === input.roleCode) {
+    return getUser(actor, userId);
+  }
+
+  const profile = existing.salesExecutiveProfile;
+  const blocker = await findDesignationBlocker(
+    userId,
+    fromRole,
+    profile?.id ?? null,
+  );
+  if (blocker) throw conflict(blocker.message);
+
+  const memberTeamIds = existing.teamMemberships.map((m) => m.teamId);
+  const primaryTeamId = memberTeamIds[0] ?? null;
+  if (input.roleCode === "SALES_EXECUTIVE" && !profile && !primaryTeamId) {
+    throw badRequest(
+      "Add this employee to a team before making them a Sales Executive.",
+    );
+  }
+
+  const nextRole = await resolveRole(input.roleCode);
+  const nextMembershipRole = membershipRoleFor(input.roleCode);
+  const designationMembershipIds = existing.teamMemberships
+    .filter(
+      (m) =>
+        m.roleInTeam === "SALES_EXECUTIVE" ||
+        m.roleInTeam === "SALES_SUPPORT_EXECUTIVE",
+    )
+    .map((m) => m.id);
+
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({
+      where: { id: userId },
+      data: { roleId: nextRole.id },
+    });
+
+    if (designationMembershipIds.length > 0) {
+      await tx.teamMembership.updateMany({
+        where: { id: { in: designationMembershipIds } },
+        data: { roleInTeam: nextMembershipRole },
+      });
+    }
+
+    let profileId = profile?.id ?? null;
+
+    if (input.roleCode === "SALES_SUPPORT_EXECUTIVE") {
+      if (profile && !profile.archivedAt) {
+        const archivedAt = new Date();
+        await tx.salesExecutiveProfile.update({
+          where: { id: profile.id },
+          data: { archivedAt },
+        });
+        await writeAuditLog(
+          {
+            actorId: actor.id,
+            action: AUDIT_ACTIONS.PROFILE_UPDATED,
+            entityType: "SalesExecutiveProfile",
+            entityId: profile.id,
+            metadata: {
+              archivedAt: archivedAt.toISOString(),
+              reason: "designation_change",
+            },
+          },
+          tx,
+        );
+      }
+    } else if (profile) {
+      const teamId =
+        primaryTeamId && !memberTeamIds.includes(profile.teamId)
+          ? primaryTeamId
+          : profile.teamId;
+      if (profile.archivedAt || teamId !== profile.teamId) {
+        await tx.salesExecutiveProfile.update({
+          where: { id: profile.id },
+          data: { archivedAt: null, teamId },
+        });
+        await writeAuditLog(
+          {
+            actorId: actor.id,
+            action: AUDIT_ACTIONS.PROFILE_UPDATED,
+            entityType: "SalesExecutiveProfile",
+            entityId: profile.id,
+            metadata: {
+              archivedAt: null,
+              ...(teamId !== profile.teamId
+                ? { fromTeamId: profile.teamId, toTeamId: teamId }
+                : {}),
+              reason: "designation_change",
+            },
+          },
+          tx,
+        );
+      }
+    } else {
+      const created = await tx.salesExecutiveProfile.create({
+        data: {
+          userId,
+          teamId: primaryTeamId!,
+          displayName: `${existing.firstName} ${existing.lastName}`.trim(),
+        },
+      });
+      profileId = created.id;
+      await writeAuditLog(
+        {
+          actorId: actor.id,
+          action: AUDIT_ACTIONS.SALES_EXECUTIVE_PROFILE_CREATED,
+          entityType: "SalesExecutiveProfile",
+          entityId: created.id,
+          metadata: {
+            userId,
+            teamId: created.teamId,
+            displayName: created.displayName,
+            via: "designation_change",
+          },
+        },
+        tx,
+      );
+    }
+
+    await revokeRefreshTokens(userId, tx);
+
+    await writeAuditLog(
+      {
+        actorId: actor.id,
+        action: AUDIT_ACTIONS.USER_ROLE_CHANGED,
+        entityType: "User",
+        entityId: userId,
+        metadata: {
+          fromRole,
+          toRole: input.roleCode,
+          via: "designation_change",
+          profileId,
+          membershipIds: designationMembershipIds,
         },
       },
       tx,

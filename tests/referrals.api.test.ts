@@ -21,6 +21,24 @@ const fields = {
   supportAlreadyProvided: "Weekly 1:1 and call shadowing",
   supportRequiredFromCommando: "Structured discovery coaching and roleplay",
   recommendationFocus: "Discovery framework and talk-track discipline",
+  profileSwot: {
+    strengthPoints: [{ text: "Warm-lead territory with repeat buyers" }],
+    weaknessPoints: [{ text: "Pipeline concentrated in two accounts" }],
+    opportunityPoints: [{ text: "Untapped mid-market segment" }],
+    threatPoints: [{ text: "Competitor discounting in region" }],
+  },
+  performanceSnapshot: {
+    salesExecutive: {
+      overallPerformance: "NEEDS_ATTENTION",
+      trend: "DECLINING",
+      insights: ["MISSING_TARGETS", "NEEDS_SUPPORT"],
+      note: "Conversion has slipped for two months; needs structured coaching.",
+      salesAchieved: 84200,
+      salesTarget: 100000,
+    },
+    salesSupport: [] as Array<Record<string, unknown>>,
+    evidence: [] as Array<Record<string, unknown>>,
+  },
 };
 
 describe("referral lifecycle", () => {
@@ -122,6 +140,38 @@ describe("referral lifecycle", () => {
     expect(provided.body.data.referral.assignment?.status).toBe("ACTIVE");
     expect(provided.body.data.referral.teamLeadSwot).toBeNull();
 
+    const profileSwot = provided.body.data.referral.profileSwot;
+    expect(profileSwot?.subjectType).toBe("PROFILE");
+    expect(profileSwot?.source).toBe("TEAM_LEAD");
+    expect(profileSwot?.strengthPoints[0]?.text).toBe(
+      "Warm-lead territory with repeat buyers",
+    );
+    const stored = await prisma.swotAnalysis.findUnique({
+      where: { id: profileSwot.id },
+    });
+    expect(stored?.assignmentId).toBe(
+      provided.body.data.referral.assignment?.id,
+    );
+    expect(stored?.visibleToSalesExecutive).toBe(false);
+
+    const commandoView = await request(app)
+      .get(`/api/referrals/${referralId}`)
+      .set("Authorization", `Bearer ${c}`);
+    expect(commandoView.body.data.referral.profileSwot?.id).toBe(profileSwot.id);
+
+    const se = await token("sales@commando.local");
+    const seGet = await request(app)
+      .get(`/api/swot/${profileSwot.id}`)
+      .set("Authorization", `Bearer ${se}`);
+    expect(seGet.status).toBe(403);
+    const seList = await request(app)
+      .get("/api/swot")
+      .set("Authorization", `Bearer ${se}`);
+    const seIds = (seList.body.data?.items ?? []).map(
+      (s: { id: string }) => s.id,
+    );
+    expect(seIds).not.toContain(profileSwot.id);
+
     const audit = await prisma.auditLog.findFirst({
       where: {
         entityId: referralId,
@@ -129,6 +179,60 @@ describe("referral lifecycle", () => {
       },
     });
     expect(audit).toBeTruthy();
+    expect(
+      (audit?.metadata as { performanceSnapshot?: { salesExecutive?: { trend?: string } } })
+        ?.performanceSnapshot?.salesExecutive?.trend,
+    ).toBe("DECLINING");
+
+    const snapshots = commandoView.body.data.referral.performanceSnapshots;
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toMatchObject({
+      subjectRole: "SALES_EXECUTIVE",
+      overallPerformance: "NEEDS_ATTENTION",
+      trend: "DECLINING",
+      insights: ["MISSING_TARGETS", "NEEDS_SUPPORT"],
+      achievementPct: 84.2,
+    });
+    expect(["SIX_MONTHS", "ALL_HISTORY"]).toContain(snapshots[0].period.kind);
+  });
+
+  it("rejects approval when the SE snapshot is incomplete", async ({ skip }) => {
+    if (!dbReady) skip();
+    const tl = await token("teamlead@commando.local");
+    const send = (salesExecutive: Record<string, unknown>) =>
+      request(app)
+        .post(`/api/referrals/${referralId ?? "missing"}/provide-information`)
+        .set("Authorization", `Bearer ${tl}`)
+        .send({
+          ...fields,
+          performanceSnapshot: { ...fields.performanceSnapshot, salesExecutive },
+          priority1: "A",
+          priority2: "B",
+          priority3: "C",
+        });
+    const base = fields.performanceSnapshot.salesExecutive;
+    expect((await send({ ...base, note: "  " })).status).toBe(400);
+    expect((await send({ ...base, insights: [] })).status).toBe(400);
+    expect((await send({ ...base, trend: undefined })).status).toBe(400);
+    expect((await send({ ...base, insights: ["STRONG_SUPPORT"] })).status).toBe(400);
+  });
+
+  it("rejects Approve & Provide Information without a Profile SWOT", async ({
+    skip,
+  }) => {
+    if (!dbReady) skip();
+    const tl = await token("teamlead@commando.local");
+    const { profileSwot: _omit, ...withoutSwot } = fields;
+    const res = await request(app)
+      .post(`/api/referrals/${referralId ?? "missing"}/provide-information`)
+      .set("Authorization", `Bearer ${tl}`)
+      .send({
+        ...withoutSwot,
+        priority1: "A",
+        priority2: "B",
+        priority3: "C",
+      });
+    expect(res.status).toBe(400);
   });
 
   it("rejects invalid / skipped status transitions", async ({ skip }) => {
@@ -451,12 +555,22 @@ describe("commando request → TL provide information → lock", () => {
     expect(closed.body.data.referral.assignment?.status).toBe("ACTIVE");
 
     const assignmentId = closed.body.data.referral.assignment.id as string;
+    const requirements = await request(app)
+      .get(`/api/assignments/${assignmentId}/handoff-requirements`)
+      .set("Authorization", `Bearer ${c}`);
+    expect(requirements.status).toBe(200);
     const ended = await request(app)
       .post(`/api/assignments/${assignmentId}/end`)
       .set("Authorization", `Bearer ${c}`)
       .send({
         status: "COMPLETED",
         completionReason: "Intervention finished in test",
+        handoffReports: (
+          requirements.body.data.subjects as { userId: string }[]
+        ).map((s) => ({
+          subjectUserId: s.userId,
+          description: "Sales recovered steadily over the intervention period.",
+        })),
       });
     expect(ended.status).toBe(200);
 
@@ -523,17 +637,60 @@ describe("commando request → TL provide information → lock", () => {
     );
 
     const tl = await token("teamlead@commando.local");
-    const provided = await request(app)
-      .post(`/api/referrals/${id}/provide-information`)
-      .set("Authorization", `Bearer ${tl}`)
-      .send({
-        ...fields,
-        priority1: "Discovery quality",
-        priority2: "Qualification discipline",
-        priority3: "Talk-track consistency",
-      });
+    const tlView = await request(app)
+      .get(`/api/referrals/${id}`)
+      .set("Authorization", `Bearer ${tl}`);
+    expect(
+      tlView.body.data.referral.snapshotSubjects.map(
+        (s: { role: string; userId: string }) => [s.role, s.userId],
+      ),
+    ).toContainEqual(["SALES_SUPPORT_EXECUTIVE", support.id]);
+
+    const approve = (performanceSnapshot: Record<string, unknown>) =>
+      request(app)
+        .post(`/api/referrals/${id}/provide-information`)
+        .set("Authorization", `Bearer ${tl}`)
+        .send({
+          ...fields,
+          performanceSnapshot: { ...fields.performanceSnapshot, ...performanceSnapshot },
+          priority1: "Discovery quality",
+          priority2: "Qualification discipline",
+          priority3: "Talk-track consistency",
+        });
+
+    const missingSse = await approve({});
+    expect(missingSse.status).toBe(400);
+    expect(missingSse.body.error?.message ?? "").toMatch(/Sales Support/);
+
+    const sseSnapshot = {
+      subjectUserId: support.id,
+      overallPerformance: "AVERAGE",
+      trend: "STABLE",
+      insights: ["STRONG_SUPPORT"],
+      note: "Reliable follow-up support; keep involved.",
+    };
+    const foreignEvidence = await approve({
+      salesSupport: [sseSnapshot],
+      evidence: [
+        {
+          key: "interventions/evidence/someone-else/abc-report.pdf",
+          fileName: "report.pdf",
+          contentType: "application/pdf",
+          size: 1000,
+        },
+      ],
+    });
+    expect(foreignEvidence.status).toBe(400);
+
+    const provided = await approve({ salesSupport: [sseSnapshot] });
     expect(provided.status).toBe(200);
     expect(provided.body.data.referral.teamLeadSwot).toBeNull();
     expect(provided.body.data.referral.teamLeadSupportSwot).toEqual([]);
+    expect(
+      provided.body.data.referral.performanceSnapshots.map(
+        (s: { subjectRole: string }) => s.subjectRole,
+      ),
+    ).toEqual(["SALES_EXECUTIVE", "SALES_SUPPORT_EXECUTIVE"]);
+    expect(provided.body.data.referral.snapshotEvidence).toEqual([]);
   });
 });

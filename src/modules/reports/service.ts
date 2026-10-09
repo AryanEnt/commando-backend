@@ -4,6 +4,7 @@ import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { forbidden, notFound } from "../../lib/errors.js";
 import { totalDaysUnderCommando } from "../../lib/assignmentDays.js";
+import { HIDE_SELF_PROFILE_SWOT } from "../../lib/lifecycleVisibility.js";
 import type { ListCommandoPerformanceQuery } from "./schemas.js";
 
 function averageScore(
@@ -88,6 +89,7 @@ async function buildRow(assignment: AssignmentRow) {
     prisma.swotAnalysis.findMany({
       where: {
         archivedAt: null,
+        ...HIDE_SELF_PROFILE_SWOT,
         OR: [
           {
             subjectType: "PROFILE",

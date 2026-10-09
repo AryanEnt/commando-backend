@@ -69,6 +69,9 @@ describe("teams, profiles, assignments", () => {
         where: { userId: user.id },
       });
       if (existingProfile) {
+        await prisma.salesSupportLink.deleteMany({
+          where: { salesExecutiveProfileId: existingProfile.id },
+        });
         await prisma.commandoAssignment.deleteMany({
           where: { salesExecutiveProfileId: existingProfile.id },
         });
@@ -161,6 +164,45 @@ describe("teams, profiles, assignments", () => {
     expect(res.status).toBe(403);
   });
 
+  it("requires a Sales Executive handoff description before ending", async ({
+    skip,
+  }) => {
+    if (!dbReady || !createdAssignmentId || !salesUserForCreate) skip();
+    const adminToken = await token("admin@commando.local");
+
+    const reqs = await request(app)
+      .get(`/api/assignments/${createdAssignmentId}/handoff-requirements`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(reqs.status).toBe(200);
+    expect(reqs.body.data.subjects).toEqual([
+      expect.objectContaining({
+        userId: salesUserForCreate,
+        role: "SALES_EXECUTIVE",
+      }),
+    ]);
+
+    const missing = await request(app)
+      .post(`/api/assignments/${createdAssignmentId}/end`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ status: "COMPLETED" });
+    expect(missing.status).toBe(400);
+    expect(missing.body.error.message).toMatch(/Sales Executive/);
+
+    const tooShort = await request(app)
+      .post(`/api/assignments/${createdAssignmentId}/end`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        status: "COMPLETED",
+        handoffReports: [{ subjectUserId: salesUserForCreate, description: "ok" }],
+      });
+    expect(tooShort.status).toBe(400);
+
+    const stillActive = await prisma.commandoAssignment.findUniqueOrThrow({
+      where: { id: createdAssignmentId },
+    });
+    expect(stillActive.status).toBe("ACTIVE");
+  });
+
   it("ends assignment and preserves history", async ({ skip }) => {
     if (!dbReady || !createdAssignmentId || !createdProfileId) skip();
     const adminToken = await token("admin@commando.local");
@@ -170,6 +212,14 @@ describe("teams, profiles, assignments", () => {
       .send({
         status: "COMPLETED",
         completionReason: "Phase 4 test completion",
+        handoffReports: [
+          {
+            subjectUserId: salesUserForCreate,
+            description: "Sales climbed from 60% to 85% of target over the period.",
+            salesAchieved: 85000,
+            salesTarget: 100000,
+          },
+        ],
       });
     expect(endRes.status).toBe(200);
     expect(endRes.body.data.assignment.status).toBe("COMPLETED");
@@ -203,6 +253,105 @@ describe("teams, profiles, assignments", () => {
       where: { id: historicalAssignmentId },
     });
     expect(stillThere?.status).toBe("COMPLETED");
+  });
+
+  it("handoff reports are visible to Team Lead and Super Admin only", async ({
+    skip,
+  }) => {
+    if (!dbReady || !historicalAssignmentId) skip();
+    const url = `/api/assignments/${historicalAssignmentId}/handoff-reports`;
+
+    const tl = await request(app)
+      .get(url)
+      .set("Authorization", `Bearer ${await token("teamlead@commando.local")}`);
+    expect(tl.status).toBe(200);
+    expect(tl.body.data.reports).toHaveLength(1);
+    expect(tl.body.data.reports[0]).toMatchObject({
+      subjectRole: "SALES_EXECUTIVE",
+      salesAchieved: 85000,
+      salesTarget: 100000,
+      achievementPct: 85,
+    });
+
+    const admin = await request(app)
+      .get(url)
+      .set("Authorization", `Bearer ${await token("admin@commando.local")}`);
+    expect(admin.status).toBe(200);
+
+    for (const email of ["commando@commando.local", "sales@commando.local"]) {
+      const res = await request(app)
+        .get(url)
+        .set("Authorization", `Bearer ${await token(email)}`);
+      expect(res.status).toBe(403);
+    }
+  });
+
+  it("requires a separate report for a linked Sales Support Executive", async ({
+    skip,
+  }) => {
+    if (!dbReady || !createdAssignmentId || !createdProfileId || !salesUserForCreate) {
+      skip();
+    }
+    const support = await prisma.user.findUnique({
+      where: { email: "support@commando.local" },
+    });
+    if (!support) skip();
+    const link = await prisma.salesSupportLink.create({
+      data: {
+        salesExecutiveProfileId: createdProfileId!,
+        salesSupportUserId: support!.id,
+      },
+    });
+    try {
+      const adminToken = await token("admin@commando.local");
+      const reqs = await request(app)
+        .get(`/api/assignments/${createdAssignmentId}/handoff-requirements`)
+        .set("Authorization", `Bearer ${adminToken}`);
+      expect(reqs.status).toBe(200);
+      expect(
+        (reqs.body.data.subjects as { role: string }[]).map((s) => s.role),
+      ).toEqual(["SALES_EXECUTIVE", "SALES_SUPPORT_EXECUTIVE"]);
+
+      const seReport = {
+        subjectUserId: salesUserForCreate,
+        description: "Pipeline rebuilt; conversions back on track.",
+      };
+      const seOnly = await request(app)
+        .post(`/api/assignments/${createdAssignmentId}/end`)
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({ status: "COMPLETED", handoffReports: [seReport] });
+      expect(seOnly.status).toBe(400);
+      expect(seOnly.body.error.message).toMatch(/Sales Support Executive/);
+
+      const both = await request(app)
+        .post(`/api/assignments/${createdAssignmentId}/end`)
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({
+          status: "COMPLETED",
+          handoffReports: [
+            seReport,
+            {
+              subjectUserId: support!.id,
+              description: "Follow-ups now same day; quote turnaround improved.",
+            },
+          ],
+        });
+      expect(both.status).toBe(200);
+
+      const next = await request(app)
+        .post("/api/assignments")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({
+          salesExecutiveProfileId: createdProfileId,
+          commandoUserId: commandoId,
+          teamLeadUserId: teamLeadId,
+          teamId,
+        });
+      expect(next.status).toBe(201);
+      createdAssignmentId = next.body.data.assignment.id;
+    } finally {
+      await prisma.salesSupportLink.delete({ where: { id: link.id } });
+    }
   });
 
   it("team change does not alter historical assignment teamId", async ({

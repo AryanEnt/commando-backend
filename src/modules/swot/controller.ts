@@ -2,9 +2,12 @@ import type { NextFunction, Request, Response } from "express";
 import type { Actor } from "../../lib/authorization.js";
 import { badRequest } from "../../lib/errors.js";
 import {
+  addSwotPointSchema,
   createSwotSchema,
+  deleteSwotPointSchema,
   listSwotQuerySchema,
   setSwotVisibilitySchema,
+  updateSwotPointSchema,
 } from "./schemas.js";
 import * as swotService from "./service.js";
 
@@ -69,6 +72,63 @@ export async function setSwotVisibility(
       req.user as Actor,
       paramId(req.params.id),
       body,
+    );
+    res.status(200).json({ data: { swot: item } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function addSwotPoint(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = addSwotPointSchema.parse(req.body);
+    const item = await swotService.correctSwotPoint(
+      req.user as Actor,
+      paramId(req.params.id),
+      { kind: "add", quadrant: body.quadrant, text: body.text },
+      body.reason,
+    );
+    res.status(200).json({ data: { swot: item } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateSwotPoint(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = updateSwotPointSchema.parse(req.body);
+    const item = await swotService.correctSwotPoint(
+      req.user as Actor,
+      paramId(req.params.id),
+      { kind: "edit", pointId: paramId(req.params.pointId), text: body.text },
+      body.reason,
+    );
+    res.status(200).json({ data: { swot: item } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function deleteSwotPoint(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const body = deleteSwotPointSchema.parse(req.body ?? {});
+    const item = await swotService.correctSwotPoint(
+      req.user as Actor,
+      paramId(req.params.id),
+      { kind: "delete", pointId: paramId(req.params.pointId) },
+      body.reason,
     );
     res.status(200).json({ data: { swot: item } });
   } catch (err) {

@@ -89,6 +89,47 @@ export function swotWhereVisibleToSalesExecutive(): {
   };
 }
 
+/** Profile SWOT is Team Lead / Commando only; legacy SE / SSE-written rows stay hidden. */
+export const HIDE_SELF_PROFILE_SWOT = {
+  NOT: {
+    subjectType: "PROFILE" as const,
+    source: {
+      in: ["SALES_EXECUTIVE", "SALES_SUPPORT_EXECUTIVE"] as SwotSource[],
+    },
+  },
+};
+
+/**
+ * SWOTs a subject executive (SE/SSE) may read: their User (EXECUTIVE) SWOT
+ * (own + shared), and Team Lead / Commando Profile SWOT versions shared on
+ * `sharedProfileIds` (the SE's own profile, or profiles an SSE actively
+ * supports). Callers that return raw, unredacted points must leave
+ * `sharedProfileIds` empty.
+ */
+export function swotWhereSubjectExecutiveMaySee(
+  _actorId: string,
+  sharedProfileIds: string[] = [],
+) {
+  return {
+    OR: [
+      {
+        subjectType: "EXECUTIVE" as const,
+        ...swotWhereVisibleToSalesExecutive(),
+      },
+      ...(sharedProfileIds.length > 0
+        ? [
+            {
+              subjectType: "PROFILE" as const,
+              source: { in: ["TEAM_LEAD", "COMMANDO"] as SwotSource[] },
+              visibleToSalesExecutive: true,
+              salesExecutiveProfileId: { in: sharedProfileIds },
+            },
+          ]
+        : []),
+    ],
+  };
+}
+
 /** @deprecated Prefer swotWhereVisibleToSalesExecutive */
 export function swotSourcesVisibleToSalesExecutive(
   lifecycle: CommandoLifecycleState,

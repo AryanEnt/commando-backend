@@ -6,6 +6,11 @@ import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import {
+  assertCommandoCanWriteProfile,
+  commandoCanReadProfile,
+  commandoReadableProfileIds,
+} from "../../lib/commandoAccess.js";
 import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
 import { createPresignedGetUrl } from "../../lib/r2.js";
 import {
@@ -167,21 +172,10 @@ async function scopeWhere(actor: Actor): Promise<Prisma.SupportTaskWhereInput> {
 
   switch (actor.roleCode) {
     case "COMMANDO_EXECUTIVE": {
-      const assignments = await prisma.commandoAssignment.findMany({
-        where: { commandoUserId: actor.id },
-        select: { salesExecutiveProfileId: true },
-      });
-      const profileIds = [
-        ...new Set(assignments.map((a) => a.salesExecutiveProfileId)),
-      ];
+      const profileIds = await commandoReadableProfileIds(prisma, actor.id);
       return {
         archivedAt: null,
-        OR: [
-          { createdById: actor.id },
-          { assignedById: actor.id },
-          { salesExecutiveProfileId: { in: profileIds } },
-          { assignment: { commandoUserId: actor.id } },
-        ],
+        salesExecutiveProfileId: { in: profileIds },
       };
     }
     case "TEAM_LEAD": {
@@ -230,16 +224,13 @@ async function assertCanAccess(actor: Actor, row: TaskRow): Promise<void> {
   }
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    if (row.createdById === actor.id || row.assignedById === actor.id) return;
-    if (row.assignment?.commandoUserId === actor.id) return;
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
+    if (
+      !(await commandoCanReadProfile(
+        prisma,
+        actor.id,
+        row.salesExecutiveProfileId,
+      ))
+    ) {
       throw forbidden("Support task is outside your assignment scope");
     }
     return;
@@ -254,6 +245,18 @@ async function assertCanAccess(actor: Actor, row: TaskRow): Promise<void> {
   }
 
   throw forbidden("Not allowed to access support tasks");
+}
+
+async function assertCommandoWrite(
+  actor: Actor,
+  row: { salesExecutiveProfileId: string },
+): Promise<void> {
+  if (actor.roleCode !== "COMMANDO_EXECUTIVE") return;
+  await assertCommandoCanWriteProfile(
+    prisma,
+    actor.id,
+    row.salesExecutiveProfileId,
+  );
 }
 
 function assertCanManageAssignment(actor: Actor): void {
@@ -441,6 +444,11 @@ export async function createSupportTask(
       },
     });
     if (!assignment) {
+      await assertCommandoCanWriteProfile(
+        prisma,
+        actor.id,
+        input.salesExecutiveProfileId,
+      );
       throw forbidden("No active Commando assignment for this profile");
     }
     assignmentId = assignment.id;
@@ -548,6 +556,7 @@ export async function updateSupportTask(
   if (!row) throw notFound("Support task not found");
   await assertCanAccess(actor, row);
   assertCanManageAssignment(actor);
+  await assertCommandoWrite(actor, row);
 
   if (!hasPermission(actor, PERMISSIONS.SALES_SUPPORT_TASK_UPDATE)) {
     throw forbidden("Missing permission to update support tasks");
@@ -732,6 +741,7 @@ export async function updateSupportTaskStatus(
   });
   if (!row) throw notFound("Support task not found");
   await assertCanAccess(actor, row);
+  await assertCommandoWrite(actor, row);
 
   if (!hasPermission(actor, PERMISSIONS.SALES_SUPPORT_TASK_STATUS_UPDATE)) {
     // Team Lead may not have STATUS_UPDATE — only Support and Commando do today
@@ -818,6 +828,7 @@ export async function addSupportTaskProgressNote(
   });
   if (!row) throw notFound("Support task not found");
   await assertCanAccess(actor, row);
+  await assertCommandoWrite(actor, row);
 
   if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
     if (row.salesSupportUserId !== actor.id) {

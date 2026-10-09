@@ -4,6 +4,11 @@ import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import {
+  assertCommandoCanWriteProfile,
+  commandoCanReadProfile,
+  commandoReadableProfileIds,
+} from "../../lib/commandoAccess.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
 import type {
@@ -70,11 +75,7 @@ function serialize(row: LinkRow) {
 }
 
 async function assignedProfileIds(commandoUserId: string): Promise<string[]> {
-  const assignments = await prisma.commandoAssignment.findMany({
-    where: { commandoUserId },
-    select: { salesExecutiveProfileId: true },
-  });
-  return [...new Set(assignments.map((a) => a.salesExecutiveProfileId))];
+  return commandoReadableProfileIds(prisma, commandoUserId);
 }
 
 async function scopeWhere(
@@ -91,12 +92,7 @@ async function scopeWhere(
     }
     case "COMMANDO_EXECUTIVE": {
       const profileIds = await assignedProfileIds(actor.id);
-      return {
-        OR: [
-          { salesExecutiveProfileId: { in: profileIds } },
-          { assignedById: actor.id },
-        ],
-      };
+      return { salesExecutiveProfileId: { in: profileIds } };
     }
     case "SALES_SUPPORT_EXECUTIVE":
       return { salesSupportUserId: actor.id };
@@ -126,15 +122,13 @@ async function assertCanAccessLink(actor: Actor, row: LinkRow): Promise<void> {
   }
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    if (row.assignedById === actor.id) return;
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
+    if (
+      !(await commandoCanReadProfile(
+        prisma,
+        actor.id,
+        row.salesExecutiveProfileId,
+      ))
+    ) {
       throw forbidden("Support link is outside your assignment scope");
     }
     return;
@@ -184,6 +178,7 @@ async function assertCanAssign(
       select: { id: true },
     });
     if (!assignment) {
+      await assertCommandoCanWriteProfile(prisma, actor.id, profile.id);
       throw forbidden(
         "You may only assign Sales Support for Sales Executives with an active intervention assigned to you",
       );
@@ -279,14 +274,7 @@ export async function getTeamContext(actor: Actor, profileId: string) {
       throw forbidden("Profile is outside your team scope");
     }
   } else if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: profile.id,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
+    if (!(await commandoCanReadProfile(prisma, actor.id, profile.id))) {
       throw forbidden("Profile is outside your assignment scope");
     }
   } else if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {

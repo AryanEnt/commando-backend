@@ -328,6 +328,93 @@ describe("user management & sales executive onboarding API", () => {
     expect(res.body.error.message).toMatch(/assignment|profile/i);
   });
 
+  it("lets Team Lead switch SE ↔ SSE designation without losing data", async () => {
+    const tl = await token("teamlead@commando.local");
+    const onboard = await request(app)
+      .post("/api/users/sales-executives")
+      .set("Authorization", `Bearer ${tl}`)
+      .send({
+        firstName: "Dana",
+        lastName: "Designation",
+        email: uniqueEmail("designation"),
+        password: PASSWORD,
+        teamId,
+        displayName: "Dana Designation",
+        employeeCode: "DSG-1",
+      });
+    expect(onboard.status).toBe(201);
+    const userId = onboard.body.data.user.id as string;
+    const profileId = onboard.body.data.profile.id as string;
+
+    for (const email of ["sales@commando.local", "support@commando.local", "commando@commando.local"]) {
+      const denied = await request(app)
+        .patch(`/api/users/${userId}/designation`)
+        .set("Authorization", `Bearer ${await token(email)}`)
+        .send({ roleCode: "SALES_SUPPORT_EXECUTIVE" });
+      expect(denied.status).toBe(403);
+    }
+
+    const toSupport = await request(app)
+      .patch(`/api/users/${userId}/designation`)
+      .set("Authorization", `Bearer ${tl}`)
+      .send({ roleCode: "SALES_SUPPORT_EXECUTIVE" });
+    expect(toSupport.status).toBe(200);
+    expect(toSupport.body.data.user.role.code).toBe("SALES_SUPPORT_EXECUTIVE");
+    expect(toSupport.body.data.user.team.roleInTeam).toBe("SALES_SUPPORT_EXECUTIVE");
+
+    const archived = await prisma.salesExecutiveProfile.findUniqueOrThrow({
+      where: { id: profileId },
+    });
+    expect(archived.userId).toBe(userId);
+    expect(archived.archivedAt).not.toBeNull();
+    expect(archived.displayName).toBe("Dana Designation");
+    expect(archived.employeeCode).toBe("DSG-1");
+
+    const toSales = await request(app)
+      .patch(`/api/users/${userId}/designation`)
+      .set("Authorization", `Bearer ${tl}`)
+      .send({ roleCode: "SALES_EXECUTIVE" });
+    expect(toSales.status).toBe(200);
+    expect(toSales.body.data.user.role.code).toBe("SALES_EXECUTIVE");
+    expect(toSales.body.data.user.team.roleInTeam).toBe("SALES_EXECUTIVE");
+    expect(toSales.body.data.user.profile.id).toBe(profileId);
+    expect(toSales.body.data.user.profile.archivedAt).toBeNull();
+    expect(
+      await prisma.salesExecutiveProfile.count({ where: { userId } }),
+    ).toBe(1);
+
+    const otherTeam = await prisma.team.create({
+      data: {
+        name: `Designation Other ${Date.now()}`,
+        description: "Out of scope for Alpha Team Lead",
+      },
+    });
+    try {
+      await prisma.teamMembership.updateMany({
+        where: { userId, isActive: true },
+        data: { teamId: otherTeam.id },
+      });
+      const outOfScope = await request(app)
+        .patch(`/api/users/${userId}/designation`)
+        .set("Authorization", `Bearer ${tl}`)
+        .send({ roleCode: "SALES_SUPPORT_EXECUTIVE" });
+      expect(outOfScope.status).toBe(403);
+
+      const adminSwitch = await request(app)
+        .patch(`/api/users/${userId}/role`)
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({ roleCode: "SALES_SUPPORT_EXECUTIVE" });
+      expect(adminSwitch.status).toBe(200);
+      expect(adminSwitch.body.data.user.role.code).toBe("SALES_SUPPORT_EXECUTIVE");
+    } finally {
+      await prisma.teamMembership.updateMany({
+        where: { userId, teamId: otherTeam.id },
+        data: { teamId },
+      });
+      await prisma.team.delete({ where: { id: otherTeam.id } }).catch(() => undefined);
+    }
+  });
+
   it("does not allow non-admin role or status changes", async () => {
     const tl = await token("teamlead@commando.local");
     const target = await prisma.user.findUniqueOrThrow({

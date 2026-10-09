@@ -52,12 +52,15 @@ export const createSwotSchema = z
 
     const subjectType = v.subjectType;
     if (subjectType === "PROFILE") {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "Profile SWOT is no longer used. Create an Executive SWOT for the Sales Executive instead.",
-        path: ["subjectType"],
-      });
+      // salesExecutiveProfileId is resolved server-side for an SE's own profile.
+      if (executiveId) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "Profile SWOT is about the sales profile, not a person — omit executiveUserId",
+          path: ["executiveUserId"],
+        });
+      }
     } else if (subjectType === "EXECUTIVE") {
       // May resolve person from salesExecutiveProfileId for SE executives
       if (!executiveId && !v.salesExecutiveProfileId) {
@@ -126,6 +129,29 @@ export const setSwotVisibilitySchema = z
     { message: "Provide at least one visibility field" },
   );
 
+const correctionReason = z.string().trim().max(1000).optional();
+
+export const addSwotPointSchema = z
+  .object({
+    quadrant: z.enum(["strength", "weakness", "opportunity", "threat"]),
+    text: z.string().trim().min(1).max(2000),
+    reason: correctionReason,
+  })
+  .strict();
+
+export const updateSwotPointSchema = z
+  .object({
+    text: z.string().trim().min(1).max(2000),
+    reason: correctionReason,
+  })
+  .strict();
+
+export const deleteSwotPointSchema = z
+  .object({
+    reason: correctionReason,
+  })
+  .strict();
+
 export const listSwotQuerySchema = z.object({
   search: z.string().trim().optional(),
   teamId: z.string().optional(),
@@ -134,6 +160,8 @@ export const listSwotQuerySchema = z.object({
   /** @deprecated Alias for executiveUserId */
   subjectUserId: z.string().optional(),
   subjectType: z.enum(["EXECUTIVE", "PROFILE"]).optional(),
+  /** Only versions written by this user (e.g. an SSE's Profile SWOTs). */
+  authorUserId: z.string().optional(),
   commandoUserId: z.string().optional(),
   source: z
     .enum([
@@ -150,3 +178,6 @@ export const listSwotQuerySchema = z.object({
 export type CreateSwotInput = z.infer<typeof createSwotSchema>;
 export type SetSwotVisibilityInput = z.infer<typeof setSwotVisibilitySchema>;
 export type ListSwotQuery = z.infer<typeof listSwotQuerySchema>;
+export type AddSwotPointInput = z.infer<typeof addSwotPointSchema>;
+export type UpdateSwotPointInput = z.infer<typeof updateSwotPointSchema>;
+export type DeleteSwotPointInput = z.infer<typeof deleteSwotPointSchema>;

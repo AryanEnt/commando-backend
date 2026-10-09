@@ -5,6 +5,11 @@ import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { forbidden, notFound } from "../../lib/errors.js";
 import { assertProfileInScope, getActiveTeamIds } from "../../lib/scope.js";
+import {
+  assertCommandoCanWriteProfile,
+  commandoCanReadProfile,
+  commandoReadableProfileIds,
+} from "../../lib/commandoAccess.js";
 import { totalDaysUnderCommando } from "../../lib/assignmentDays.js";
 import {
   getCommandoLifecycleState,
@@ -116,13 +121,7 @@ async function scopeWhere(
       };
     }
     case "COMMANDO_EXECUTIVE": {
-      const assignments = await prisma.commandoAssignment.findMany({
-        where: { commandoUserId: actor.id },
-        select: { salesExecutiveProfileId: true },
-      });
-      const profileIds = [
-        ...new Set(assignments.map((a) => a.salesExecutiveProfileId)),
-      ];
+      const profileIds = await commandoReadableProfileIds(prisma, actor.id);
       return {
         archivedAt: null,
         salesExecutiveProfileId: { in: profileIds },
@@ -164,14 +163,13 @@ async function assertCanAccess(actor: Actor, row: EvalRow): Promise<void> {
   }
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
+    if (
+      !(await commandoCanReadProfile(
+        prisma,
+        actor.id,
+        row.salesExecutiveProfileId,
+      ))
+    ) {
       throw forbidden("Performance is outside your assignment scope");
     }
     return;
@@ -310,6 +308,7 @@ export async function createPerformance(
       },
     });
     if (!assignment) {
+      await assertCommandoCanWriteProfile(prisma, actor.id, profile.id);
       throw forbidden(
         "You may only create performance for profiles with an active assignment to you",
       );

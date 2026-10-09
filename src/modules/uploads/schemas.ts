@@ -21,11 +21,28 @@ const IMAGE_CONTENT_TYPES = new Set([
   "image/gif",
 ]);
 
+const MAX_EVIDENCE_BYTES = 10 * 1024 * 1024;
+
+/** Content type → allowed file extensions for intervention supporting evidence. */
+const EVIDENCE_TYPES: Record<string, readonly string[]> = {
+  "application/pdf": ["pdf"],
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ["xlsx"],
+  "application/vnd.ms-excel": ["xls", "csv"],
+  "text/csv": ["csv"],
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ["docx"],
+  "application/msword": ["doc"],
+  "image/jpeg": ["jpg", "jpeg"],
+  "image/png": ["png"],
+};
+
 export const UPLOAD_PURPOSES = [
   "weekly-review-minutes",
   "support-task-image",
   "action-item-image",
   "daily-log-image",
+  "daily-work-log-image",
+  "intervention-evidence",
+  "handoff-report",
 ] as const;
 
 export type UploadPurpose = (typeof UPLOAD_PURPOSES)[number];
@@ -135,6 +152,73 @@ export function isOwnedDailyLogImageKey(
   userId: string,
 ): boolean {
   return key.startsWith(`daily-logs/images/${userId}/`);
+}
+
+export function buildDailyWorkLogImageKey(
+  userId: string,
+  fileName: string,
+): string {
+  const safe = sanitizeFileName(fileName);
+  return `daily-work-logs/images/${userId}/${randomUUID()}-${safe || "screenshot"}`;
+}
+
+export function isOwnedDailyWorkLogImageKey(
+  key: string,
+  userId: string,
+): boolean {
+  return key.startsWith(`daily-work-logs/images/${userId}/`);
+}
+
+export function assertAllowedEvidenceUpload(input: {
+  contentType: string;
+  contentLength: number;
+  fileName?: string;
+}): void {
+  const extensions = EVIDENCE_TYPES[input.contentType];
+  const ext = input.fileName?.split(".").pop()?.toLowerCase() ?? "";
+  if (!extensions || (input.fileName !== undefined && !extensions.includes(ext))) {
+    throw new Error(
+      "Unsupported file type. Use PDF, Excel (XLSX/XLS), CSV, Word (DOCX/DOC), JPG, or PNG.",
+    );
+  }
+  if (input.contentLength > MAX_EVIDENCE_BYTES) {
+    throw new Error("File must be 10 MB or smaller.");
+  }
+}
+
+export function buildInterventionEvidenceKey(
+  userId: string,
+  fileName: string,
+): string {
+  const safe = sanitizeFileName(fileName);
+  return `interventions/evidence/${userId}/${randomUUID()}-${safe || "document"}`;
+}
+
+export function isOwnedInterventionEvidenceKey(
+  key: string,
+  userId: string,
+): boolean {
+  return (
+    key.startsWith(`interventions/evidence/${userId}/`) && !key.includes("..")
+  );
+}
+
+export function buildHandoffReportKey(
+  userId: string,
+  fileName: string,
+): string {
+  const safe = sanitizeFileName(fileName);
+  return `interventions/handoff-reports/${userId}/${randomUUID()}-${safe || "document"}`;
+}
+
+export function isOwnedHandoffReportKey(
+  key: string,
+  userId: string,
+): boolean {
+  return (
+    key.startsWith(`interventions/handoff-reports/${userId}/`) &&
+    !key.includes("..")
+  );
 }
 
 export const MAX_MINUTES_BYTES_EXPORT = MAX_MINUTES_BYTES;

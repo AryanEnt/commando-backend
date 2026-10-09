@@ -2,12 +2,20 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
 import type { Actor } from "../../lib/authorization.js";
-import { badRequest, conflict, notFound } from "../../lib/errors.js";
+import { isSuperAdmin } from "../../lib/authorization.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
 import {
   assignmentScopeWhere,
   requireRecordAccess,
 } from "../../lib/scope.js";
+import { createPresignedGetUrl } from "../../lib/r2.js";
 import { totalDaysUnderCommando } from "../../lib/assignmentDays.js";
+import {
+  listHandoffReports,
+  listSubjectHandoffReports,
+  loadHandoffRequirements,
+  writeHandoffReports,
+} from "./handoff.js";
 import type { z } from "zod";
 import type {
   createAssignmentSchema,
@@ -254,38 +262,60 @@ export async function endAssignment(
     throw badRequest("endedAt cannot be before startedAt");
   }
 
-  const assignment = await prisma.commandoAssignment.update({
-    where: { id: assignmentId },
-    data: {
-      status: input.status,
-      endedAt,
-      completionReason: input.completionReason ?? null,
-      outcome: input.outcome ?? null,
-      initialProblem: input.initialProblem ?? null,
-      interventionProvided: input.interventionProvided ?? null,
-      improvementObserved: input.improvementObserved ?? null,
-      remainingGaps: input.remainingGaps ?? null,
-      finalCommandoAssessment: input.finalCommandoAssessment ?? null,
-      finalTeamLeadView: input.finalTeamLeadView ?? null,
-    },
-    include: assignmentInclude,
-  });
+  const assignment = await prisma.$transaction(async (tx) => {
+    const ended = await tx.commandoAssignment.updateMany({
+      where: { id: assignmentId, status: "ACTIVE" },
+      data: {
+        status: input.status,
+        endedAt,
+        completionReason: input.completionReason ?? null,
+        outcome: input.outcome ?? null,
+        initialProblem: input.initialProblem ?? null,
+        interventionProvided: input.interventionProvided ?? null,
+        improvementObserved: input.improvementObserved ?? null,
+        remainingGaps: input.remainingGaps ?? null,
+        finalCommandoAssessment: input.finalCommandoAssessment ?? null,
+        finalTeamLeadView: input.finalTeamLeadView ?? null,
+      },
+    });
+    if (ended.count === 0) {
+      throw badRequest("Only ACTIVE assignments can be ended");
+    }
 
-  await writeAuditLog({
-    actorId: actor.id,
-    action:
-      input.status === "EXITED"
-        ? AUDIT_ACTIONS.COMMANDO_ASSIGNMENT_EXITED
-        : AUDIT_ACTIONS.COMMANDO_ASSIGNMENT_ENDED,
-    entityType: "CommandoAssignment",
-    entityId: assignment.id,
-    metadata: {
-      status: assignment.status,
-      endedAt: assignment.endedAt,
-      completionReason: assignment.completionReason,
-      outcome: assignment.outcome,
-      verb: "UNASSIGN",
-    },
+    const reports = await writeHandoffReports(tx, {
+      actor,
+      assignment: existing,
+      reports: input.handoffReports,
+      periodEnd: endedAt,
+    });
+
+    const row = await tx.commandoAssignment.findUniqueOrThrow({
+      where: { id: assignmentId },
+      include: assignmentInclude,
+    });
+
+    await writeAuditLog(
+      {
+        actorId: actor.id,
+        action:
+          input.status === "EXITED"
+            ? AUDIT_ACTIONS.COMMANDO_ASSIGNMENT_EXITED
+            : AUDIT_ACTIONS.COMMANDO_ASSIGNMENT_ENDED,
+        entityType: "CommandoAssignment",
+        entityId: row.id,
+        metadata: {
+          status: row.status,
+          endedAt: row.endedAt,
+          completionReason: row.completionReason,
+          outcome: row.outcome,
+          handoffReports: reports,
+          verb: "UNASSIGN",
+        },
+      },
+      tx,
+    );
+
+    return row;
   });
 
   if (input.outcome) {
@@ -299,6 +329,77 @@ export async function endAssignment(
   }
 
   return serializeAssignment(assignment);
+}
+
+async function loadAssignmentWithAccess(actor: Actor, assignmentId: string) {
+  const assignment = await prisma.commandoAssignment.findUnique({
+    where: { id: assignmentId },
+    include: assignmentInclude,
+  });
+  if (!assignment) throw notFound("Assignment not found");
+  await requireRecordAccess(prisma, actor, {
+    teamId: assignment.teamId,
+    profileId: assignment.salesExecutiveProfileId,
+    profileUserId: assignment.profile.userId,
+    assignmentCommandoUserId: assignment.commandoUserId,
+    assignmentTeamLeadUserId: assignment.teamLeadUserId,
+  });
+  return assignment;
+}
+
+/** Who needs a handoff report, plus the Team Lead's starting figures for context. */
+export async function getHandoffRequirements(actor: Actor, assignmentId: string) {
+  const assignment = await loadAssignmentWithAccess(actor, assignmentId);
+  if (assignment.status !== "ACTIVE") {
+    throw badRequest("Only ACTIVE assignments can be handed off");
+  }
+  return loadHandoffRequirements(prisma, assignment);
+}
+
+function assertCanViewHandoffReports(actor: Actor) {
+  if (!isSuperAdmin(actor) && actor.roleCode !== "TEAM_LEAD") {
+    throw forbidden("Handoff reports are only visible to the Team Lead and Super Admin");
+  }
+}
+
+export async function getHandoffReports(actor: Actor, assignmentId: string) {
+  assertCanViewHandoffReports(actor);
+  await loadAssignmentWithAccess(actor, assignmentId);
+  return listHandoffReports(prisma, assignmentId);
+}
+
+export async function getSubjectHandoffReports(actor: Actor, subjectUserId: string) {
+  assertCanViewHandoffReports(actor);
+  const scope = await assignmentScopeWhere(prisma, actor);
+  return listSubjectHandoffReports(
+    prisma,
+    subjectUserId,
+    scope as Prisma.CommandoAssignmentWhereInput,
+  );
+}
+
+export async function getHandoffAttachmentUrl(
+  actor: Actor,
+  assignmentId: string,
+  attachmentId: string,
+) {
+  assertCanViewHandoffReports(actor);
+  await loadAssignmentWithAccess(actor, assignmentId);
+  const attachment = await prisma.assignmentHandoffAttachment.findFirst({
+    where: { id: attachmentId, report: { assignmentId } },
+  });
+  if (!attachment) throw notFound("Document not found");
+  const url = await createPresignedGetUrl({
+    key: attachment.storageKey,
+    fileName: attachment.fileName,
+    expiresInSeconds: 600,
+  });
+  return {
+    url,
+    fileName: attachment.fileName,
+    contentType: attachment.contentType,
+    expiresInSeconds: 600,
+  };
 }
 
 export async function transferAssignment(

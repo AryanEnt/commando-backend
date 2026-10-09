@@ -26,9 +26,33 @@ assignmentsRouter.post(
 );
 
 assignmentsRouter.get(
+  "/handoff-reports",
+  requirePermission(PERMISSIONS.ASSIGNMENT_VIEW),
+  controller.getSubjectHandoffReports,
+);
+
+assignmentsRouter.get(
   "/:id",
   requirePermission(PERMISSIONS.ASSIGNMENT_VIEW),
   controller.getAssignment,
+);
+
+assignmentsRouter.get(
+  "/:id/handoff-requirements",
+  requirePermission(PERMISSIONS.ASSIGNMENT_UPDATE),
+  controller.getHandoffRequirements,
+);
+
+assignmentsRouter.get(
+  "/:id/handoff-reports",
+  requirePermission(PERMISSIONS.ASSIGNMENT_VIEW),
+  controller.getHandoffReports,
+);
+
+assignmentsRouter.get(
+  "/:id/handoff-reports/attachments/:attachmentId/url",
+  requirePermission(PERMISSIONS.ASSIGNMENT_VIEW),
+  controller.getHandoffAttachmentUrl,
 );
 
 assignmentsRouter.post(

@@ -1,4 +1,4 @@
-import type { DailyWorkCommitment, Prisma } from "@prisma/client";
+import { Prisma, type DailyWorkCommitment } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import { writeAuditLog, AUDIT_ACTIONS } from "../../lib/audit.js";
 import type { Actor } from "../../lib/authorization.js";
@@ -7,18 +7,35 @@ import {
   isSuperAdmin,
 } from "../../lib/authorization.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
-import { badRequest, forbidden, notFound } from "../../lib/errors.js";
+import { badRequest, conflict, forbidden, notFound } from "../../lib/errors.js";
+import { createPresignedGetUrl, isR2Configured } from "../../lib/r2.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import {
+  commandoReadableProfileIds,
+  commandoWritableProfileIds,
+} from "../../lib/commandoAccess.js";
 import {
   supportUserIdsOnTeams,
   teamIdsForCommandoActive,
 } from "../../lib/supportScope.js";
-import type {
-  CreateDailyWorkLogInput,
-  ListDailyWorkCommitmentsQuery,
-  ListDailyWorkLogsQuery,
-  SaveDailyWorkCommitmentInput,
-  UpdateDailyWorkLogInput,
+import {
+  assertAllowedImageUpload,
+  isOwnedDailyWorkLogImageKey,
+} from "../uploads/schemas.js";
+import {
+  resolveWorkActivity,
+  workActivitiesForRole,
+  workActivityLabels,
+} from "./activities.js";
+import {
+  MAX_DAILY_WORK_LOG_ATTACHMENTS,
+  type CreateCommitmentPlanInput,
+  type CreateDailyWorkLogInput,
+  type DailyWorkLogAttachmentInput,
+  type ListDailyWorkCommitmentsQuery,
+  type ListDailyWorkLogsQuery,
+  type SaveDailyWorkCommitmentInput,
+  type UpdateDailyWorkLogInput,
 } from "./schemas.js";
 
 const include = {
@@ -34,22 +51,107 @@ const include = {
   profile: {
     select: { id: true, displayName: true, userId: true, teamId: true },
   },
+  attachments: { orderBy: { createdAt: "asc" as const } },
 } satisfies Prisma.DailyWorkLogInclude;
 
 type Row = Prisma.DailyWorkLogGetPayload<{ include: typeof include }>;
 
-function serialize(row: Row) {
+const ATTACHMENT_URL_TTL_SECONDS = 3600;
+
+async function attachmentUrl(storageKey: string): Promise<string | null> {
+  if (!isR2Configured()) return null;
+  try {
+    return await createPresignedGetUrl({
+      key: storageKey,
+      expiresInSeconds: ATTACHMENT_URL_TTL_SECONDS,
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function serialize(row: Row) {
   return {
     id: row.id,
     authorUserId: row.authorUserId,
     author: row.author,
     salesExecutiveProfileId: row.salesExecutiveProfileId,
     profile: row.profile,
+    kind: row.kind,
     activity: row.activity,
+    listItem: row.listItem,
+    subItem: row.subItem,
+    ...workActivityLabels(row.listItem, row.subItem),
+    count: row.count,
+    timeRange: row.timeRange,
+    totalAmount: row.totalAmount === null ? null : Number(row.totalAmount),
     notes: row.notes,
     loggedAt: row.loggedAt,
+    startedAt: row.startedAt,
+    endedAt: row.endedAt,
+    durationMinutes: row.durationMinutes,
+    attachments: await Promise.all(
+      row.attachments.map(async (a) => ({
+        id: a.id,
+        fileName: a.fileName,
+        contentType: a.contentType,
+        sizeBytes: a.sizeBytes,
+        url: await attachmentUrl(a.storageKey),
+        createdAt: a.createdAt,
+      })),
+    ),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  };
+}
+
+function toAttachmentRows(
+  actor: Actor,
+  attachments: DailyWorkLogAttachmentInput[] | undefined,
+) {
+  return (attachments ?? []).map((a) => {
+    try {
+      assertAllowedImageUpload({
+        contentType: a.contentType,
+        contentLength: a.size ?? 1,
+      });
+    } catch (err) {
+      throw badRequest(err instanceof Error ? err.message : "Invalid image");
+    }
+    if (!isOwnedDailyWorkLogImageKey(a.key, actor.id)) {
+      throw badRequest("Invalid screenshot upload key");
+    }
+    return {
+      storageKey: a.key,
+      fileName: a.fileName.trim(),
+      contentType: a.contentType,
+      sizeBytes: a.size ?? null,
+    };
+  });
+}
+
+/**
+ * Prisma data for the task time window. `undefined` leaves stored values
+ * untouched; both `null` clears them. Schemas guarantee a valid pair.
+ */
+function taskTimeData(input: {
+  startedAt?: Date | null;
+  endedAt?: Date | null;
+}): {
+  startedAt?: Date | null;
+  endedAt?: Date | null;
+  durationMinutes?: number | null;
+} {
+  if (input.startedAt === undefined && input.endedAt === undefined) return {};
+  if (!input.startedAt || !input.endedAt) {
+    return { startedAt: null, endedAt: null, durationMinutes: null };
+  }
+  return {
+    startedAt: input.startedAt,
+    endedAt: input.endedAt,
+    durationMinutes: Math.round(
+      (input.endedAt.getTime() - input.startedAt.getTime()) / MINUTE_MS,
+    ),
   };
 }
 
@@ -79,20 +181,12 @@ function parseDateOnly(date: string): Date {
 }
 
 const MINUTE_MS = 60_000;
-const DAY_MS = 24 * 60 * MINUTE_MS;
 
 /** YYYY-MM-DD of `at` in the author's timezone (`tzOffsetMinutes` = getTimezoneOffset()). */
 function localDayKey(at: Date, tzOffsetMinutes: number): string {
   return new Date(at.getTime() - tzOffsetMinutes * MINUTE_MS)
     .toISOString()
     .slice(0, 10);
-}
-
-function localDayBounds(dayKey: string, tzOffsetMinutes: number) {
-  const start = new Date(
-    parseDateOnly(dayKey).getTime() + tzOffsetMinutes * MINUTE_MS,
-  );
-  return { start, end: new Date(start.getTime() + DAY_MS - 1) };
 }
 
 async function authorProfileId(actor: Actor): Promise<string | null> {
@@ -118,6 +212,28 @@ function findCommitment(authorUserId: string, dayKey: string) {
   });
 }
 
+/** A saved commitment note or at least one commitment row on the author's local day. */
+async function hasCommitmentForDay(
+  authorUserId: string,
+  dayKey: string,
+  tzOffsetMinutes: number,
+): Promise<boolean> {
+  if (await findCommitment(authorUserId, dayKey)) return true;
+  const start = new Date(
+    parseDateOnly(dayKey).getTime() + tzOffsetMinutes * MINUTE_MS,
+  );
+  const end = new Date(start.getTime() + 24 * 60 * MINUTE_MS);
+  const rows = await prisma.dailyWorkLog.count({
+    where: {
+      authorUserId,
+      kind: "COMMITMENT",
+      archivedAt: null,
+      loggedAt: { gte: start, lt: end },
+    },
+  });
+  return rows > 0;
+}
+
 /** Entries dated today (author's local day) require today's commitment first. */
 async function assertCommitmentIfToday(
   authorUserId: string,
@@ -126,10 +242,13 @@ async function assertCommitmentIfToday(
 ) {
   const today = localDayKey(new Date(), tzOffsetMinutes);
   if (localDayKey(loggedAt, tzOffsetMinutes) !== today) return;
-  const commitment = await findCommitment(authorUserId, today);
-  if (!commitment) {
+  if (!(await hasCommitmentForDay(authorUserId, today, tzOffsetMinutes))) {
     throw badRequest("Add today's commitment before logging your work");
   }
+}
+
+function roundAmount(value: number | null): number | null {
+  return value === null ? null : Math.round(value * 100) / 100;
 }
 
 /** SE profiles a Team Lead can see work logs for. */
@@ -168,19 +287,16 @@ async function teamLeadSupportUserIds(actorId: string): Promise<string[]> {
   return [...new Set([...onTeams, ...linked])];
 }
 
+/** Active assignments plus SEs handed off within the view-only window. */
 async function commandoProfileIds(actorId: string): Promise<string[]> {
-  const assignments = await prisma.commandoAssignment.findMany({
-    where: { commandoUserId: actorId, status: "ACTIVE" },
-    select: { salesExecutiveProfileId: true },
-  });
-  return assignments.map((a) => a.salesExecutiveProfileId);
+  return commandoReadableProfileIds(prisma, actorId);
 }
 
 /** SSE user IDs on the Commando's active teams or linked to their assigned SEs. */
 async function commandoSupportUserIds(actorId: string): Promise<string[]> {
   const [teamIds, profileIds] = await Promise.all([
     teamIdsForCommandoActive(prisma, actorId),
-    commandoProfileIds(actorId),
+    commandoWritableProfileIds(prisma, actorId),
   ]);
   const [onTeams, linked] = await Promise.all([
     supportUserIdsOnTeams(prisma, teamIds),
@@ -284,7 +400,7 @@ export async function listDailyWorkLogs(
   }
 
   const scope = await scopeWhere(actor);
-  const and: Prisma.DailyWorkLogWhereInput[] = [scope];
+  const and: Prisma.DailyWorkLogWhereInput[] = [scope, { kind: query.kind }];
 
   if (query.authorUserId) {
     and.push({ authorUserId: query.authorUserId });
@@ -332,7 +448,7 @@ export async function listDailyWorkLogs(
   ]);
 
   return {
-    logs: rows.map(serialize),
+    logs: await Promise.all(rows.map(serialize)),
     total,
     page: query.page,
     pageSize: query.pageSize,
@@ -359,36 +475,188 @@ export async function createDailyWorkLog(
 ) {
   assertCanAuthor(actor);
 
-  const activity = input.activity.trim();
-  if (!activity) throw badRequest("Activity is required");
+  const isCommitment = input.kind === "COMMITMENT";
+  const notes = input.notes?.trim() ? input.notes.trim() : null;
+  // Commitments are a free-text description only.
+  const resolved =
+    !isCommitment && input.listItem
+      ? resolveWorkActivity(actor.roleCode, {
+          listItem: input.listItem,
+          subItem: input.subItem,
+          totalAmount: input.totalAmount,
+        })
+      : null;
+  const activity = isCommitment
+    ? (notes ?? "").slice(0, 500)
+    : (resolved?.activityLabel ?? input.activity?.trim() ?? "");
+  if (!activity) {
+    throw badRequest(
+      isCommitment ? "Describe what you plan to do" : "Activity is required",
+    );
+  }
 
-  await assertCommitmentIfToday(actor.id, input.loggedAt, input.tzOffsetMinutes);
+  // Commitments are always for the author's current day.
+  const loggedAt = isCommitment ? new Date() : input.loggedAt;
+  if (isCommitment) {
+    const today = localDayKey(loggedAt, input.tzOffsetMinutes);
+    if (await hasCommitmentForDay(actor.id, today, input.tzOffsetMinutes)) {
+      throw conflict("You've already added today's commitment");
+    }
+  } else {
+    await assertCommitmentIfToday(actor.id, loggedAt, input.tzOffsetMinutes);
+  }
   const salesExecutiveProfileId = await authorProfileId(actor);
+  const attachmentRows = toAttachmentRows(actor, input.attachments);
 
   const created = await prisma.dailyWorkLog.create({
     data: {
       authorUserId: actor.id,
       salesExecutiveProfileId,
+      kind: input.kind,
       activity,
-      notes: input.notes?.trim() ? input.notes.trim() : null,
-      loggedAt: input.loggedAt,
+      listItem: resolved?.listItem ?? null,
+      subItem: resolved?.subItem ?? null,
+      count: resolved ? (input.count ?? null) : null,
+      timeRange: resolved ? input.timeRange?.trim() || null : null,
+      totalAmount: roundAmount(resolved?.totalAmount ?? null),
+      notes,
+      loggedAt,
+      ...(isCommitment ? {} : taskTimeData(input)),
+      ...(attachmentRows.length > 0
+        ? { attachments: { create: attachmentRows } }
+        : {}),
     },
     include,
   });
 
   await writeAuditLog({
     actorId: actor.id,
-    action: AUDIT_ACTIONS.DAILY_WORK_LOG_CREATED,
+    action: isCommitment
+      ? AUDIT_ACTIONS.DAILY_WORK_COMMITMENT_SAVED
+      : AUDIT_ACTIONS.DAILY_WORK_LOG_CREATED,
     entityType: "DailyWorkLog",
     entityId: created.id,
     metadata: {
+      kind: created.kind,
       activity: created.activity,
+      listItem: created.listItem,
+      subItem: created.subItem,
+      count: created.count,
       loggedAt: created.loggedAt.toISOString(),
+      durationMinutes: created.durationMinutes,
       salesExecutiveProfileId,
+      attachments: attachmentRows.length,
     },
   });
 
   return serialize(created);
+}
+
+/** Today's commitment as one or more planned activities; locked once added. */
+export async function createCommitmentPlan(
+  actor: Actor,
+  input: CreateCommitmentPlanInput,
+) {
+  assertCanAuthor(actor);
+
+  const seen = new Set<string>();
+  const items = input.items.map((item) => {
+    const resolved = resolveWorkActivity(actor.roleCode, item);
+    const key = `${resolved.listItem}:${resolved.subItem ?? ""}`;
+    if (seen.has(key)) {
+      throw badRequest(`${resolved.activityLabel} is listed twice`);
+    }
+    seen.add(key);
+    return { ...resolved, count: item.count };
+  });
+
+  const now = new Date();
+  const today = localDayKey(now, input.tzOffsetMinutes);
+  if (await hasCommitmentForDay(actor.id, today, input.tzOffsetMinutes)) {
+    throw conflict("You've already added today's commitment");
+  }
+  const salesExecutiveProfileId = await authorProfileId(actor);
+  const note = input.note?.trim() || null;
+
+  let result: { ids: string[]; commitment: DailyWorkCommitment | null };
+  try {
+    result = await prisma.$transaction(async (tx) => {
+      const commitment = note
+        ? await tx.dailyWorkCommitment.create({
+            data: {
+              authorUserId: actor.id,
+              salesExecutiveProfileId,
+              commitDate: parseDateOnly(today),
+              commitment: note,
+            },
+          })
+        : null;
+      const ids: string[] = [];
+      for (const [index, item] of items.entries()) {
+        const row = await tx.dailyWorkLog.create({
+          data: {
+            authorUserId: actor.id,
+            salesExecutiveProfileId,
+            kind: "COMMITMENT",
+            activity: item.activityLabel,
+            listItem: item.listItem,
+            subItem: item.subItem,
+            count: item.count,
+            totalAmount: roundAmount(item.totalAmount),
+            // Lists are newest first; staggering keeps the order the author picked.
+            loggedAt: new Date(now.getTime() - index),
+          },
+          select: { id: true },
+        });
+        ids.push(row.id);
+      }
+      return { ids, commitment };
+    });
+  } catch (err) {
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === "P2002"
+    ) {
+      throw conflict("You've already added today's commitment");
+    }
+    throw err;
+  }
+
+  const rows = await prisma.dailyWorkLog.findMany({
+    where: { id: { in: result.ids } },
+    include,
+    orderBy: { loggedAt: "desc" },
+  });
+
+  await writeAuditLog({
+    actorId: actor.id,
+    action: AUDIT_ACTIONS.DAILY_WORK_COMMITMENT_SAVED,
+    entityType: "DailyWorkLog",
+    entityId: result.ids[0]!,
+    metadata: {
+      kind: "COMMITMENT",
+      commitDate: today,
+      items: items.map((i) => ({
+        listItem: i.listItem,
+        subItem: i.subItem,
+        count: i.count,
+      })),
+      note: Boolean(note),
+      salesExecutiveProfileId,
+    },
+  });
+
+  return {
+    logs: await Promise.all(rows.map(serialize)),
+    commitment: result.commitment ? serializeCommitment(result.commitment) : null,
+  };
+}
+
+export function listWorkActivityOptions(actor: Actor) {
+  if (!hasPermission(actor, PERMISSIONS.DAILY_WORK_LOG_VIEW)) {
+    throw forbidden("Not allowed to view daily work logs");
+  }
+  return { activities: workActivitiesForRole(actor.roleCode) };
 }
 
 export async function updateDailyWorkLog(
@@ -408,15 +676,69 @@ export async function updateDailyWorkLog(
   if (!hasPermission(actor, PERMISSIONS.DAILY_WORK_LOG_CREATE)) {
     throw forbidden("Not allowed to update daily work logs");
   }
+  if (row.kind === "COMMITMENT") {
+    throw badRequest("Commitments are locked once added and can't be changed");
+  }
   if (input.loggedAt) {
     await assertCommitmentIfToday(actor.id, input.loggedAt, input.tzOffsetMinutes);
+  }
+
+  const structuredChange =
+    input.listItem !== undefined ||
+    input.subItem !== undefined ||
+    input.totalAmount !== undefined;
+  // A new activity resets the sub item and amount unless they are sent with it.
+  const resolved = structuredChange
+    ? resolveWorkActivity(actor.roleCode, {
+        listItem: input.listItem ?? row.listItem ?? "",
+        subItem:
+          input.subItem !== undefined
+            ? input.subItem
+            : input.listItem !== undefined
+              ? null
+              : row.subItem,
+        totalAmount:
+          input.totalAmount !== undefined
+            ? input.totalAmount
+            : input.listItem !== undefined
+              ? null
+              : row.totalAmount === null
+                ? null
+                : Number(row.totalAmount),
+      })
+    : null;
+
+  const removeIds = (input.removeAttachmentIds ?? []).filter((id) =>
+    row.attachments.some((a) => a.id === id),
+  );
+  const attachmentRows = toAttachmentRows(actor, input.attachments);
+  if (
+    row.attachments.length - removeIds.length + attachmentRows.length >
+    MAX_DAILY_WORK_LOG_ATTACHMENTS
+  ) {
+    throw badRequest(
+      `An entry can have at most ${MAX_DAILY_WORK_LOG_ATTACHMENTS} screenshots`,
+    );
   }
 
   const updated = await prisma.dailyWorkLog.update({
     where: { id: row.id },
     data: {
-      activity:
-        input.activity !== undefined ? input.activity.trim() : undefined,
+      activity: resolved
+        ? resolved.activityLabel
+        : input.activity !== undefined
+          ? input.activity.trim()
+          : undefined,
+      ...(resolved
+        ? {
+            listItem: resolved.listItem,
+            subItem: resolved.subItem,
+            totalAmount: roundAmount(resolved.totalAmount),
+          }
+        : {}),
+      count: input.count,
+      timeRange:
+        input.timeRange === undefined ? undefined : input.timeRange?.trim() || null,
       notes:
         input.notes === undefined
           ? undefined
@@ -424,6 +746,19 @@ export async function updateDailyWorkLog(
             ? input.notes.trim()
             : null,
       loggedAt: input.loggedAt,
+      ...taskTimeData(input),
+      ...(removeIds.length > 0 || attachmentRows.length > 0
+        ? {
+            attachments: {
+              ...(removeIds.length > 0
+                ? { deleteMany: { id: { in: removeIds } } }
+                : {}),
+              ...(attachmentRows.length > 0
+                ? { create: attachmentRows }
+                : {}),
+            },
+          }
+        : {}),
     },
     include,
   });
@@ -435,7 +770,11 @@ export async function updateDailyWorkLog(
     entityId: updated.id,
     metadata: {
       activity: updated.activity,
+      listItem: updated.listItem,
+      subItem: updated.subItem,
+      count: updated.count,
       loggedAt: updated.loggedAt.toISOString(),
+      durationMinutes: updated.durationMinutes,
     },
   });
 
@@ -453,6 +792,9 @@ export async function deleteDailyWorkLog(actor: Actor, id: string) {
   }
   if (!hasPermission(actor, PERMISSIONS.DAILY_WORK_LOG_CREATE)) {
     throw forbidden("Not allowed to delete daily work logs");
+  }
+  if (row.kind === "COMMITMENT") {
+    throw badRequest("Commitments are locked once added and can't be deleted");
   }
 
   const updated = await prisma.dailyWorkLog.update({
@@ -514,7 +856,7 @@ export async function listDailyWorkCommitments(
   return { commitments: rows.map(serializeCommitment) };
 }
 
-/** Create or edit today's commitment; editable only until today's first entry. */
+/** Create today's commitment; it cannot be changed once saved. */
 export async function saveDailyWorkCommitment(
   actor: Actor,
   input: SaveDailyWorkCommitmentInput,
@@ -525,42 +867,40 @@ export async function saveDailyWorkCommitment(
   if (!commitment) throw badRequest("Commitment is required");
 
   const today = localDayKey(new Date(), input.tzOffsetMinutes);
-  const existing = await findCommitment(actor.id, today);
-  if (existing) {
-    const { start, end } = localDayBounds(today, input.tzOffsetMinutes);
-    const entriesToday = await prisma.dailyWorkLog.count({
-      where: {
-        authorUserId: actor.id,
-        archivedAt: null,
-        loggedAt: { gte: start, lte: end },
-      },
-    });
-    if (entriesToday > 0) {
-      throw badRequest(
-        "Today's commitment is locked once you have logged work for the day",
-      );
-    }
+  if (await hasCommitmentForDay(actor.id, today, input.tzOffsetMinutes)) {
+    throw badRequest("Today's commitment is already saved and cannot be changed");
   }
 
   const salesExecutiveProfileId = await authorProfileId(actor);
   const commitDate = parseDateOnly(today);
-  const saved = await prisma.dailyWorkCommitment.upsert({
-    where: { authorUserId_commitDate: { authorUserId: actor.id, commitDate } },
-    create: {
-      authorUserId: actor.id,
-      salesExecutiveProfileId,
-      commitDate,
-      commitment,
-    },
-    update: { commitment },
-  });
+  let saved: DailyWorkCommitment;
+  try {
+    saved = await prisma.dailyWorkCommitment.create({
+      data: {
+        authorUserId: actor.id,
+        salesExecutiveProfileId,
+        commitDate,
+        commitment,
+      },
+    });
+  } catch (err) {
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === "P2002"
+    ) {
+      throw badRequest(
+        "Today's commitment is already saved and cannot be changed",
+      );
+    }
+    throw err;
+  }
 
   await writeAuditLog({
     actorId: actor.id,
     action: AUDIT_ACTIONS.DAILY_WORK_COMMITMENT_SAVED,
     entityType: "DailyWorkCommitment",
     entityId: saved.id,
-    metadata: { commitDate: today, edited: Boolean(existing) },
+    metadata: { commitDate: today },
   });
 
   return serializeCommitment(saved);

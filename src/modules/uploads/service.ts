@@ -1,13 +1,17 @@
 import type { Actor } from "../../lib/authorization.js";
-import { hasPermission } from "../../lib/authorization.js";
+import { hasPermission, isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, forbidden } from "../../lib/errors.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
 import { createPresignedPutUrl, putObjectBytes } from "../../lib/r2.js";
 import {
+  assertAllowedEvidenceUpload,
   assertAllowedImageUpload,
   assertAllowedMinutesUpload,
   buildActionItemImageKey,
+  buildHandoffReportKey,
+  buildInterventionEvidenceKey,
   buildDailyLogImageKey,
+  buildDailyWorkLogImageKey,
   buildSupportTaskImageKey,
   buildWeeklyReviewMinutesKey,
   UPLOAD_PURPOSES,
@@ -64,6 +68,37 @@ function assertCanUpload(actor: Actor, purpose: UploadPurpose) {
     return;
   }
 
+  if (purpose === "daily-work-log-image") {
+    if (
+      !hasPermission(actor, PERMISSIONS.DAILY_WORK_LOG_CREATE) ||
+      (actor.roleCode !== "SALES_EXECUTIVE" &&
+        actor.roleCode !== "SALES_SUPPORT_EXECUTIVE")
+    ) {
+      throw forbidden("Not allowed to upload work log screenshots");
+    }
+    return;
+  }
+
+  if (purpose === "intervention-evidence") {
+    if (
+      !hasPermission(actor, PERMISSIONS.REFERRAL_VIEW) ||
+      (actor.roleCode !== "TEAM_LEAD" && !isSuperAdmin(actor))
+    ) {
+      throw forbidden("Only the Team Lead can add supporting evidence");
+    }
+    return;
+  }
+
+  if (purpose === "handoff-report") {
+    if (
+      !hasPermission(actor, PERMISSIONS.ASSIGNMENT_UPDATE) ||
+      (actor.roleCode !== "COMMANDO_EXECUTIVE" && !isSuperAdmin(actor))
+    ) {
+      throw forbidden("Only the Commando can attach handoff documents");
+    }
+    return;
+  }
+
   throw badRequest("Unsupported upload purpose");
 }
 
@@ -77,6 +112,15 @@ function buildKey(purpose: UploadPurpose, actorId: string, fileName: string) {
   if (purpose === "daily-log-image") {
     return buildDailyLogImageKey(actorId, fileName);
   }
+  if (purpose === "daily-work-log-image") {
+    return buildDailyWorkLogImageKey(actorId, fileName);
+  }
+  if (purpose === "intervention-evidence") {
+    return buildInterventionEvidenceKey(actorId, fileName);
+  }
+  if (purpose === "handoff-report") {
+    return buildHandoffReportKey(actorId, fileName);
+  }
   return buildActionItemImageKey(actorId, fileName);
 }
 
@@ -84,9 +128,12 @@ function assertContent(
   purpose: UploadPurpose,
   contentType: string,
   contentLength: number,
+  fileName: string,
 ) {
   try {
-    if (purpose === "weekly-review-minutes") {
+    if (purpose === "intervention-evidence" || purpose === "handoff-report") {
+      assertAllowedEvidenceUpload({ contentType, contentLength, fileName });
+    } else if (purpose === "weekly-review-minutes") {
       assertAllowedMinutesUpload({ contentType, contentLength });
     } else {
       assertAllowedImageUpload({ contentType, contentLength });
@@ -98,7 +145,7 @@ function assertContent(
 
 export async function presignUpload(actor: Actor, input: PresignUploadInput) {
   assertCanUpload(actor, input.purpose);
-  assertContent(input.purpose, input.contentType, input.contentLength);
+  assertContent(input.purpose, input.contentType, input.contentLength, input.fileName);
 
   const key = buildKey(input.purpose, actor.id, input.fileName);
   const uploadUrl = await createPresignedPutUrl({
@@ -129,7 +176,7 @@ export async function uploadObject(
     throw badRequest("Unsupported upload purpose");
   }
   assertCanUpload(actor, input.purpose);
-  assertContent(input.purpose, input.contentType, input.body.byteLength);
+  assertContent(input.purpose, input.contentType, input.body.byteLength, input.fileName);
 
   const key = buildKey(input.purpose, actor.id, input.fileName);
   await putObjectBytes({

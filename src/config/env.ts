@@ -59,12 +59,17 @@ export const env = {
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS ?? 30_000),
   logLevel: (process.env.LOG_LEVEL ?? (isProd ? "info" : "debug")).toLowerCase(),
   shutdownTimeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 10_000),
-  loginRateLimitMax: Number(process.env.LOGIN_RATE_LIMIT_MAX ?? 20),
+  loginRateLimitMax: Number(process.env.LOGIN_RATE_LIMIT_MAX ?? 200),
   loginRateLimitWindowMs: Number(
     process.env.LOGIN_RATE_LIMIT_WINDOW_MS ?? 60_000,
   ),
-  apiRateLimitMax: Number(process.env.API_RATE_LIMIT_MAX ?? 300),
+  // A single workspace screen issues ~30 API calls, so this must allow brisk navigation.
+  apiRateLimitMax: Number(process.env.API_RATE_LIMIT_MAX ?? 1200),
   apiRateLimitWindowMs: Number(process.env.API_RATE_LIMIT_WINDOW_MS ?? 60_000),
+  /** Per-user GET response cache lifetime; 0 disables. Any DB write invalidates it immediately. */
+  readCacheTtlMs: Number(
+    process.env.API_READ_CACHE_TTL_MS ?? (nodeEnv === "test" ? 0 : 10_000),
+  ),
   /** Cloudflare R2 (S3-compatible). Optional until upload is used. */
   r2AccountId: (process.env.R2_ACCOUNT_ID ?? "").trim(),
   r2AccessKeyId: (process.env.R2_ACCESS_KEY_ID ?? "").trim(),

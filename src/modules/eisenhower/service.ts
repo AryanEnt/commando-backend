@@ -5,6 +5,11 @@ import { isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import {
+  assertCommandoCanWriteProfile,
+  commandoCanReadProfile,
+  commandoReadableProfileIds,
+} from "../../lib/commandoAccess.js";
+import {
   getCommandoLifecycleState,
   salesExecutiveCanViewEisenhowerOwnership,
 } from "../../lib/lifecycleVisibility.js";
@@ -117,17 +122,10 @@ async function scopeWhere(
 
   switch (actor.roleCode) {
     case "COMMANDO_EXECUTIVE": {
-      const assignments = await prisma.commandoAssignment.findMany({
-        where: { commandoUserId: actor.id },
-        select: { salesExecutiveProfileId: true },
-      });
-      const profileIds = [
-        ...new Set(assignments.map((a) => a.salesExecutiveProfileId)),
-      ];
+      const profileIds = await commandoReadableProfileIds(prisma, actor.id);
       return {
         archivedAt: null,
         OR: [
-          { createdById: actor.id },
           { salesExecutiveProfileId: { in: profileIds } },
         ],
       };
@@ -168,15 +166,13 @@ async function assertCanAccess(actor: Actor, row: TaskRow): Promise<void> {
   if (isSuperAdmin(actor)) return;
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    if (row.createdById === actor.id) return;
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
+    if (
+      !(await commandoCanReadProfile(
+        prisma,
+        actor.id,
+        row.salesExecutiveProfileId,
+      ))
+    ) {
       throw forbidden("Task is outside your assignment scope");
     }
     return;
@@ -217,17 +213,11 @@ async function assertCanManage(actor: Actor, row: TaskRow): Promise<void> {
     throw forbidden("Super Admin is read-only for Eisenhower tasks");
   }
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const active = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-        status: "ACTIVE",
-      },
-      select: { id: true },
-    });
-    if (!active && row.createdById !== actor.id) {
-      throw forbidden("No active assignment to manage this task");
-    }
+    await assertCommandoCanWriteProfile(
+      prisma,
+      actor.id,
+      row.salesExecutiveProfileId,
+    );
     return;
   }
   if (actor.roleCode === "TEAM_LEAD") {
@@ -276,6 +266,7 @@ export async function createEisenhowerTask(
       },
     });
     if (!assignment) {
+      await assertCommandoCanWriteProfile(prisma, actor.id, profile.id);
       throw forbidden(
         "You may only create tasks for profiles with an active assignment to you",
       );
@@ -577,14 +568,7 @@ async function assertCanViewEisenhowerProfile(
       return profile;
     }
     case "COMMANDO_EXECUTIVE": {
-      const any = await prisma.commandoAssignment.findFirst({
-        where: {
-          salesExecutiveProfileId: profile.id,
-          commandoUserId: actor.id,
-        },
-        select: { id: true },
-      });
-      if (!any) {
+      if (!(await commandoCanReadProfile(prisma, actor.id, profile.id))) {
         throw forbidden("You do not have access to this profile");
       }
       return profile;

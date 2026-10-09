@@ -125,6 +125,23 @@ export async function provideReferralInformation(
   }
 }
 
+export async function getSnapshotEvidenceUrl(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await referralService.getSnapshotEvidenceUrl(
+      req.user as Actor,
+      paramId(req.params.id),
+      paramId(req.params.evidenceId),
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function rejectReferral(
   req: Request,
   res: Response,

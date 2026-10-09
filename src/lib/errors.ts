@@ -14,6 +14,14 @@ export function unauthorized(message = "Authentication required"): AppError {
   return new AppError(401, "UNAUTHORIZED", message);
 }
 
+export function sessionReplaced(): AppError {
+  return new AppError(
+    401,
+    "SESSION_REPLACED",
+    "You were signed out because your account was used on another device",
+  );
+}
+
 export function forbidden(message = "Insufficient permissions"): AppError {
   return new AppError(403, "FORBIDDEN", message);
 }

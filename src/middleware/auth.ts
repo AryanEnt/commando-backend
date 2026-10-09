@@ -7,9 +7,10 @@ import {
   type Actor,
 } from "../lib/authorization.js";
 import type { PermissionCode, RoleCode } from "../lib/permissions.js";
-import { unauthorized } from "../lib/errors.js";
+import { sessionReplaced, unauthorized } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
-import { verifyAccessToken } from "../lib/tokens.js";
+import { readThroughCache } from "../lib/readCache.js";
+import { verifyAccessToken, type AccessTokenPayload } from "../lib/tokens.js";
 import type { AuthUser } from "../types/auth.js";
 import { requireRecordAccess } from "../lib/scope.js";
 import type { RecordAccessContext } from "../lib/scope.js";
@@ -55,21 +56,61 @@ export function getAccessTokenFromRequest(req: Request): string | null {
   return bearer || cookie || null;
 }
 
-async function loadAuthUser(userId: string): Promise<AuthUser | null> {
+type RoleGrant = { code: RoleCode; permissions: PermissionCode[] };
+
+/** Role permissions only change via the seed script, so they are cached; user state is not. */
+const ROLE_CACHE_TTL_MS = 5 * 60 * 1000;
+const roleCache = new Map<string, { grant: RoleGrant; expiresAt: number }>();
+
+async function loadRoleGrant(roleId: string): Promise<RoleGrant | null> {
+  const cached = roleCache.get(roleId);
+  if (cached && cached.expiresAt > Date.now()) return cached.grant;
+
+  const role = await prisma.role.findUnique({
+    where: { id: roleId },
+    select: {
+      code: true,
+      rolePermissions: { select: { permission: { select: { code: true } } } },
+    },
+  });
+  if (!role) return null;
+
+  const grant: RoleGrant = {
+    code: role.code as RoleCode,
+    permissions: role.rolePermissions.map(
+      (rp) => rp.permission.code as PermissionCode,
+    ),
+  };
+  roleCache.set(roleId, { grant, expiresAt: Date.now() + ROLE_CACHE_TTL_MS });
+  return grant;
+}
+
+/** Test helper — drop cached role permissions. */
+export function clearRoleGrantCache(): void {
+  roleCache.clear();
+}
+
+/** Throws SESSION_REPLACED when the token belongs to an older login session. */
+async function loadAuthUser(
+  payload: AccessTokenPayload,
+): Promise<AuthUser | null> {
   const user = await prisma.user.findFirst({
-    where: { id: userId, isActive: true, deletedAt: null },
-    include: {
-      role: {
-        include: {
-          rolePermissions: {
-            include: { permission: true },
-          },
-        },
-      },
+    where: { id: payload.sub, isActive: true, deletedAt: null },
+    select: {
+      id: true,
+      email: true,
+      firstName: true,
+      lastName: true,
+      roleId: true,
+      tokenVersion: true,
     },
   });
 
   if (!user) return null;
+  if ((payload.ver ?? 0) !== user.tokenVersion) throw sessionReplaced();
+
+  const grant = await loadRoleGrant(user.roleId);
+  if (!grant) return null;
 
   return {
     id: user.id,
@@ -77,10 +118,8 @@ async function loadAuthUser(userId: string): Promise<AuthUser | null> {
     firstName: user.firstName,
     lastName: user.lastName,
     roleId: user.roleId,
-    roleCode: user.role.code as RoleCode,
-    permissions: user.role.rolePermissions.map(
-      (rp) => rp.permission.code as PermissionCode,
-    ),
+    roleCode: grant.code,
+    permissions: grant.permissions,
   };
 }
 
@@ -96,8 +135,7 @@ export async function optionalAuthentication(
       next();
       return;
     }
-    const payload = verifyAccessToken(token);
-    const user = await loadAuthUser(payload.sub);
+    const user = await loadAuthUser(verifyAccessToken(token));
     if (user) req.user = user;
   } catch {
     /* stay anonymous */
@@ -107,7 +145,7 @@ export async function optionalAuthentication(
 
 export async function requireAuthentication(
   req: Request,
-  _res: Response,
+  res: Response,
   next: NextFunction,
 ): Promise<void> {
   try {
@@ -115,13 +153,12 @@ export async function requireAuthentication(
     if (!token) {
       throw unauthorized();
     }
-    const payload = verifyAccessToken(token);
-    const user = await loadAuthUser(payload.sub);
+    const user = await loadAuthUser(verifyAccessToken(token));
     if (!user) {
       throw unauthorized("User not found or inactive");
     }
     req.user = user;
-    next();
+    await readThroughCache(req, res, next);
   } catch (err) {
     if (err && typeof err === "object" && "name" in err) {
       const name = (err as { name: string }).name;

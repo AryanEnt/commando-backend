@@ -155,7 +155,11 @@ export function loadQuadrantPoints(
       } as const
     )[q];
     const visible = own || Boolean(row[flagKey]) || overall;
-    result[q] = textToSwotPoints(row[q] ?? "", visible);
+    // Stable ids so a later per-point request can find the same legacy point.
+    result[q] = textToSwotPoints(row[q] ?? "", visible).map((p, i) => ({
+      ...p,
+      id: `${q}-legacy-${i + 1}`,
+    }));
   }
   return result;
 }
@@ -193,6 +197,84 @@ export function setQuadrantPointsVisible(
   return {
     ...points,
     [quadrant]: points[quadrant].map((p) => ({ ...p, visible })),
+  };
+}
+
+export type SwotPointCorrection =
+  | { kind: "add"; quadrant: SwotPointQuadrant; text: string }
+  | { kind: "edit"; pointId: string; text: string }
+  | { kind: "delete"; pointId: string };
+
+export type SwotPointCorrectionResult = {
+  points: QuadrantPointMap;
+  quadrant: SwotPointQuadrant;
+  pointId: string;
+  before: string | null;
+  after: string | null;
+};
+
+export function findSwotPoint(
+  points: QuadrantPointMap,
+  id: string,
+): { quadrant: SwotPointQuadrant; index: number } | null {
+  for (const quadrant of SWOT_POINT_QUADRANTS) {
+    const index = points[quadrant].findIndex((p) => p.id === id);
+    if (index >= 0) return { quadrant, index };
+  }
+  return null;
+}
+
+/**
+ * Apply one Super Admin correction. Only the target point changes; every other
+ * point keeps its id, text, order and visibility. Returns null when the point
+ * to edit or delete does not exist.
+ */
+export function applySwotPointCorrection(
+  points: QuadrantPointMap,
+  correction: SwotPointCorrection,
+  newPointVisible: boolean,
+  newPointId: string = randomUUID(),
+): SwotPointCorrectionResult | null {
+  if (correction.kind === "add") {
+    const text = correction.text.trim();
+    const point: SwotPoint = { id: newPointId, text, visible: newPointVisible };
+    return {
+      points: {
+        ...points,
+        [correction.quadrant]: [...points[correction.quadrant], point],
+      },
+      quadrant: correction.quadrant,
+      pointId: point.id,
+      before: null,
+      after: text,
+    };
+  }
+
+  const found = findSwotPoint(points, correction.pointId);
+  if (!found) return null;
+  const { quadrant, index } = found;
+  const list = points[quadrant].slice();
+  const before = list[index].text;
+
+  if (correction.kind === "edit") {
+    const text = correction.text.trim();
+    list[index] = { ...list[index], text };
+    return {
+      points: { ...points, [quadrant]: list },
+      quadrant,
+      pointId: correction.pointId,
+      before,
+      after: text,
+    };
+  }
+
+  list.splice(index, 1);
+  return {
+    points: { ...points, [quadrant]: list },
+    quadrant,
+    pointId: correction.pointId,
+    before,
+    after: null,
   };
 }
 

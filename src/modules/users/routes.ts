@@ -3,6 +3,7 @@ import {
   requireAuthentication,
   requireAnyPermission,
   requirePermission,
+  requireRole,
 } from "../../middleware/auth.js";
 import { validate } from "../../middleware/validate.js";
 import { rateLimit } from "../../middleware/rateLimit.js";
@@ -10,6 +11,7 @@ import { PERMISSIONS } from "../../lib/permissions.js";
 import {
   createSalesExecutiveSchema,
   createUserSchema,
+  updateUserDesignationSchema,
   updateUserRoleSchema,
   updateUserSchema,
   updateUserStatusSchema,
@@ -84,6 +86,19 @@ usersRouter.patch(
   requirePermission(PERMISSIONS.USER_ROLE_UPDATE),
   validate(updateUserRoleSchema),
   controller.changeUserRole,
+);
+
+usersRouter.get(
+  "/:id/designation",
+  requireRole(["SUPER_ADMIN", "TEAM_LEAD"]),
+  controller.getUserDesignation,
+);
+
+usersRouter.patch(
+  "/:id/designation",
+  requireRole(["SUPER_ADMIN", "TEAM_LEAD"]),
+  validate(updateUserDesignationSchema),
+  controller.changeUserDesignation,
 );
 
 export const rolesRouter = Router();

@@ -22,6 +22,7 @@ export const createPerformanceSchema = z
   })
   .strict();
 
+
 export const listPerformanceQuerySchema = z.object({
   search: z.string().trim().optional(),
   profileId: z.string().optional(),

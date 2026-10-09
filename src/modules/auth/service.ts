@@ -1,6 +1,6 @@
 import type { Response } from "express";
 import { prisma } from "../../lib/prisma.js";
-import { unauthorized } from "../../lib/errors.js";
+import { sessionReplaced, unauthorized } from "../../lib/errors.js";
 import { verifyPassword } from "../../lib/password.js";
 import {
   generateRefreshToken,
@@ -65,19 +65,41 @@ export async function login(input: LoginInput) {
   }
 
   const authUser = toAuthUser(user);
+  const refreshToken = generateRefreshToken();
+  const now = new Date();
+
+  // New login replaces every other session for this user.
+  const { tokenVersion, replacedSessions } = await prisma.$transaction(
+    async (tx) => {
+      const revoked = await tx.refreshToken.updateMany({
+        where: { userId: user.id, revokedAt: null, expiresAt: { gt: now } },
+        data: { revokedAt: now },
+      });
+      const updated = await tx.user.update({
+        where: { id: user.id },
+        data: { tokenVersion: { increment: 1 } },
+        select: { tokenVersion: true },
+      });
+      await tx.refreshToken.create({
+        data: {
+          userId: user.id,
+          tokenHash: hashToken(refreshToken),
+          sessionVersion: updated.tokenVersion,
+          expiresAt: refreshExpiryDate(),
+        },
+      });
+      return {
+        tokenVersion: updated.tokenVersion,
+        replacedSessions: revoked.count,
+      };
+    },
+  );
+
   const accessToken = signAccessToken({
     sub: user.id,
     email: user.email,
     roleCode: authUser.roleCode,
-  });
-
-  const refreshToken = generateRefreshToken();
-  await prisma.refreshToken.create({
-    data: {
-      userId: user.id,
-      tokenHash: hashToken(refreshToken),
-      expiresAt: refreshExpiryDate(),
-    },
+    ver: tokenVersion,
   });
 
   await prisma.auditLog.create({
@@ -88,6 +110,17 @@ export async function login(input: LoginInput) {
       entityId: user.id,
     },
   });
+  if (replacedSessions > 0) {
+    await prisma.auditLog.create({
+      data: {
+        actorId: user.id,
+        action: "AUTH_SESSION_REPLACED",
+        entityType: "User",
+        entityId: user.id,
+        metadata: { replacedSessions },
+      },
+    });
+  }
 
   return { user: authUser, accessToken, refreshToken };
 }
@@ -129,12 +162,8 @@ export async function refreshSession(refreshToken: string) {
   }
 
   const tokenHash = hashToken(refreshToken);
-  const stored = await prisma.refreshToken.findFirst({
-    where: {
-      tokenHash,
-      revokedAt: null,
-      expiresAt: { gt: new Date() },
-    },
+  const stored = await prisma.refreshToken.findUnique({
+    where: { tokenHash },
     include: {
       user: {
         include: {
@@ -151,6 +180,12 @@ export async function refreshSession(refreshToken: string) {
   if (!stored || !stored.user.isActive || stored.user.deletedAt) {
     throw unauthorized("Invalid or expired refresh token");
   }
+  if (stored.sessionVersion !== stored.user.tokenVersion) {
+    throw sessionReplaced();
+  }
+  if (stored.revokedAt || stored.expiresAt <= new Date()) {
+    throw unauthorized("Invalid or expired refresh token");
+  }
 
   await prisma.refreshToken.update({
     where: { id: stored.id },
@@ -162,6 +197,7 @@ export async function refreshSession(refreshToken: string) {
     sub: stored.user.id,
     email: stored.user.email,
     roleCode: authUser.roleCode,
+    ver: stored.sessionVersion,
   });
 
   const nextRefresh = generateRefreshToken();
@@ -169,6 +205,7 @@ export async function refreshSession(refreshToken: string) {
     data: {
       userId: stored.user.id,
       tokenHash: hashToken(nextRefresh),
+      sessionVersion: stored.sessionVersion,
       expiresAt: refreshExpiryDate(),
     },
   });

@@ -3,15 +3,17 @@ import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, forbidden } from "../../lib/errors.js";
 import { assertProfileInScope } from "../../lib/scope.js";
+import { assertCommandoCanWriteProfile } from "../../lib/commandoAccess.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import { totalDaysUnderCommando } from "../../lib/assignmentDays.js";
 import { AUDIT_ACTIONS, writeAuditLog } from "../../lib/audit.js";
 import {
   coachingSourcesVisibleToSalesExecutive,
   getCommandoLifecycleState,
+  HIDE_SELF_PROFILE_SWOT,
   salesExecutiveCanViewActionItemStatus,
   salesExecutiveCanViewMonitoring,
-  swotWhereVisibleToSalesExecutive,
+  swotWhereSubjectExecutiveMaySee,
 } from "../../lib/lifecycleVisibility.js";
 import * as profileService from "../profiles/service.js";
 import type { z } from "zod";
@@ -35,7 +37,7 @@ export async function getIntervention(actor: Actor, profileId: string) {
       : null;
   const seSwotWhere =
     actor.roleCode === "SALES_EXECUTIVE"
-      ? swotWhereVisibleToSalesExecutive()
+      ? swotWhereSubjectExecutiveMaySee(actor.id)
       : null;
   const seCanSeeMonitoring = lifecycle
     ? salesExecutiveCanViewMonitoring(lifecycle)
@@ -71,8 +73,11 @@ export async function getIntervention(actor: Actor, profileId: string) {
     prisma.swotAnalysis.findFirst({
       where: {
         archivedAt: null,
-        ...swotSubjectWhere,
-        ...(seSwotWhere ? seSwotWhere : {}),
+        AND: [
+          swotSubjectWhere,
+          HIDE_SELF_PROFILE_SWOT,
+          ...(seSwotWhere ? [seSwotWhere] : []),
+        ],
       },
       orderBy: { createdAt: "desc" },
     }),
@@ -277,7 +282,7 @@ export async function getInterventionTimeline(actor: Actor, profileId: string) {
       : null;
   const seSwotWhere =
     actor.roleCode === "SALES_EXECUTIVE"
-      ? swotWhereVisibleToSalesExecutive()
+      ? swotWhereSubjectExecutiveMaySee(actor.id)
       : null;
   const seCoachingSources = lifecycle
     ? coachingSourcesVisibleToSalesExecutive(lifecycle)
@@ -325,8 +330,11 @@ export async function getInterventionTimeline(actor: Actor, profileId: string) {
     prisma.swotAnalysis.findMany({
       where: {
         archivedAt: null,
-        ...swotSubjectWhere,
-        ...(seSwotWhere ? seSwotWhere : {}),
+        AND: [
+          swotSubjectWhere,
+          HIDE_SELF_PROFILE_SWOT,
+          ...(seSwotWhere ? [seSwotWhere] : []),
+        ],
       },
       orderBy: { createdAt: "desc" },
       take: 20,
@@ -427,7 +435,7 @@ export async function getInterventionTimeline(actor: Actor, profileId: string) {
     events.push({
       at: s.createdAt.toISOString(),
       type: "SWOT",
-      title: `SWOT completed (${s.source.replaceAll("_", " ")})`,
+      title: `${s.subjectType === "PROFILE" ? "Profile" : "User"} SWOT completed (${s.source.replaceAll("_", " ")})`,
       href: `/swot/${s.id}`,
       entityId: s.id,
     });
@@ -571,6 +579,9 @@ export async function createGoal(
     !isSuperAdmin(actor)
   ) {
     throw forbidden("You cannot create intervention goals.");
+  }
+  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    await assertCommandoCanWriteProfile(prisma, actor.id, profileId);
   }
   if (actor.roleCode === "TEAM_LEAD") {
     await assertTeamLeadOperationalWriteAllowed(prisma, actor, profileId, {

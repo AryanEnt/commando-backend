@@ -55,6 +55,12 @@ referralsRouter.get(
   controller.getReferral,
 );
 
+referralsRouter.get(
+  "/:id/evidence/:evidenceId/url",
+  requirePermission(PERMISSIONS.REFERRAL_VIEW),
+  controller.getSnapshotEvidenceUrl,
+);
+
 /** Named transitions only — no arbitrary status PATCH. */
 referralsRouter.post(
   "/:id/acknowledge",

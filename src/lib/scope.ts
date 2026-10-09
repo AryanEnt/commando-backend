@@ -2,6 +2,10 @@ import type { PrismaClient } from "@prisma/client";
 import type { Actor } from "./authorization.js";
 import { isSuperAdmin } from "./authorization.js";
 import { forbidden, notFound } from "./errors.js";
+import {
+  commandoCanReadProfile,
+  commandoReadableProfileIds,
+} from "./commandoAccess.js";
 
 export type RecordAccessContext = {
   teamId?: string | null;
@@ -113,12 +117,18 @@ export async function assertProfileInScope(
     throw notFound("Sales executive profile not found");
   }
 
+  if (user.roleCode === "COMMANDO_EXECUTIVE") {
+    if (!(await commandoCanReadProfile(prisma, user.id, profileId))) {
+      throw forbidden(
+        "Your view-only access to this Sales Executive has ended",
+      );
+    }
+    return;
+  }
+
   const assignment = await prisma.commandoAssignment.findFirst({
     where: {
       salesExecutiveProfileId: profileId,
-      ...(user.roleCode === "COMMANDO_EXECUTIVE"
-        ? { commandoUserId: user.id }
-        : {}),
     },
     orderBy: [{ status: "asc" }, { startedAt: "desc" }],
     select: {
@@ -190,15 +200,7 @@ async function isAssignedCommandoToProfile(
   commandoUserId: string,
   profileId?: string | null,
 ): Promise<boolean> {
-  if (!profileId) return false;
-  const assignment = await prisma.commandoAssignment.findFirst({
-    where: {
-      salesExecutiveProfileId: profileId,
-      commandoUserId,
-    },
-    select: { id: true },
-  });
-  return Boolean(assignment);
+  return commandoCanReadProfile(prisma, commandoUserId, profileId);
 }
 
 async function hasActiveSupportLink(
@@ -222,7 +224,7 @@ async function hasActiveSupportLink(
 export async function profileScopeWhere(
   prisma: PrismaClient,
   user: Actor,
-  options?: { includeHistory?: boolean },
+  _options?: { includeHistory?: boolean },
 ): Promise<Record<string, unknown>> {
   if (isSuperAdmin(user)) {
     return { archivedAt: null };
@@ -234,18 +236,10 @@ export async function profileScopeWhere(
       return { archivedAt: null, teamId: { in: teamIds } };
     }
     case "COMMANDO_EXECUTIVE": {
-      const assignments = await prisma.commandoAssignment.findMany({
-        where: {
-          commandoUserId: user.id,
-          ...(options?.includeHistory ? {} : { status: "ACTIVE" }),
-        },
-        select: { salesExecutiveProfileId: true },
-      });
+      // Active plus view-only (recently handed off); `includeHistory` cannot widen past the window.
       return {
         archivedAt: null,
-        id: {
-          in: assignments.map((a) => a.salesExecutiveProfileId),
-        },
+        id: { in: await commandoReadableProfileIds(prisma, user.id) },
       };
     }
     case "SALES_EXECUTIVE":

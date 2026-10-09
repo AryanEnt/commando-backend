@@ -51,6 +51,15 @@ export const updateUserRoleSchema = z.object({
   roleCode: roleCodeSchema,
 });
 
+export const DESIGNATION_ROLE_CODES = [
+  "SALES_EXECUTIVE",
+  "SALES_SUPPORT_EXECUTIVE",
+] as const;
+
+export const updateUserDesignationSchema = z.object({
+  roleCode: z.enum(DESIGNATION_ROLE_CODES),
+});
+
 export const createSalesExecutiveSchema = z.object({
   firstName: z.string().trim().min(1).max(80),
   lastName: z.string().trim().min(1).max(80),

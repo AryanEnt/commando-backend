@@ -8,6 +8,16 @@ import {
   getActiveTeamIds,
   requireRecordAccess,
 } from "../../lib/scope.js";
+import { loadQuadrantPoints } from "../../lib/swotPoints.js";
+import { HIDE_SELF_PROFILE_SWOT } from "../../lib/lifecycleVisibility.js";
+import { createPresignedGetUrl } from "../../lib/r2.js";
+import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
+import {
+  loadSnapshotPacket,
+  loadSnapshotSubjects,
+  writePerformanceSnapshot,
+  type SnapshotSubject,
+} from "./snapshot.js";
 import type {
   CreateCommandoRequestInput,
   CreateReferralInput,
@@ -81,6 +91,137 @@ type TeamLeadSupportSwotSummary = TeamLeadSwotSummary & {
   supportUser: AssignedSupportPerson;
 };
 
+const referralSwotInclude = {
+  createdBy: { select: { id: true, firstName: true, lastName: true } },
+} satisfies Prisma.SwotAnalysisInclude;
+
+type ReferralSwotRow = Prisma.SwotAnalysisGetPayload<{
+  include: typeof referralSwotInclude;
+}>;
+
+function referralSwotSummary(row: ReferralSwotRow) {
+  const points = loadQuadrantPoints(row);
+  const plain = (list: typeof points.strength) =>
+    list.map((p) => ({ id: p.id, text: p.text }));
+  return {
+    id: row.id,
+    subjectType: row.subjectType,
+    source: row.source,
+    versionNumber: row.versionNumber,
+    createdAt: row.createdAt,
+    createdBy: row.createdBy,
+    strengthPoints: plain(points.strength),
+    weaknessPoints: plain(points.weakness),
+    opportunityPoints: plain(points.opportunity),
+    threatPoints: plain(points.threat),
+  };
+}
+
+type ReferralSwotSummary = ReturnType<typeof referralSwotSummary>;
+
+type TeamLeadUserSwot = {
+  subjectUserId: string;
+  role: "SALES_EXECUTIVE" | "SALES_SUPPORT_EXECUTIVE";
+  name: string;
+  swot: ReferralSwotSummary | null;
+  /** The person's own latest User SWOT. */
+  selfSwot: ReferralSwotSummary | null;
+};
+
+/**
+ * Latest User SWOT per source, the latest Team Lead / Commando Profile SWOT,
+ * and the latest Team Lead User SWOT for the SE and each linked SSE — for
+ * Team Lead, Commando and Super Admin viewers only.
+ */
+async function loadReferralSwots(
+  referral: ReferralRow,
+  actor: Actor | null,
+  assignedSupport: AssignedSupportPerson[],
+): Promise<{
+  userSwots: ReferralSwotSummary[];
+  profileSwot: ReferralSwotSummary | null;
+  teamLeadUserSwots: TeamLeadUserSwot[];
+}> {
+  const canSee =
+    !!actor &&
+    (isSuperAdmin(actor) ||
+      actor.roleCode === "TEAM_LEAD" ||
+      actor.roleCode === "COMMANDO_EXECUTIVE");
+  if (!canSee) {
+    return { userSwots: [], profileSwot: null, teamLeadUserSwots: [] };
+  }
+
+  const people: Omit<TeamLeadUserSwot, "swot" | "selfSwot">[] = [
+    {
+      subjectUserId: referral.profile.userId,
+      role: "SALES_EXECUTIVE",
+      name: referral.profile.displayName,
+    },
+    ...assignedSupport
+      .filter((p) => p.userId !== referral.profile.userId)
+      .map((p) => ({
+        subjectUserId: p.userId,
+        role: "SALES_SUPPORT_EXECUTIVE" as const,
+        name: `${p.firstName} ${p.lastName}`.trim(),
+      })),
+  ];
+
+  const [rows, personRows] = await Promise.all([
+    prisma.swotAnalysis.findMany({
+      where: {
+        archivedAt: null,
+        ...HIDE_SELF_PROFILE_SWOT,
+        OR: [
+          {
+            subjectType: "PROFILE",
+            salesExecutiveProfileId: referral.salesExecutiveProfileId,
+          },
+          { subjectType: "EXECUTIVE", executiveUserId: referral.profile.userId },
+        ],
+      },
+      orderBy: [{ createdAt: "desc" }],
+      include: referralSwotInclude,
+      take: 100,
+    }),
+    prisma.swotAnalysis.findMany({
+      where: {
+        archivedAt: null,
+        subjectType: "EXECUTIVE",
+        source: { in: ["TEAM_LEAD", "SALES_EXECUTIVE", "SALES_SUPPORT_EXECUTIVE"] },
+        executiveUserId: { in: people.map((p) => p.subjectUserId) },
+      },
+      orderBy: [{ createdAt: "desc" }],
+      distinct: ["executiveUserId", "source"],
+      include: referralSwotInclude,
+    }),
+  ]);
+  const latestFor = (userId: string, source: string) => {
+    const row = personRows.find(
+      (r) => r.executiveUserId === userId && r.source === source,
+    );
+    return row ? referralSwotSummary(row) : null;
+  };
+  const teamLeadUserSwots = people.map((p) => ({
+    ...p,
+    swot: latestFor(p.subjectUserId, "TEAM_LEAD"),
+    selfSwot: latestFor(p.subjectUserId, p.role),
+  }));
+
+  const profileRow = rows.find((r) => r.subjectType === "PROFILE") ?? null;
+  const seenSources = new Set<string>();
+  const userSwots: ReferralSwotSummary[] = [];
+  for (const row of rows) {
+    if (row.subjectType !== "EXECUTIVE" || seenSources.has(row.source)) continue;
+    seenSources.add(row.source);
+    userSwots.push(referralSwotSummary(row));
+  }
+  return {
+    userSwots,
+    profileSwot: profileRow ? referralSwotSummary(profileRow) : null,
+    teamLeadUserSwots,
+  };
+}
+
 function serialize(
   referral: ReferralRow,
   teamLeadSwot: TeamLeadSwotSummary | null = null,
@@ -88,6 +229,12 @@ function serialize(
   packet: {
     assignedSupport?: AssignedSupportPerson[];
     teamLeadSupportSwot?: TeamLeadSupportSwotSummary[];
+    userSwots?: ReferralSwotSummary[];
+    profileSwot?: ReferralSwotSummary | null;
+    teamLeadUserSwots?: TeamLeadUserSwot[];
+    performanceSnapshots?: Awaited<ReturnType<typeof loadSnapshotPacket>>["performanceSnapshots"];
+    snapshotEvidence?: Awaited<ReturnType<typeof loadSnapshotPacket>>["snapshotEvidence"];
+    snapshotSubjects?: SnapshotSubject[];
   } = {},
 ) {
   return {
@@ -127,8 +274,43 @@ function serialize(
     teamLeadSwot,
     assignedSupport: packet.assignedSupport ?? [],
     teamLeadSupportSwot: packet.teamLeadSupportSwot ?? [],
+    userSwots: packet.userSwots ?? [],
+    profileSwot: packet.profileSwot ?? null,
+    teamLeadUserSwots: packet.teamLeadUserSwots ?? [],
+    performanceSnapshots: packet.performanceSnapshots ?? [],
+    snapshotEvidence: packet.snapshotEvidence ?? [],
+    snapshotSubjects: packet.snapshotSubjects ?? [],
     allowedActions: allowedActionsFor(referral, actor),
   };
+}
+
+function isManagementViewer(actor: Actor | null) {
+  return (
+    !!actor &&
+    (isSuperAdmin(actor) ||
+      actor.roleCode === "TEAM_LEAD" ||
+      actor.roleCode === "COMMANDO_EXECUTIVE")
+  );
+}
+
+function awaitsTeamLeadSnapshot(referral: ReferralRow) {
+  return (
+    referral.status === "SUBMITTED" &&
+    referral.initiatedBy === "COMMANDO" &&
+    !referral.informationProvidedAt
+  );
+}
+
+/** Snapshot (+ evidence) for management viewers; who to snapshot while the TL is deciding. */
+async function loadSnapshotExtras(referral: ReferralRow, actor: Actor | null) {
+  if (!isManagementViewer(actor)) return {};
+  const [packet, snapshotSubjects] = await Promise.all([
+    loadSnapshotPacket(prisma, referral.id),
+    awaitsTeamLeadSnapshot(referral) && actor!.roleCode !== "COMMANDO_EXECUTIVE"
+      ? loadSnapshotSubjects(prisma, referral)
+      : Promise.resolve([]),
+  ]);
+  return { ...packet, snapshotSubjects };
 }
 
 async function listAssignedSupport(
@@ -160,12 +342,16 @@ async function listAssignedSupport(
 }
 
 async function attachTeamLeadSwot(referral: ReferralRow, actor: Actor | null = null) {
-  const assignedSupport = await listAssignedSupport(
-    referral.salesExecutiveProfileId,
-  );
+  const assignedSupport = await listAssignedSupport(referral.salesExecutiveProfileId);
+  const [swots, snapshot] = await Promise.all([
+    loadReferralSwots(referral, actor, assignedSupport),
+    loadSnapshotExtras(referral, actor),
+  ]);
   return serialize(referral, null, actor, {
     assignedSupport,
     teamLeadSupportSwot: [],
+    ...swots,
+    ...snapshot,
   });
 }
 
@@ -876,6 +1062,13 @@ export async function provideReferralInformation(
         include: referralInclude,
       });
 
+      const snapshot = await writePerformanceSnapshot(tx, {
+        actor,
+        referral,
+        input: input.performanceSnapshot,
+        now: providedAt,
+      });
+
       await writeAuditLog(
         {
           actorId: actor.id,
@@ -887,6 +1080,8 @@ export async function provideReferralInformation(
             to: "ACKNOWLEDGED",
             assignmentId,
             profileId: referral.salesExecutiveProfileId,
+            summary: "TL submitted performance snapshot and approved intervention.",
+            performanceSnapshot: snapshot.auditSummary,
             verb: "APPROVE",
           },
         },
@@ -896,10 +1091,54 @@ export async function provideReferralInformation(
       return { updated: row };
     });
 
+    await recordWorkspaceEvent({
+      salesExecutiveProfileId: referral.salesExecutiveProfileId,
+      assignmentId: updated.assignmentId,
+      type: "INTERVENTION",
+      title: "TL submitted performance snapshot and approved intervention",
+      status: "COMPLETED",
+      occurredAt: providedAt,
+      sourceType: "Referral",
+      sourceId: updated.id,
+      createdById: actor.id,
+    });
+
     return attachTeamLeadSwot(updated, actor);
   } catch (err) {
     rethrowAssignmentConflict(err);
   }
+}
+
+/** Short-lived download link for one supporting document (management viewers only). */
+export async function getSnapshotEvidenceUrl(
+  actor: Actor,
+  referralId: string,
+  evidenceId: string,
+) {
+  const referral = await prisma.referral.findFirst({
+    where: { id: referralId, archivedAt: null },
+    include: referralInclude,
+  });
+  if (!referral) throw notFound("Referral not found");
+  await assertReferralAccess(actor, referral);
+  if (!isManagementViewer(actor)) {
+    throw forbidden("Supporting evidence is only shared with the Team Lead and Commando");
+  }
+  const evidence = await prisma.interventionSnapshotEvidence.findFirst({
+    where: { id: evidenceId, referralId },
+  });
+  if (!evidence) throw notFound("Document not found");
+  const url = await createPresignedGetUrl({
+    key: evidence.storageKey,
+    fileName: evidence.fileName,
+    expiresInSeconds: 600,
+  });
+  return {
+    url,
+    fileName: evidence.fileName,
+    contentType: evidence.contentType,
+    expiresInSeconds: 600,
+  };
 }
 
 export function acknowledgeReferral(

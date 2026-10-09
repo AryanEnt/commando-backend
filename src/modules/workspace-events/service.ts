@@ -5,6 +5,10 @@ import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import {
+  assertCommandoCanWriteProfile,
+  commandoCanReadProfile,
+} from "../../lib/commandoAccess.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import { eisenhowerCategoryFrom } from "../../lib/workspaceEvents.js";
 import type {
@@ -112,14 +116,7 @@ async function assertCanViewProfile(
       return profile;
     }
     case "COMMANDO_EXECUTIVE": {
-      const any = await prisma.commandoAssignment.findFirst({
-        where: {
-          salesExecutiveProfileId: profile.id,
-          commandoUserId: actor.id,
-        },
-        select: { id: true },
-      });
-      if (!any) {
+      if (!(await commandoCanReadProfile(prisma, actor.id, profile.id))) {
         throw forbidden("You do not have access to this profile");
       }
       return profile;
@@ -248,6 +245,7 @@ export async function createWorkspaceEvent(
       },
     });
     if (!assignment) {
+      await assertCommandoCanWriteProfile(prisma, actor.id, profile.id);
       throw forbidden(
         "You may only create events for profiles with an active assignment to you",
       );

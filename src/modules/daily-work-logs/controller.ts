@@ -59,6 +59,22 @@ export async function create(
   }
 }
 
+export async function createCommitmentPlan(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await service.createCommitmentPlan(
+      req.user as Actor,
+      req.body,
+    );
+    res.status(201).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function update(
   req: Request,
   res: Response,
@@ -71,6 +87,20 @@ export async function update(
       req.body,
     );
     res.status(200).json({ data: { log } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export function activityOptions(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  try {
+    res
+      .status(200)
+      .json({ data: service.listWorkActivityOptions(req.user as Actor) });
   } catch (err) {
     next(err);
   }

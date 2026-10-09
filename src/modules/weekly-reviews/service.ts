@@ -4,8 +4,17 @@ import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import {
+  assertCommandoCanWriteProfile,
+  commandoCanReadProfile,
+  commandoReadableProfileIds,
+} from "../../lib/commandoAccess.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import { recordWorkspaceEvent } from "../../lib/workspaceEvents.js";
+import {
+  HIDE_SELF_PROFILE_SWOT,
+  swotWhereSubjectExecutiveMaySee,
+} from "../../lib/lifecycleVisibility.js";
 import {
   assertCanManageSupportUser,
   assertCanViewSupportUser,
@@ -203,11 +212,7 @@ function normalizeMeetingMinutes(
 }
 
 async function assignedProfileIds(commandoUserId: string): Promise<string[]> {
-  const assignments = await prisma.commandoAssignment.findMany({
-    where: { commandoUserId },
-    select: { salesExecutiveProfileId: true },
-  });
-  return [...new Set(assignments.map((a) => a.salesExecutiveProfileId))];
+  return commandoReadableProfileIds(prisma, commandoUserId);
 }
 
 async function resolveTeamLeadForSupportUser(
@@ -276,8 +281,8 @@ async function scopeWhere(actor: Actor): Promise<Prisma.WeeklyReviewWhereInput> 
       return {
         archivedAt: null,
         OR: [
-          { commandoUserId: actor.id },
-          { createdById: actor.id },
+          { commandoUserId: actor.id, salesExecutiveProfileId: null },
+          { createdById: actor.id, salesExecutiveProfileId: null },
           { salesExecutiveProfileId: { in: profileIds } },
           ...(supportIds.length > 0
             ? [{ executiveUserId: { in: supportIds } }]
@@ -332,22 +337,20 @@ async function assertCanAccess(actor: Actor, row: ReviewRow): Promise<void> {
   if (isSuperAdmin(actor)) return;
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    if (row.salesExecutiveProfileId) {
+      if (
+        await commandoCanReadProfile(prisma, actor.id, row.salesExecutiveProfileId)
+      ) {
+        return;
+      }
+      throw forbidden("Review is outside your assignment scope");
+    }
     if (row.commandoUserId === actor.id || row.createdById === actor.id) {
       return;
     }
     if (row.executiveUserId) {
       await assertCanViewSupportUser(prisma, actor, row.executiveUserId);
       return;
-    }
-    if (row.salesExecutiveProfileId) {
-      const assigned = await prisma.commandoAssignment.findFirst({
-        where: {
-          salesExecutiveProfileId: row.salesExecutiveProfileId,
-          commandoUserId: actor.id,
-        },
-        select: { id: true },
-      });
-      if (assigned) return;
     }
     throw forbidden("Review is outside your assignment scope");
   }
@@ -691,6 +694,7 @@ export async function createWeeklyReview(
       },
     });
     if (!assignment) {
+      await assertCommandoCanWriteProfile(prisma, actor.id, profile.id);
       throw forbidden("No active Commando assignment for this profile");
     }
     assignmentId = assignment.id;
@@ -916,6 +920,13 @@ export async function updateWeeklyReview(
   if (!canEditAsCommando && !canEditAsTl) {
     throw forbidden("Only the review owner can edit this draft");
   }
+  if (canEditAsCommando && existing.salesExecutiveProfileId) {
+    await assertCommandoCanWriteProfile(
+      prisma,
+      actor.id,
+      existing.salesExecutiveProfileId,
+    );
+  }
   if (canEditAsTl && existing.salesExecutiveProfileId) {
     await assertTeamLeadOperationalWriteAllowed(
       prisma,
@@ -1031,6 +1042,13 @@ export async function submitWeeklyReview(actor: Actor, id: string) {
   if (!canSubmitAsCommando && !canSubmitAsTl) {
     throw forbidden("Only the review owner can submit this review");
   }
+  if (canSubmitAsCommando && existing.salesExecutiveProfileId) {
+    await assertCommandoCanWriteProfile(
+      prisma,
+      actor.id,
+      existing.salesExecutiveProfileId,
+    );
+  }
   if (canSubmitAsTl && existing.salesExecutiveProfileId) {
     await assertTeamLeadOperationalWriteAllowed(
       prisma,
@@ -1072,6 +1090,16 @@ export async function acknowledgeWeeklyReview(actor: Actor, id: string) {
   });
   if (!existing) throw notFound("Weekly review not found");
   await assertCanAccess(actor, existing);
+  if (
+    actor.roleCode === "COMMANDO_EXECUTIVE" &&
+    existing.salesExecutiveProfileId
+  ) {
+    await assertCommandoCanWriteProfile(
+      prisma,
+      actor.id,
+      existing.salesExecutiveProfileId,
+    );
+  }
 
   if (existing.status !== "SUBMITTED") {
     throw badRequest("Only submitted reviews can be acknowledged");
@@ -1199,17 +1227,7 @@ async function assertCanViewProfileHub(actor: Actor, profileId: string) {
   }
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const assignment = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: profile.id,
-        OR: [
-          { status: "ACTIVE", commandoUserId: actor.id },
-          { status: "COMPLETED", commandoUserId: actor.id },
-        ],
-      },
-      select: { id: true },
-    });
-    if (!assignment) {
+    if (!(await commandoCanReadProfile(prisma, actor.id, profile.id))) {
       throw forbidden("No Commando assignment for this profile");
     }
     return profile;
@@ -1251,7 +1269,7 @@ export async function getWeeklyReviewHub(
           orderBy: [{ loggedAt: "asc" }, { createdAt: "asc" }],
           include: {
             activityType: {
-              select: { id: true, name: true, code: true },
+              select: { id: true, name: true, code: true, description: true },
             },
           },
         },
@@ -1362,15 +1380,23 @@ export async function getWeeklyReviewHub(
     prisma.swotAnalysis.findMany({
       where: {
         archivedAt: null,
-        OR: [
+        AND: [
+          HIDE_SELF_PROFILE_SWOT,
           {
-            subjectType: "PROFILE",
-            salesExecutiveProfileId: profile.id,
+            OR: [
+              {
+                subjectType: "PROFILE",
+                salesExecutiveProfileId: profile.id,
+              },
+              {
+                subjectType: "EXECUTIVE",
+                executiveUserId: profile.userId,
+              },
+            ],
           },
-          {
-            subjectType: "EXECUTIVE",
-            executiveUserId: profile.userId,
-          },
+          ...(actor.roleCode === "SALES_EXECUTIVE"
+            ? [swotWhereSubjectExecutiveMaySee(actor.id)]
+            : []),
         ],
       },
       orderBy: [{ versionNumber: "desc" }, { createdAt: "desc" }],
@@ -1576,6 +1602,7 @@ export async function getWeeklyReviewHub(
     })),
     swot: swotRows.map((s) => ({
       id: s.id,
+      subjectType: s.subjectType,
       source: s.source,
       strength: s.strength,
       weakness: s.weakness,

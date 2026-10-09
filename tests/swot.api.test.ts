@@ -683,8 +683,11 @@ describe("Profile SWOT vs Executive SWOT separation", () => {
     expect(nextProfile.status).toBe(201);
     expect(nextProfile.body.data.swot.subjectType).toBe("PROFILE");
     expect(nextProfile.body.data.swot.source).toBe("COMMANDO");
-    // Version chains are scoped by subjectType + subject + source
-    expect(nextProfile.body.data.swot.versionNumber).toBe(1);
+    // Profile SWOT is one version chain per profile, whoever authors it
+    expect(nextProfile.body.data.swot.versionNumber).toBeGreaterThan(
+      profileSwot.versionNumber ?? 1,
+    );
+    expect(nextProfile.body.data.swot.visibleToSalesExecutive).toBe(false);
 
     const execUnchanged = await prisma.swotAnalysis.findUnique({
       where: { id: exec1Swot.id },
@@ -698,5 +701,193 @@ describe("Profile SWOT vs Executive SWOT separation", () => {
         },
       },
     });
+  });
+
+  it("SE writes own Profile SWOT in a separate stream and can't see an unshared TL one", async ({
+    skip,
+  }) => {
+    if (!dbReady) skip();
+
+    const tlProfile = await prisma.swotAnalysis.create({
+      data: {
+        subjectType: "PROFILE",
+        salesExecutiveProfileId: profileId,
+        executiveUserId: null,
+        teamId,
+        source: "TEAM_LEAD",
+        ...body,
+        strength: "TL-only profile view",
+        createdById: tlUserId,
+      },
+    });
+
+    const se = await token("sales@commando.local");
+    const seProfile = await request(app)
+      .post("/api/swot")
+      .set("Authorization", `Bearer ${se}`)
+      .send({ subjectType: "PROFILE", ...body, strength: "My profile view" });
+    expect(seProfile.status).toBe(201);
+    expect(seProfile.body.data.swot.subjectType).toBe("PROFILE");
+    expect(seProfile.body.data.swot.source).toBe("SALES_EXECUTIVE");
+    expect(seProfile.body.data.swot.salesExecutiveProfileId).toBe(profileId);
+    expect(seProfile.body.data.swot.versionNumber).toBe(1);
+
+    const seOwn = await request(app)
+      .get(`/api/swot/${seProfile.body.data.swot.id}`)
+      .set("Authorization", `Bearer ${se}`);
+    expect(seOwn.status).toBe(200);
+
+    const seTl = await request(app)
+      .get(`/api/swot/${tlProfile.id}`)
+      .set("Authorization", `Bearer ${se}`);
+    expect(seTl.status).toBe(403);
+
+    const seList = await request(app)
+      .get(`/api/swot?subjectType=PROFILE&profileId=${profileId}`)
+      .set("Authorization", `Bearer ${se}`);
+    const ids = seList.body.data.items.map((s: { id: string }) => s.id);
+    expect(ids).toContain(seProfile.body.data.swot.id);
+    expect(ids).not.toContain(tlProfile.id);
+
+    const c = await token("commando@commando.local");
+    const commandoNext = await request(app)
+      .post("/api/swot")
+      .set("Authorization", `Bearer ${c}`)
+      .send({
+        subjectType: "PROFILE",
+        salesExecutiveProfileId: profileId,
+        ...body,
+      });
+    expect(commandoNext.status).toBe(201);
+    expect(commandoNext.body.data.swot.supersedesId).not.toBe(
+      seProfile.body.data.swot.id,
+    );
+
+    await prisma.swotAnalysis.deleteMany({
+      where: {
+        id: {
+          in: [
+            tlProfile.id,
+            seProfile.body.data.swot.id,
+            commandoNext.body.data.swot.id,
+          ],
+        },
+      },
+    });
+  });
+
+  it("shares chosen Profile SWOT points with the SE and their active SSE only", async ({
+    skip,
+  }) => {
+    if (!dbReady) skip();
+    const support = await prisma.user.findUnique({
+      where: { email: "support@commando.local" },
+    });
+    if (!support) skip();
+
+    const existingLink = await prisma.salesSupportLink.findFirst({
+      where: {
+        salesExecutiveProfileId: profileId,
+        salesSupportUserId: support!.id,
+        isActive: true,
+        endedAt: null,
+      },
+    });
+    const link =
+      existingLink ??
+      (await prisma.salesSupportLink.create({
+        data: {
+          salesExecutiveProfileId: profileId,
+          salesSupportUserId: support!.id,
+          isActive: true,
+        },
+      }));
+
+    const c = await token("commando@commando.local");
+    const created = await request(app)
+      .post("/api/swot")
+      .set("Authorization", `Bearer ${c}`)
+      .send({
+        subjectType: "PROFILE",
+        salesExecutiveProfileId: profileId,
+        strengthPoints: [
+          { text: "Shared profile strength", visible: true },
+          { text: "Private profile strength", visible: false },
+        ],
+        weaknessPoints: [{ text: "Private profile weakness", visible: false }],
+        opportunityPoints: [{ text: "Private profile opportunity" }],
+        threatPoints: [{ text: "Private profile threat" }],
+      });
+    expect(created.status).toBe(201);
+    const swotId = created.body.data.swot.id as string;
+    expect(created.body.data.swot.visibleToSalesExecutive).toBe(true);
+    expect(created.body.data.swot.strengthPoints).toHaveLength(2);
+
+    const se = await token("sales@commando.local");
+    const seView = await request(app)
+      .get(`/api/swot/${swotId}`)
+      .set("Authorization", `Bearer ${se}`);
+    expect(seView.status).toBe(200);
+    expect(
+      seView.body.data.swot.strengthPoints.map((p: { text: string }) => p.text),
+    ).toEqual(["Shared profile strength"]);
+    expect(seView.body.data.swot.weaknessPoints).toEqual([]);
+    expect(seView.body.data.swot.weakness).toBeNull();
+
+    const seList = await request(app)
+      .get(`/api/swot?subjectType=PROFILE&profileId=${profileId}`)
+      .set("Authorization", `Bearer ${se}`);
+    expect(
+      seList.body.data.items.map((s: { id: string }) => s.id),
+    ).toContain(swotId);
+
+    const sse = await token("support@commando.local");
+    const sseView = await request(app)
+      .get(`/api/swot/${swotId}`)
+      .set("Authorization", `Bearer ${sse}`);
+    expect(sseView.status).toBe(200);
+    expect(sseView.body.data.swot.strengthPoints).toHaveLength(1);
+
+    const tl = await token("teamlead@commando.local");
+    const tlToggle = await request(app)
+      .patch(`/api/swot/${swotId}/visibility`)
+      .set("Authorization", `Bearer ${tl}`)
+      .send({ visibleToSalesExecutive: false });
+    expect(tlToggle.status).toBe(403);
+
+    await prisma.salesSupportLink.update({
+      where: { id: link.id },
+      data: { isActive: false, endedAt: new Date() },
+    });
+    const sseUnlinked = await request(app)
+      .get(`/api/swot/${swotId}`)
+      .set("Authorization", `Bearer ${sse}`);
+    expect(sseUnlinked.status).toBe(403);
+    const sseList = await request(app)
+      .get("/api/swot?subjectType=PROFILE")
+      .set("Authorization", `Bearer ${sse}`);
+    expect(
+      sseList.body.data.items.map((s: { id: string }) => s.id),
+    ).not.toContain(swotId);
+
+    const hide = await request(app)
+      .patch(`/api/swot/${swotId}/visibility`)
+      .set("Authorization", `Bearer ${c}`)
+      .send({ visibleToSalesExecutive: false });
+    expect(hide.status).toBe(200);
+    const seHidden = await request(app)
+      .get(`/api/swot/${swotId}`)
+      .set("Authorization", `Bearer ${se}`);
+    expect(seHidden.status).toBe(403);
+
+    if (existingLink) {
+      await prisma.salesSupportLink.update({
+        where: { id: link.id },
+        data: { isActive: true, endedAt: null },
+      });
+    } else {
+      await prisma.salesSupportLink.delete({ where: { id: link.id } });
+    }
+    await prisma.swotAnalysis.deleteMany({ where: { id: swotId } });
   });
 });

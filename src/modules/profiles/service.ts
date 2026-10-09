@@ -8,6 +8,10 @@ import {
   profileScopeWhere,
 } from "../../lib/scope.js";
 import { totalDaysUnderCommando } from "../../lib/assignmentDays.js";
+import {
+  type CommandoAccess,
+  getCommandoAccess,
+} from "../../lib/commandoAccess.js";
 import type { z } from "zod";
 import type {
   createProfileSchema,
@@ -49,6 +53,31 @@ function mapAssignmentSummary(
       assignment.startedAt,
       assignment.endedAt,
     ),
+  };
+}
+
+type PersonBrief = {
+  id: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+};
+
+/** What the current Commando may do on this SE: full, view-only (with expiry), or none. */
+function serializeCommandoAccess(
+  access: CommandoAccess,
+  assignments: Array<{ teamLeadUserId: string; teamLead: PersonBrief }>,
+) {
+  if (access.mode !== "READ_ONLY") return { mode: access.mode };
+  const teamLead =
+    assignments.find((a) => a.teamLeadUserId === access.teamLeadUserId)
+      ?.teamLead ?? null;
+  return {
+    mode: access.mode,
+    handedOffAt: access.handedOffAt,
+    until: access.until,
+    daysLeft: access.daysLeft,
+    teamLead,
   };
 }
 
@@ -125,11 +154,35 @@ export async function listProfiles(actor: Actor, query: ListQuery) {
     }),
   ]);
 
+  const accessByProfile = new Map<string, ReturnType<typeof serializeCommandoAccess>>();
+  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    const accesses = await Promise.all(
+      profiles.map((p) => getCommandoAccess(prisma, actor.id, p.id)),
+    );
+    const leadIds = [
+      ...new Set(
+        accesses.flatMap((a) => (a.mode === "READ_ONLY" ? [a.teamLeadUserId] : [])),
+      ),
+    ];
+    const leads =
+      leadIds.length === 0
+        ? []
+        : await prisma.user.findMany({
+            where: { id: { in: leadIds } },
+            select: { id: true, firstName: true, lastName: true, email: true },
+          });
+    const leadAssignments = leads.map((l) => ({ teamLeadUserId: l.id, teamLead: l }));
+    profiles.forEach((p, i) => {
+      accessByProfile.set(p.id, serializeCommandoAccess(accesses[i]!, leadAssignments));
+    });
+  }
+
   return {
     page: query.page,
     pageSize: query.pageSize,
     total,
     profiles: profiles.map((p) => ({
+      commandoAccess: accessByProfile.get(p.id) ?? null,
       id: p.id,
       displayName: p.displayName,
       employeeCode: p.employeeCode,
@@ -178,7 +231,16 @@ export async function getProfile(actor: Actor, profileId: string) {
   const current = profile.assignments.find((a) => a.status === "ACTIVE") ?? null;
   const history = profile.assignments.filter((a) => a.status !== "ACTIVE");
 
+  const commandoAccess =
+    actor.roleCode === "COMMANDO_EXECUTIVE"
+      ? serializeCommandoAccess(
+          await getCommandoAccess(prisma, actor.id, profileId),
+          profile.assignments,
+        )
+      : null;
+
   return {
+    commandoAccess,
     id: profile.id,
     displayName: profile.displayName,
     employeeCode: profile.employeeCode,

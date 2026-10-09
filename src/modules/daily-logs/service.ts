@@ -10,6 +10,11 @@ import {
 } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import {
+  assertCommandoCanWriteProfile,
+  commandoCanReadProfile,
+  commandoReadableProfileIds,
+} from "../../lib/commandoAccess.js";
+import {
   assertCanManageSupportUser,
   supportUserIdsOnTeams,
   teamIdsForCommandoActive,
@@ -34,7 +39,7 @@ import {
 
 const entryInclude = {
   activityType: {
-    select: { id: true, code: true, name: true },
+    select: { id: true, code: true, name: true, description: true },
   },
   createdBy: {
     select: { id: true, firstName: true, lastName: true, email: true },
@@ -180,11 +185,7 @@ function serialize(row: LogRow) {
 }
 
 async function assignedProfileIds(commandoUserId: string): Promise<string[]> {
-  const assignments = await prisma.commandoAssignment.findMany({
-    where: { commandoUserId },
-    select: { salesExecutiveProfileId: true },
-  });
-  return [...new Set(assignments.map((a) => a.salesExecutiveProfileId))];
+  return commandoReadableProfileIds(prisma, commandoUserId);
 }
 
 async function scopeWhere(actor: Actor): Promise<Prisma.DailyLogWhereInput> {
@@ -200,7 +201,7 @@ async function scopeWhere(actor: Actor): Promise<Prisma.DailyLogWhereInput> {
     return {
       archivedAt: null,
       OR: [
-        { createdById: actor.id },
+        { createdById: actor.id, salesExecutiveProfileId: null },
         { salesExecutiveProfileId: { in: profileIds } },
         ...(supportIds.length > 0
           ? [{ executiveUserId: { in: supportIds } }]
@@ -234,17 +235,15 @@ async function assertCanAccessLog(actor: Actor, row: LogRow): Promise<void> {
   if (isSuperAdmin(actor)) return;
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    if (row.createdById === actor.id) return;
     if (row.salesExecutiveProfileId) {
-      const assigned = await prisma.commandoAssignment.findFirst({
-        where: {
-          salesExecutiveProfileId: row.salesExecutiveProfileId,
-          commandoUserId: actor.id,
-        },
-        select: { id: true },
-      });
-      if (assigned) return;
+      if (
+        await commandoCanReadProfile(prisma, actor.id, row.salesExecutiveProfileId)
+      ) {
+        return;
+      }
+      throw forbidden("Log is outside your assignment scope");
     }
+    if (row.createdById === actor.id) return;
     if (row.executiveUserId) {
       const teamIds = await teamIdsForCommandoActive(prisma, actor.id);
       const supportIds = await supportUserIdsOnTeams(prisma, teamIds);
@@ -332,6 +331,7 @@ async function assertCanWriteLogSubject(
     },
   });
   if (!assignment) {
+    await assertCommandoCanWriteProfile(prisma, actor.id, profile.id);
     throw forbidden(
       "You may only create logs for profiles with an active assignment to you",
     );

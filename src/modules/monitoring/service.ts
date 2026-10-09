@@ -14,6 +14,11 @@ import {
 } from "../../lib/lifecycleVisibility.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import {
+  assertCommandoCanWriteProfile,
+  commandoCanReadProfile,
+  commandoReadableProfileIds,
+} from "../../lib/commandoAccess.js";
+import {
   assertCanManageSupportUser,
   assertCanViewSupportUser,
   supportUserIdsOnTeams,
@@ -212,11 +217,7 @@ function serialize(row: RecordRow) {
 }
 
 async function assignedProfileIds(commandoUserId: string): Promise<string[]> {
-  const assignments = await prisma.commandoAssignment.findMany({
-    where: { commandoUserId },
-    select: { salesExecutiveProfileId: true },
-  });
-  return [...new Set(assignments.map((a) => a.salesExecutiveProfileId))];
+  return commandoReadableProfileIds(prisma, commandoUserId);
 }
 
 async function scopeWhere(
@@ -233,7 +234,7 @@ async function scopeWhere(
     return {
       archivedAt: null,
       OR: [
-        { createdById: actor.id },
+        { createdById: actor.id, salesExecutiveProfileId: null },
         { salesExecutiveProfileId: { in: profileIds } },
         ...(supportIds.length
           ? [{ executiveUserId: { in: supportIds } }]
@@ -312,15 +313,13 @@ async function assertCanAccessRecord(
   }
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    if (row.createdById === actor.id) return;
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
+    if (
+      !(await commandoCanReadProfile(
+        prisma,
+        actor.id,
+        row.salesExecutiveProfileId,
+      ))
+    ) {
       throw forbidden("Monitoring record is outside your assignment scope");
     }
     return;
@@ -400,6 +399,7 @@ export async function assertCanCustomizeSeChecklist(
       select: { id: true },
     });
     if (!assignment) {
+      await assertCommandoCanWriteProfile(prisma, actor.id, profile.id);
       throw forbidden(
         "You may only customize checklists for profiles with an active assignment to you",
       );
@@ -485,14 +485,7 @@ async function assertCanViewSeChecklist(actor: Actor, profileId: string) {
   if (isSuperAdmin(actor)) return profile;
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: profile.id,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
+    if (!(await commandoCanReadProfile(prisma, actor.id, profile.id))) {
       throw forbidden("Profile is outside your assignment scope");
     }
     return profile;
@@ -1895,6 +1888,7 @@ export async function createMonitoringRecord(
       },
     });
     if (!assignment) {
+      await assertCommandoCanWriteProfile(prisma, actor.id, profile.id);
       throw forbidden(
         "You may only create monitoring for profiles with an active assignment to you",
       );
@@ -2078,6 +2072,11 @@ async function assertCanEditRecord(actor: Actor, row: RecordRow) {
     select: { id: true },
   });
   if (!assignment) {
+    await assertCommandoCanWriteProfile(
+      prisma,
+      actor.id,
+      row.salesExecutiveProfileId,
+    );
     throw forbidden(
       "You may only edit monitoring for profiles with an active assignment to you",
     );

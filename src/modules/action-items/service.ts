@@ -6,6 +6,11 @@ import { hasPermission, isSuperAdmin } from "../../lib/authorization.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
+import {
+  assertCommandoCanWriteProfile,
+  commandoCanReadProfile,
+  commandoReadableProfileIds,
+} from "../../lib/commandoAccess.js";
 import { assertTeamLeadOperationalWriteAllowed } from "../../lib/teamLeadLock.js";
 import {
   getCommandoLifecycleState,
@@ -246,20 +251,10 @@ async function scopeWhere(actor: Actor): Promise<Prisma.ActionItemWhereInput> {
 
   switch (actor.roleCode) {
     case "COMMANDO_EXECUTIVE": {
-      const assignments = await prisma.commandoAssignment.findMany({
-        where: { commandoUserId: actor.id },
-        select: { salesExecutiveProfileId: true },
-      });
-      const profileIds = [
-        ...new Set(assignments.map((a) => a.salesExecutiveProfileId)),
-      ];
+      const profileIds = await commandoReadableProfileIds(prisma, actor.id);
       return {
         archivedAt: null,
-        OR: [
-          { createdById: actor.id },
-          { salesExecutiveProfileId: { in: profileIds } },
-          { assignment: { commandoUserId: actor.id } },
-        ],
+        salesExecutiveProfileId: { in: profileIds },
       };
     }
     case "TEAM_LEAD": {
@@ -289,16 +284,13 @@ async function assertCanAccess(actor: Actor, row: ItemRow): Promise<void> {
   if (isSuperAdmin(actor)) return;
 
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    if (row.createdById === actor.id) return;
-    if (row.assignment?.commandoUserId === actor.id) return;
-    const assigned = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-      },
-      select: { id: true },
-    });
-    if (!assigned) {
+    if (
+      !(await commandoCanReadProfile(
+        prisma,
+        actor.id,
+        row.salesExecutiveProfileId,
+      ))
+    ) {
       throw forbidden("Action item is outside your assignment scope");
     }
     return;
@@ -335,17 +327,11 @@ async function assertCanManage(actor: Actor, row: ItemRow): Promise<void> {
     throw forbidden("Super Admin is read-only for action items");
   }
   if (actor.roleCode === "COMMANDO_EXECUTIVE") {
-    const active = await prisma.commandoAssignment.findFirst({
-      where: {
-        salesExecutiveProfileId: row.salesExecutiveProfileId,
-        commandoUserId: actor.id,
-        status: "ACTIVE",
-      },
-      select: { id: true },
-    });
-    if (!active && row.createdById !== actor.id) {
-      throw forbidden("No active assignment to manage this action item");
-    }
+    await assertCommandoCanWriteProfile(
+      prisma,
+      actor.id,
+      row.salesExecutiveProfileId,
+    );
     return;
   }
   if (actor.roleCode === "TEAM_LEAD") {
@@ -569,6 +555,7 @@ export async function createActionItem(
       },
     });
     if (!assignment) {
+      await assertCommandoCanWriteProfile(prisma, actor.id, profile.id);
       throw forbidden(
         "You may only create action items for profiles with an active assignment to you",
       );
@@ -905,6 +892,13 @@ export async function addActionItemAttachment(
   const typed = asItemRow(row);
   await assertCanAccess(actor, typed);
   assertCanAddScreenshot(actor, typed);
+  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    await assertCommandoCanWriteProfile(
+      prisma,
+      actor.id,
+      typed.salesExecutiveProfileId,
+    );
+  }
 
   if (typed.status !== "ACTIVE") {
     throw badRequest("Cannot add screenshots to a completed assignment");
@@ -992,6 +986,13 @@ export async function removeActionItemAttachment(
   if (!row) throw notFound("Action item not found");
   const typed = asItemRow(row);
   await assertCanAccess(actor, typed);
+  if (actor.roleCode === "COMMANDO_EXECUTIVE") {
+    await assertCommandoCanWriteProfile(
+      prisma,
+      actor.id,
+      typed.salesExecutiveProfileId,
+    );
+  }
 
   if (typed.status !== "ACTIVE") {
     throw badRequest("Cannot remove screenshots from a completed assignment");

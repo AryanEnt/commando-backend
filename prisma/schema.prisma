@@ -90,6 +90,18 @@ enum EisenhowerTaskStatus {
   CANCELLED
 }
 
+enum SnapshotPerformanceLevel {
+  STRONG
+  AVERAGE
+  NEEDS_ATTENTION
+}
+
+enum SnapshotTrend {
+  IMPROVING
+  STABLE
+  DECLINING
+}
+
 enum WorkspaceEventType {
   MONITORING
   COACHING
@@ -212,6 +224,8 @@ model User {
   lastName     String
   isActive     Boolean   @default(true)
   roleId       String
+  /// Bumped on every login; tokens from older sessions are rejected (single active session).
+  tokenVersion Int       @default(0)
   deletedAt    DateTime?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
@@ -231,6 +245,7 @@ model User {
   interventionGoals      InterventionGoal[]  @relation("InterventionGoalOwner")
 
   swotCreated            SwotAnalysis[]          @relation("SwotCreator")
+  swotCorrected          SwotAnalysis[]          @relation("SwotCorrector")
   swotAsExecutive        SwotAnalysis[]          @relation("SwotExecutiveSubject")
   dailyLogsCreated       DailyLog[]              @relation("DailyLogCreator")
   dailyLogEntriesCreated DailyLogEntry[]         @relation("DailyLogEntryCreator")
@@ -271,6 +286,12 @@ model User {
   dailyWorkLogs          DailyWorkLog[]          @relation("DailyWorkLogAuthor")
   dailyWorkCommitments   DailyWorkCommitment[]   @relation("DailyWorkCommitmentAuthor")
   refreshTokens          RefreshToken[]
+  performanceSnapshotsAbout   InterventionPerformanceSnapshot[] @relation("SnapshotSubject")
+  performanceSnapshotsCreated InterventionPerformanceSnapshot[] @relation("SnapshotCreator")
+  snapshotEvidenceUploaded    InterventionSnapshotEvidence[]    @relation("SnapshotEvidenceUploader")
+  handoffReportsAbout         AssignmentHandoffReport[]         @relation("HandoffReportSubject")
+  handoffReportsCreated       AssignmentHandoffReport[]         @relation("HandoffReportCreator")
+  handoffAttachmentsUploaded  AssignmentHandoffAttachment[]     @relation("HandoffAttachmentUploader")
 
   @@index([roleId])
   @@index([deletedAt])
@@ -278,12 +299,14 @@ model User {
 }
 
 model RefreshToken {
-  id        String    @id @default(cuid())
-  userId    String
-  tokenHash String    @unique
-  expiresAt DateTime
-  revokedAt DateTime?
-  createdAt DateTime  @default(now())
+  id             String    @id @default(cuid())
+  userId         String
+  tokenHash      String    @unique
+  /// User.tokenVersion of the login session this token belongs to
+  sessionVersion Int       @default(0)
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -448,6 +471,7 @@ model CommandoAssignment {
   supportTasks      SupportTask[]
   interventionGoals InterventionGoal[]
   workspaceEvents   WorkspaceEvent[]
+  handoffReports    AssignmentHandoffReport[]
 
   @@index([salesExecutiveProfileId, status])
   @@index([commandoUserId, status])
@@ -494,6 +518,8 @@ model Referral {
   commando   User                  @relation("ReferralCommando", fields: [commandoUserId], references: [id], onDelete: Restrict)
   acknowledgedBy User?            @relation("ReferralAcknowledgedBy", fields: [acknowledgedById], references: [id], onDelete: SetNull)
   assignment CommandoAssignment?   @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+  performanceSnapshots InterventionPerformanceSnapshot[]
+  snapshotEvidence     InterventionSnapshotEvidence[]
 
   @@index([salesExecutiveProfileId])
   @@index([teamLeadUserId])
@@ -502,6 +528,103 @@ model Referral {
   @@index([assignmentId])
   @@index([status])
   @@index([createdAt])
+}
+
+/// Team Lead's performance snapshot of one person (SE or linked SSE), frozen
+/// at approval so the Commando always sees what was originally handed over.
+model InterventionPerformanceSnapshot {
+  id                 String                   @id @default(cuid())
+  referralId         String
+  subjectUserId      String
+  /// SALES_EXECUTIVE | SALES_SUPPORT_EXECUTIVE at the time of the snapshot
+  subjectRole        RoleCode
+  subjectName        String
+  overallPerformance SnapshotPerformanceLevel
+  trend              SnapshotTrend
+  insights           String[]
+  note               String
+  salesAchieved      Decimal?                 @db.Decimal(14, 2)
+  salesTarget        Decimal?                 @db.Decimal(14, 2)
+  achievementPct     Decimal?                 @db.Decimal(7, 2)
+  /// SIX_MONTHS | ALL_HISTORY
+  periodKind         String
+  periodStart        DateTime
+  periodEnd          DateTime
+  createdById        String
+  createdAt          DateTime                 @default(now())
+
+  referral    Referral @relation(fields: [referralId], references: [id], onDelete: Cascade)
+  subjectUser User     @relation("SnapshotSubject", fields: [subjectUserId], references: [id], onDelete: Restrict)
+  createdBy   User     @relation("SnapshotCreator", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@unique([referralId, subjectUserId])
+  @@index([subjectUserId])
+  @@index([createdById])
+}
+
+/// Optional supporting documents attached to the Team Lead's snapshot (Cloudflare R2).
+model InterventionSnapshotEvidence {
+  id           String   @id @default(cuid())
+  referralId   String
+  storageKey   String
+  fileName     String
+  contentType  String
+  sizeBytes    Int?
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  referral   Referral @relation(fields: [referralId], references: [id], onDelete: Cascade)
+  uploadedBy User     @relation("SnapshotEvidenceUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  @@index([referralId, createdAt])
+  @@index([uploadedById])
+}
+
+/// Commando's write-up of one person (SE or linked SSE) for the intervention
+/// period, required when handing the Sales Executive back to the Team Lead.
+/// Visible to the Team Lead and Super Admin only.
+model AssignmentHandoffReport {
+  id             String   @id @default(cuid())
+  assignmentId   String
+  subjectUserId  String
+  /// SALES_EXECUTIVE | SALES_SUPPORT_EXECUTIVE at handoff time
+  subjectRole    RoleCode
+  subjectName    String
+  description    String
+  salesAchieved  Decimal? @db.Decimal(14, 2)
+  salesTarget    Decimal? @db.Decimal(14, 2)
+  achievementPct Decimal? @db.Decimal(7, 2)
+  periodStart    DateTime
+  periodEnd      DateTime
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  assignment  CommandoAssignment            @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  subjectUser User                          @relation("HandoffReportSubject", fields: [subjectUserId], references: [id], onDelete: Restrict)
+  createdBy   User                          @relation("HandoffReportCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  attachments AssignmentHandoffAttachment[]
+
+  @@unique([assignmentId, subjectUserId])
+  @@index([subjectUserId])
+  @@index([createdById])
+}
+
+/// Optional supporting documents on a handoff report (Cloudflare R2).
+model AssignmentHandoffAttachment {
+  id           String   @id @default(cuid())
+  reportId     String
+  storageKey   String   @unique
+  fileName     String
+  contentType  String
+  sizeBytes    Int?
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  report     AssignmentHandoffReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  uploadedBy User                    @relation("HandoffAttachmentUploader", fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  @@index([reportId, createdAt])
+  @@index([uploadedById])
 }
 
 // ─────────────────────────────────────────────
@@ -537,6 +660,10 @@ model SwotAnalysis {
   visibleOpportunity      Boolean         @default(false)
   visibleThreat           Boolean         @default(false)
   createdById             String
+  /** Set when a Super Admin corrected points; createdById stays the original author. */
+  correctedById           String?
+  correctedAt             DateTime?
+  correctionReason        String?
   archivedAt              DateTime?
   createdAt               DateTime        @default(now())
   updatedAt               DateTime        @updatedAt
@@ -545,6 +672,7 @@ model SwotAnalysis {
   executiveUser User?                  @relation("SwotExecutiveSubject", fields: [executiveUserId], references: [id], onDelete: Restrict)
   team          Team?                  @relation(fields: [teamId], references: [id], onDelete: Restrict)
   createdBy     User                   @relation("SwotCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  correctedBy   User?                  @relation("SwotCorrector", fields: [correctedById], references: [id], onDelete: SetNull)
   supersedes    SwotAnalysis?          @relation("SwotVersionChain", fields: [supersedesId], references: [id], onDelete: SetNull)
   supersededBy  SwotAnalysis[]         @relation("SwotVersionChain")
 
@@ -669,6 +797,12 @@ model DailyLogEntryAttachment {
   @@index([storageKey])
 }
 
+/// LOG = work completed; COMMITMENT = planned for the day (locked once added).
+enum DailyWorkEntryKind {
+  LOG
+  COMMITMENT
+}
+
 /// Executive self-reported daily work (SE or SSE). Multiple per day allowed.
 /// Separate from Commando DailyLog coaching journals.
 model DailyWorkLog {
@@ -677,20 +811,54 @@ model DailyWorkLog {
   authorUserId            String
   /// Set when author is a Sales Executive (scope for TL/Commando)
   salesExecutiveProfileId String?
+  kind                    DailyWorkEntryKind @default(LOG)
+  /// Display label; for structured entries "List item · Sub item"
   activity                String
+  /// Structured entries: activity code from the role's activity config
+  listItem                String?
+  subItem                 String?
+  /// Completed count (LOG) or target (COMMITMENT)
+  count                   Int?
+  /// Author-entered free text, e.g. "2min - 5min"
+  timeRange               String?
+  /// Daily Collection only
+  totalAmount             Decimal?  @db.Decimal(14, 2)
   notes                   String?
   /// Activity timestamp (date + time)
   loggedAt                DateTime
+  /// Author-entered task start / end; set together or not at all
+  startedAt               DateTime?
+  endedAt                 DateTime?
+  /// Server-computed from startedAt → endedAt
+  durationMinutes         Int?
   archivedAt              DateTime?
   createdAt               DateTime  @default(now())
   updatedAt               DateTime  @updatedAt
 
-  author  User                   @relation("DailyWorkLogAuthor", fields: [authorUserId], references: [id], onDelete: Restrict)
-  profile SalesExecutiveProfile? @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  author      User                    @relation("DailyWorkLogAuthor", fields: [authorUserId], references: [id], onDelete: Restrict)
+  profile     SalesExecutiveProfile?  @relation(fields: [salesExecutiveProfileId], references: [id], onDelete: Restrict)
+  attachments DailyWorkLogAttachment[]
 
   @@index([authorUserId, loggedAt])
+  @@index([authorUserId, kind, loggedAt])
   @@index([salesExecutiveProfileId, loggedAt])
   @@index([loggedAt])
+}
+
+/// Screenshots / images on a Daily Work Log entry (uploaded by the entry author).
+model DailyWorkLogAttachment {
+  id          String   @id @default(cuid())
+  logId       String
+  /// Cloudflare R2 object key
+  storageKey  String
+  fileName    String
+  contentType String
+  sizeBytes   Int?
+  createdAt   DateTime @default(now())
+
+  log DailyWorkLog @relation(fields: [logId], references: [id], onDelete: Cascade)
+
+  @@index([logId, createdAt])
 }
 
 /// Start-of-day plan written by an SE / SSE before their first Daily Work Log entry.

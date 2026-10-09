@@ -6,6 +6,7 @@ import {
   createSalesExecutiveSchema,
   createUserSchema,
   listUsersQuerySchema,
+  updateUserDesignationSchema,
   updateUserRoleSchema,
   updateUserSchema,
   updateUserStatusSchema,
@@ -123,6 +124,40 @@ export async function changeUserRole(
   try {
     const input = updateUserRoleSchema.parse(req.body);
     const user = await usersService.changeUserRole(
+      actorFrom(req),
+      paramId(req.params.id),
+      input,
+    );
+    res.status(200).json({ data: { user } });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getUserDesignation(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const result = await usersService.getDesignationEligibility(
+      actorFrom(req),
+      paramId(req.params.id),
+    );
+    res.status(200).json({ data: result });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function changeUserDesignation(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const input = updateUserDesignationSchema.parse(req.body);
+    const user = await usersService.changeDesignation(
       actorFrom(req),
       paramId(req.params.id),
       input,
