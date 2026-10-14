@@ -2,6 +2,7 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma.js";
 import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
+import { roleHidesCoachingDailyLogs } from "../../lib/permissions.js";
 import { badRequest, forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import {
@@ -1246,6 +1247,7 @@ export async function getWeeklyReviewHub(
   const profile = await assertCanViewProfileHub(actor, query.profileId);
   const week = resolveWeekBounds(query.weekStart);
   const weekEndExclusive = nextMonday(week.start);
+  const hideDailyLogs = roleHidesCoachingDailyLogs(actor.roleCode);
 
   const [
     dailyLogs,
@@ -1257,24 +1259,26 @@ export async function getWeeklyReviewHub(
     swotRows,
     activeAssignment,
   ] = await Promise.all([
-    prisma.dailyLog.findMany({
-      where: {
-        salesExecutiveProfileId: profile.id,
-        archivedAt: null,
-        logDate: { gte: week.start, lte: week.end },
-      },
-      orderBy: [{ logDate: "asc" }, { createdAt: "asc" }],
-      include: {
-        entries: {
-          orderBy: [{ loggedAt: "asc" }, { createdAt: "asc" }],
+    hideDailyLogs
+      ? Promise.resolve([])
+      : prisma.dailyLog.findMany({
+          where: {
+            salesExecutiveProfileId: profile.id,
+            archivedAt: null,
+            logDate: { gte: week.start, lte: week.end },
+          },
+          orderBy: [{ logDate: "asc" }, { createdAt: "asc" }],
           include: {
-            activityType: {
-              select: { id: true, name: true, code: true, description: true },
+            entries: {
+              orderBy: [{ loggedAt: "asc" }, { createdAt: "asc" }],
+              include: {
+                activityType: {
+                  select: { id: true, name: true, code: true, description: true },
+                },
+              },
             },
           },
-        },
-      },
-    }),
+        }),
     prisma.liveMonitoringRecord.findMany({
       where: {
         salesExecutiveProfileId: profile.id,

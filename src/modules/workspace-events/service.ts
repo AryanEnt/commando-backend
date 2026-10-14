@@ -3,6 +3,7 @@ import { prisma } from "../../lib/prisma.js";
 import { writeAuditLog } from "../../lib/audit.js";
 import type { Actor } from "../../lib/authorization.js";
 import { isSuperAdmin } from "../../lib/authorization.js";
+import { roleHidesCoachingDailyLogs } from "../../lib/permissions.js";
 import { forbidden, notFound } from "../../lib/errors.js";
 import { getActiveTeamIds } from "../../lib/scope.js";
 import {
@@ -174,11 +175,25 @@ export async function listWorkspaceEvents(
 ) {
   await assertCanViewProfile(actor, query.profileId);
 
+  const hideDailyLogs = roleHidesCoachingDailyLogs(actor.roleCode);
+  if (hideDailyLogs && query.type === "DAILY_LOG") {
+    return {
+      page: query.page,
+      pageSize: query.pageSize,
+      total: 0,
+      events: [],
+    };
+  }
+
   const from = rangeStart(query.range);
   const where: Prisma.WorkspaceEventWhereInput = {
     archivedAt: null,
     salesExecutiveProfileId: query.profileId,
-    ...(query.type ? { type: query.type } : {}),
+    ...(query.type
+      ? { type: query.type }
+      : hideDailyLogs
+        ? { type: { not: "DAILY_LOG" } }
+        : {}),
     ...(query.eisenhowerCategory
       ? { eisenhowerCategory: query.eisenhowerCategory }
       : {}),

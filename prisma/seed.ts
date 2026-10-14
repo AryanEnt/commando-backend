@@ -289,6 +289,8 @@ async function upsertRolesAndPermissions() {
     });
   }
 
+ 
+
   const permissions = await prisma.permission.findMany();
   const permissionByCode = new Map(permissions.map((p) => [p.code, p.id]));
   const roles = await prisma.role.findMany();

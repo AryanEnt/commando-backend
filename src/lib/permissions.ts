@@ -8,6 +8,13 @@ export const ROLE_CODES = [
 
 export type RoleCode = (typeof ROLE_CODES)[number];
 
+/** Coaching Daily Logs are internal to TL / Commando / Super Admin. */
+export function roleHidesCoachingDailyLogs(roleCode: RoleCode | string): boolean {
+  return (
+    roleCode === "SALES_EXECUTIVE" || roleCode === "SALES_SUPPORT_EXECUTIVE"
+  );
+}
+
 /** Canonical permission codes — seed and authorize against these. */
 export const PERMISSIONS = {
   USER_VIEW: "USER_VIEW",

@@ -222,12 +222,6 @@ async function scopeWhere(actor: Actor): Promise<Prisma.DailyLogWhereInput> {
       ],
     };
   }
-  if (actor.roleCode === "SALES_EXECUTIVE") {
-    return { archivedAt: null, profile: { userId: actor.id } };
-  }
-  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
-    return { archivedAt: null, executiveUserId: actor.id };
-  }
   return { id: "__none__" };
 }
 
@@ -260,20 +254,6 @@ async function assertCanAccessLog(actor: Actor, row: LogRow): Promise<void> {
       if (supportIds.includes(row.executiveUserId)) return;
     }
     throw forbidden("Log is outside your team scope");
-  }
-
-  if (actor.roleCode === "SALES_EXECUTIVE") {
-    if (!row.profile || row.profile.userId !== actor.id) {
-      throw forbidden("You may only view your own daily logs");
-    }
-    return;
-  }
-
-  if (actor.roleCode === "SALES_SUPPORT_EXECUTIVE") {
-    if (row.executiveUserId !== actor.id) {
-      throw forbidden("You may only view your own daily logs");
-    }
-    return;
   }
 
   throw forbidden("Not allowed to access daily logs");

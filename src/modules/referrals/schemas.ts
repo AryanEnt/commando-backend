@@ -71,6 +71,19 @@ function snapshotSchema<T extends readonly [string, ...string[]]>(insights: T) {
     salesAchieved: optionalAmount,
     salesTarget: optionalAmount,
     achievementPct: z.number().finite().min(0).max(10000).nullable().optional(),
+    monthlySales: z
+      .array(
+        z.object({
+          month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/),
+          salesAchieved: z.number().finite().min(0).max(1e12),
+        }),
+      )
+      .max(12)
+      .refine((sales) => new Set(sales.map((entry) => entry.month)).size === sales.length)
+      .refine(
+        (sales) => sales.reduce((total, entry) => total + entry.salesAchieved, 0) <= 999_999_999_999.99,
+      )
+      .optional(),
   });
 }
 

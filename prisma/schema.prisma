@@ -546,6 +546,7 @@ model InterventionPerformanceSnapshot {
   salesAchieved      Decimal?                 @db.Decimal(14, 2)
   salesTarget        Decimal?                 @db.Decimal(14, 2)
   achievementPct     Decimal?                 @db.Decimal(7, 2)
+  monthlySales       Json?
   /// SIX_MONTHS | ALL_HISTORY
   periodKind         String
   periodStart        DateTime

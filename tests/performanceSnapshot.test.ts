@@ -63,6 +63,50 @@ describe("performanceSnapshotSchema", () => {
       }).success,
     ).toBe(true);
   });
+
+  it("validates unique month-specific sales values", () => {
+    const monthlySales = [
+      { month: "2026-07", salesAchieved: 10000 },
+      { month: "2026-08", salesAchieved: 20000 },
+      { month: "2026-09", salesAchieved: 30000 },
+    ];
+    expect(
+      performanceSnapshotSchema.parse({
+        salesExecutive: { ...se, monthlySales },
+      }).salesExecutive.monthlySales,
+    ).toEqual(monthlySales);
+    expect(
+      performanceSnapshotSchema.safeParse({
+        salesExecutive: {
+          ...se,
+          monthlySales: Array.from({ length: 13 }, (_, index) => ({
+            month: `2026-${String(index + 1).padStart(2, "0")}`,
+            salesAchieved: 1000,
+          })),
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      performanceSnapshotSchema.safeParse({
+        salesExecutive: {
+          ...se,
+          monthlySales: [
+            monthlySales[0],
+            monthlySales[1],
+            { month: "2026-08", salesAchieved: 30000 },
+          ],
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      performanceSnapshotSchema.safeParse({
+        salesExecutive: {
+          ...se,
+          monthlySales: [{ month: "2026-13", salesAchieved: 10000 }],
+        },
+      }).success,
+    ).toBe(false);
+  });
 });
 
 describe("intervention evidence uploads", () => {

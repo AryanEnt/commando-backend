@@ -35,6 +35,7 @@ const fields = {
       note: "Conversion has slipped for two months; needs structured coaching.",
       salesAchieved: 84200,
       salesTarget: 100000,
+      monthlySales: [{ month: "2026-09", salesAchieved: 84200 }],
     },
     salesSupport: [] as Array<Record<string, unknown>>,
     evidence: [] as Array<Record<string, unknown>>,
@@ -192,6 +193,7 @@ describe("referral lifecycle", () => {
       trend: "DECLINING",
       insights: ["MISSING_TARGETS", "NEEDS_SUPPORT"],
       achievementPct: 84.2,
+      monthlySales: [{ month: "2026-09", salesAchieved: 84200 }],
     });
     expect(["SIX_MONTHS", "ALL_HISTORY"]).toContain(snapshots[0].period.kind);
   });

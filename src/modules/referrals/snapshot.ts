@@ -139,6 +139,28 @@ type EvidenceRow = {
 
 const toNumber = (d: Prisma.Decimal | null) => (d == null ? null : d.toNumber());
 
+function monthlySalesFromJson(value: Prisma.JsonValue | null) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new Error("Invalid monthly sales data in performance snapshot");
+  return value.map((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error("Invalid monthly sales entry in performance snapshot");
+    }
+    const month = entry.month;
+    const salesAchieved = entry.salesAchieved;
+    if (
+      typeof month !== "string" ||
+      !/^\d{4}-(0[1-9]|1[0-2])$/.test(month) ||
+      typeof salesAchieved !== "number" ||
+      !Number.isFinite(salesAchieved) ||
+      salesAchieved < 0
+    ) {
+      throw new Error("Invalid monthly sales entry in performance snapshot");
+    }
+    return { month, salesAchieved };
+  });
+}
+
 export function serializeSnapshot(row: SnapshotRow) {
   return {
     id: row.id,
@@ -152,6 +174,7 @@ export function serializeSnapshot(row: SnapshotRow) {
     salesAchieved: toNumber(row.salesAchieved),
     salesTarget: toNumber(row.salesTarget),
     achievementPct: toNumber(row.achievementPct),
+    monthlySales: monthlySalesFromJson(row.monthlySales),
     period: {
       kind: row.periodKind as SnapshotPeriodKind,
       start: row.periodStart,
@@ -255,6 +278,12 @@ export async function writePerformanceSnapshot(
     ...supports.map((s) => ({ subject: s, data: supportInputs.get(s.userId)! })),
   ];
   for (const { subject, data } of rows) {
+    const salesAchieved =
+      data.monthlySales && data.monthlySales.length > 0
+        ? Math.round(
+            data.monthlySales.reduce((total, entry) => total + entry.salesAchieved, 0) * 100,
+          ) / 100
+        : data.salesAchieved ?? null;
     await tx.interventionPerformanceSnapshot.create({
       data: {
         referralId: referral.id,
@@ -265,9 +294,10 @@ export async function writePerformanceSnapshot(
         trend: data.trend,
         insights: data.insights,
         note: data.note,
-        salesAchieved: data.salesAchieved ?? null,
+        salesAchieved,
         salesTarget: data.salesTarget ?? null,
-        achievementPct: achievementFrom(data),
+        achievementPct: achievementFrom({ ...data, salesAchieved }),
+        monthlySales: data.monthlySales ?? [],
         periodKind: subject.period.kind,
         periodStart: subject.period.start,
         periodEnd: subject.period.end,
