@@ -46,6 +46,23 @@ export function errorHandler(
     return;
   }
 
+  const payloadTooLarge =
+    err &&
+    typeof err === "object" &&
+    (("type" in err && (err as { type: string }).type === "entity.too.large") ||
+      ("status" in err && (err as { status: number }).status === 413) ||
+      ("statusCode" in err && (err as { statusCode: number }).statusCode === 413));
+  if (payloadTooLarge) {
+    res.status(413).json({
+      error: {
+        code: "PAYLOAD_TOO_LARGE",
+        message:
+          "This form is too large to send. Shorten long answers or remove some evidence files.",
+      },
+    });
+    return;
+  }
+
   if (err instanceof Prisma.PrismaClientValidationError) {
     const message = err.message;
     logger.error("prisma_validation_error", { error: message });

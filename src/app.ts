@@ -84,7 +84,8 @@ export function createApp() {
       allowedHeaders: ["Content-Type", "Authorization"],
     }),
   );
-  app.use(express.json({ limit: "1mb" }));
+  /** Management packets can include several long narratives + snapshot notes. */
+  app.use(express.json({ limit: "2mb" }));
   app.use(cookieParser());
 
   app.get("/health", (_req, res) => {

@@ -24,7 +24,11 @@ usersRouter.use(requireAuthentication);
 
 usersRouter.get(
   "/",
-  requirePermission(PERMISSIONS.USER_VIEW),
+  requireAnyPermission([
+    PERMISSIONS.USER_VIEW,
+    /** Team Leads pick existing users when adding team members. */
+    PERMISSIONS.TEAM_VIEW,
+  ]),
   controller.listUsers,
 );
 

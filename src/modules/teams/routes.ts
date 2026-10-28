@@ -2,6 +2,7 @@ import { Router } from "express";
 import {
   requireAuthentication,
   requirePermission,
+  requireRole,
 } from "../../middleware/auth.js";
 import { validate } from "../../middleware/validate.js";
 import { PERMISSIONS } from "../../lib/permissions.js";
@@ -51,7 +52,7 @@ teamsRouter.get(
 
 teamsRouter.post(
   "/:id/members",
-  requirePermission(PERMISSIONS.TEAM_MANAGE),
+  requireRole(["TEAM_LEAD"]),
   validate(addMemberSchema),
   controller.addMember,
 );

@@ -153,9 +153,10 @@ export async function addMember(
   teamId: string,
   input: AddMemberInput,
 ) {
-  if (!isSuperAdmin(actor)) {
-    throw forbidden("Only Super Admin can manage team membership");
+  if (actor.roleCode !== "TEAM_LEAD") {
+    throw forbidden("Only Team Leads can add members to a team");
   }
+  await assertTeamManageableByLead(actor, teamId);
 
   const team = await prisma.team.findFirst({
     where: { id: teamId, archivedAt: null },
